@@ -186,6 +186,16 @@ def main() -> None:
                          i + 1, len(scene_ids), scene_id)
                 success += 1
                 continue
+        review_path = args.data_dir / "processed" / scene_id / "review.json"
+        if review_path.exists():
+            review = json.loads(review_path.read_text(encoding="utf-8"))
+            if review.get("status") == "rejected" or review.get("stage2_status") == "rejected":
+                log.info("[%d/%d] %s marked as rejected in review, skipping",
+                         i + 1, len(scene_ids), scene_id)
+                success += 1
+                continue
+
+               
 
         t0 = time.perf_counter()
         try:
