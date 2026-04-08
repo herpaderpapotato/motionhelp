@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """Predict funscript position values using the TCN model.
 
 Usage:
@@ -23,6 +24,7 @@ Usage:
 import argparse
 import json
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -480,120 +482,615 @@ def predictions_to_funscript(positions: np.ndarray, fps: float = 30.0, start_tim
     }
 
 
-def playback_with_prediction(
+def live_playback_with_prediction(
     video_path: Path,
-    predictions: np.ndarray,
-    fps: float,
-    vr_mode: bool,
-    sbs_crop: str,
-    start_time: float = 0.0,
-    display_height: int = 720,
-) -> None:
-    """Real-time video playback with prediction graph overlay."""
-    try:
-        from torchcodec.decoders import VideoDecoder
-        decoder = VideoDecoder(str(video_path), device="cuda", dimension_order="NHWC")
-        src_fps = decoder.metadata.average_fps or 30.0
-    except Exception:
-        print("Error: torchcodec CUDA required for playback mode")
-        return
+    pose_model_path: Path,
+    model: "FunscriptTCN",
+    device: torch.device,
+    vr_mode: bool = True,
+    sbs_crop: str = "left",
+    start_time: float | None = None,
+    duration: float | None = None,
+    target_fps: float = 30.0,
+    frame_size: int = 640,
+    max_persons: int = 10,
+    seq_len: int = 120,
+    emb_mean: np.ndarray | None = None,
+    emb_std: np.ndarray | None = None,
+    flow_mean: np.ndarray | None = None,
+    flow_std: np.ndarray | None = None,
+) -> np.ndarray:
+    """Live video playback with simultaneous feature extraction and TCN prediction.
 
-    start_frame = int(start_time * src_fps) if start_time else 0
-    step = src_fps / fps if fps < src_fps else 1.0
-    n_pred = len(predictions)
-    graph_height = 140
+    Runs the full decode → YOLO → RAFT → TCN pipeline on a background thread
+    while displaying the video in real time via a tkinter GUI. Predictions are
+    overlaid as they become available.
 
-    cv2.namedWindow("Prediction Playback", cv2.WINDOW_NORMAL)
-    frame_time = 1.0 / fps
-    t_start = time.perf_counter()
-    paused = False
+    Returns the final predictions array (for downstream funscript saving).
+    """
+    import threading
+    import tkinter as tk
+    from tkinter import ttk
+    import matplotlib
+    matplotlib.use("TkAgg")
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    from PIL import Image, ImageTk
 
-    print(f"  Playback: {n_pred} frames at {fps} fps. Press Q/ESC to quit, SPACE to pause.")
+    MAX_FRAME_BUF = 300       # max decoded frames to keep in RAM (~150MB at 640px)
+    STATS_EVERY_N = 8         # update stats panel every N display ticks
+    GRAPH_EVERY_N = 20        # update matplotlib graph every N display ticks
 
-    for i in range(n_pred):
-        src_idx = start_frame + int(i * step)
-        if src_idx >= len(decoder):
-            break
+    # ── Shared state (protected by _lock) ─────────────────────────────────
+    _lock = threading.Lock()
+    _state: dict = {
+        "frames":           {},     # frame_idx -> np.ndarray RGB [H,W,3]
+        "predictions":      None,   # np.ndarray or None (replaced after each chunk)
+        "decode_fps":       0.0,
+        "yolo_fps":         0.0,
+        "frames_decoded":   0,
+        "frames_predicted": 0,
+        "total_est":        0,
+        "status":           "Initializing…",
+        "done":             False,
+        "error":            None,
+    }
 
-        frame = decoder[src_idx]  # [H, W, C] uint8 CUDA
+    # ── Worker thread ──────────────────────────────────────────────────────
+    def _worker() -> None:
+        try:
+            with _lock:
+                _state["status"] = "Loading pose model…"
 
-        # VR crop
-        if vr_mode:
-            half_w = frame.shape[1] // 2
-            if sbs_crop == "left":
-                frame = frame[:, :half_w]
+            pose_model = load_pose_model(
+                model_name="yolo11m-pose",
+                model_path=str(pose_model_path),
+                device=str(device),
+            )
+            extractor = SinglePassExtractor(
+                pose_model, max_persons=max_persons, n_keypoints=21,
+                confidence_threshold=0.02, device=str(device),
+            )
+
+            # Estimate total frames
+            total_est = 0
+            try:
+                from torchcodec.decoders import VideoDecoder as _VD
+                _tmp = _VD(str(video_path))
+                src_fps = _tmp.metadata.average_fps or 30.0
+                src_n   = _tmp.metadata.num_frames or 0
+                _tmp = None
+                eff = target_fps or src_fps
+                if duration:
+                    total_est = int(duration * eff)
+                elif src_fps > 0:
+                    total_est = int(src_n * eff / src_fps)
+            except Exception:
+                pass
+            with _lock:
+                _state["total_est"] = total_est
+                _state["status"]    = "Processing video…"
+
+            crop_left = vr_mode and sbs_crop == "left"
+            batch_size = 32
+            flow_size  = 320
+
+            all_kp:   list[np.ndarray] = []
+            all_emb:  list[np.ndarray] = []
+            all_flow: list[np.ndarray] = []
+            prev_flow_frame: np.ndarray | None = None
+            frame_count = 0
+            t0_total  = time.perf_counter()
+            t_yolo    = 0.0
+            n_yolo    = 0
+
+            for chunk_np in stream_video_gpu(
+                video_path,
+                device=str(device),
+                crop_left_half=crop_left,
+                target_size=frame_size,
+                target_fps=target_fps,
+                start_time=start_time,
+                duration=duration,
+                chunk_size=256,
+                as_numpy=True,
+            ):
+                chunk_len = len(chunk_np)
+
+                # Store decoded frames (evict oldest when buffer full)
+                with _lock:
+                    for i, f in enumerate(chunk_np):
+                        _state["frames"][frame_count + i] = f
+                    while len(_state["frames"]) > MAX_FRAME_BUF:
+                        oldest = min(_state["frames"])
+                        del _state["frames"][oldest]
+
+                pose_frames = list(chunk_np)
+                flow_frames = [cv2.resize(f, (flow_size, flow_size)) for f in pose_frames]
+
+                # YOLO single-pass
+                t1 = time.perf_counter()
+                kp, emb = extract_single_pass_batched(extractor, pose_frames, batch_size)
+                t_yolo += time.perf_counter() - t1
+                n_yolo += chunk_len
+                all_kp.append(kp)
+                all_emb.append(emb)
+                del pose_frames
+
+                # RAFT optical flow
+                if prev_flow_frame is not None:
+                    fi = np.stack([prev_flow_frame] + flow_frames)
+                    fc = compute_flow_raft_batched(
+                        fi, output_features=64, device=str(device), batch_size=64,
+                    )
+                    all_flow.append(fc[1:])
+                else:
+                    fi = np.stack(flow_frames)
+                    fc = compute_flow_raft_batched(
+                        fi, output_features=64, device=str(device), batch_size=64,
+                    )
+                    all_flow.append(fc)
+                prev_flow_frame = flow_frames[-1]
+                del flow_frames
+
+                frame_count += chunk_len
+                elapsed = time.perf_counter() - t0_total
+                decode_fps = frame_count / elapsed if elapsed > 0 else 0.0
+                yolo_fps   = n_yolo / t_yolo if t_yolo > 0 else 0.0
+
+                # Run TCN on all accumulated features so far
+                preds_new = None
+                if frame_count >= seq_len:
+                    kp_a  = np.concatenate(all_kp)
+                    emb_a = np.concatenate(all_emb)
+                    fl_a  = np.concatenate(all_flow)
+                    n = min(len(kp_a), len(emb_a), len(fl_a))
+                    kp_a = kp_a[:n]; emb_a = emb_a[:n]; fl_a = fl_a[:n]
+                    if emb_mean is not None:
+                        emb_a = (emb_a - emb_mean) / (emb_std + 1e-8)
+                    if flow_mean is not None:
+                        fl_a = (fl_a - flow_mean) / (flow_std + 1e-8)
+                    preds_new = sliding_window_predict(
+                        model, kp_a, emb_a, fl_a, device, seq_len, stride=60,
+                    )
+
+                with _lock:
+                    _state["decode_fps"]       = decode_fps
+                    _state["yolo_fps"]         = yolo_fps
+                    _state["frames_decoded"]   = frame_count
+                    if preds_new is not None:
+                        _state["predictions"]      = preds_new
+                        _state["frames_predicted"] = len(preds_new)
+
+            # Final prediction pass on complete data
+            kp_a  = np.concatenate(all_kp)
+            emb_a = np.concatenate(all_emb)
+            fl_a  = np.concatenate(all_flow)
+            n = min(len(kp_a), len(emb_a), len(fl_a))
+            kp_a = kp_a[:n]; emb_a = emb_a[:n]; fl_a = fl_a[:n]
+            if emb_mean is not None:
+                emb_a = (emb_a - emb_mean) / (emb_std + 1e-8)
+            if flow_mean is not None:
+                fl_a = (fl_a - flow_mean) / (flow_std + 1e-8)
+            preds_final = sliding_window_predict(
+                model, kp_a, emb_a, fl_a, device, seq_len, stride=60,
+            )
+
+            extractor.close()
+            with _lock:
+                _state["predictions"]      = preds_final
+                _state["frames_predicted"] = len(preds_final)
+                _state["status"]           = "Done"
+                _state["done"]             = True
+
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            with _lock:
+                _state["error"]  = exc
+                _state["status"] = f"Error: {exc}"
+                _state["done"]   = True
+
+    worker_thread = threading.Thread(target=_worker, daemon=True)
+    worker_thread.start()
+
+    # ── Helper: draw position meter (adapted from visualize_data.py) ───────
+    def _draw_position_meter(frame_bgr: np.ndarray, position: float) -> np.ndarray:
+        frame = frame_bgr.copy()
+        h, w = frame.shape[:2]
+        pos = float(np.clip(position, 0.0, 1.0))
+        mw  = max(14, w // 45)
+        pad = max(6, w // 100)
+        x1, x2 = w - mw - pad, w - pad
+        y1, y2  = pad, h - pad
+        th = max(1, y2 - y1)
+        lc = max(42, w // 14)
+        sx = max(0, x1 - lc)
+        roi = frame[y1:y2, sx:w].copy()
+        frame[y1:y2, sx:w] = cv2.addWeighted(roi, 0.38, np.zeros_like(roi), 0.62, 0)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (55, 55, 55), -1)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (110, 110, 110), 1)
+        fh = int(pos * th)
+        if fh > 0:
+            fy = y2 - fh
+            r  = int(80 + 170 * pos)
+            g  = int(130 - 30 * pos)
+            b  = int(240 - 160 * pos)
+            cv2.rectangle(frame, (x1, fy), (x2, y2), (b, g, r), -1)
+        iy = max(y1, min(y2, y2 - int(pos * th)))
+        cv2.rectangle(frame, (x1 - 3, iy - 2), (x2 + 3, iy + 2), (255, 255, 255), -1)
+        lbl = f"{pos:.2f}"
+        fs  = max(0.38, w / 1600.0)
+        (tw, tht), _ = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX, fs, 1)
+        cv2.putText(frame, lbl, (x1 - tw - 6, max(y1 + tht, min(y2 - 2, iy + tht // 2))),
+                    cv2.FONT_HERSHEY_SIMPLEX, fs, (255, 255, 255), 1, cv2.LINE_AA)
+        for val in (1.0, 0.5, 0.0):
+            vy = max(y1 + 8, min(y2, y2 - int(val * th) + 4))
+            cv2.putText(frame, f"{val:.1f}", (x1 + 2, vy),
+                        cv2.FONT_HERSHEY_SIMPLEX, max(0.28, w / 2200.0),
+                        (130, 130, 130), 1, cv2.LINE_AA)
+        return frame
+
+    # ── Build tkinter GUI ──────────────────────────────────────────────────
+    root = tk.Tk()
+    root.title("VideoToMotion — Live Prediction")
+    root.configure(bg="#1e1e1e")
+    root.resizable(True, True)
+
+    _running = [True]
+    _tk_photo: list = [None]         # keep reference to avoid GC
+
+    # Playback state
+    _pos      = [0]                  # current display frame index
+    _playing  = [True]
+    _speed    = [1.0]
+    _t_start  = [time.perf_counter()]
+    _f_start  = [0]                  # frame index when timer was last reset
+    _buf_wait = [False]              # True when display has caught up to decode
+    _tick     = [0]                  # display update counter
+
+    frame_delay_ms = max(16, int(1000.0 / target_fps))
+
+    # ── Layout ────────────────────────────────────────────────────────────
+    # Row 1: video canvas  +  stats panel
+    top_row = tk.Frame(root, bg="#1e1e1e")
+    top_row.pack(fill=tk.BOTH, expand=False, padx=4, pady=(4, 0))
+
+    video_canvas = tk.Canvas(
+        top_row, bg="#000000", width=frame_size, height=frame_size,
+        highlightthickness=0,
+    )
+    video_canvas.pack(side=tk.LEFT, padx=(0, 4))
+
+    # Stats panel
+    stats_outer = tk.Frame(top_row, bg="#252526", width=230)
+    stats_outer.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 4))
+    stats_outer.pack_propagate(False)
+
+    tk.Label(
+        stats_outer, text="Live Stats", bg="#252526", fg="#cccccc",
+        font=("Segoe UI", 10, "bold"), anchor="w",
+    ).pack(fill=tk.X, padx=8, pady=(8, 4))
+
+    stats_text = tk.Text(
+        stats_outer, bg="#1e1e1e", fg="#d4d4d4", font=("Consolas", 9),
+        borderwidth=0, highlightthickness=0, state=tk.DISABLED,
+        wrap=tk.WORD, height=22, width=26,
+    )
+    stats_text.pack(fill=tk.BOTH, expand=True, padx=4, pady=(0, 4))
+    stats_text.tag_configure("head",  foreground="#4ec9b0", font=("Consolas", 9, "bold"))
+    stats_text.tag_configure("val",   foreground="#ce9178")
+    stats_text.tag_configure("ok",    foreground="#6a9955")
+    stats_text.tag_configure("warn",  foreground="#d79921")
+    stats_text.tag_configure("err",   foreground="#f44747")
+    stats_text.tag_configure("dim",   foreground="#555555")
+
+    # Row 2: matplotlib prediction timeline
+    graph_frame = tk.Frame(root, bg="#1e1e1e")
+    graph_frame.pack(fill=tk.X, padx=4, pady=(4, 0))
+
+    fig = plt.figure(figsize=(10, 2.0), facecolor="#1e1e1e")
+    ax  = fig.add_subplot(111)
+    ax.set_facecolor("#252526")
+    ax.tick_params(colors="#888888", labelsize=7)
+    for sp in ax.spines.values():
+        sp.set_edgecolor("#444444")
+    ax.set_ylim(-0.05, 1.05)
+    ax.set_ylabel("Position", color="#888888", fontsize=8)
+    ax.set_xlabel("Time (s)",  color="#888888", fontsize=8)
+    for g_val in (0.0, 0.25, 0.5, 0.75, 1.0):
+        ax.axhline(g_val, color="#333333", lw=0.5, linestyle=":")
+    [pred_line]   = ax.plot([], [], lw=1.5,  color="#e37933", label="Prediction")
+    [cursor_line] = ax.plot([], [], lw=1.5,  color="#4ee344", linestyle="--", label="Now")
+    ax.legend(fontsize=7, labelcolor="#888888", facecolor="#252526", edgecolor="#444444",
+              loc="upper left")
+    fig.tight_layout(pad=0.6)
+
+    timeline_canvas = FigureCanvasTkAgg(fig, master=graph_frame)
+    timeline_canvas.get_tk_widget().pack(fill=tk.X)
+
+    # Row 3: controls
+    ctrl_frame = tk.Frame(root, bg="#1e1e1e")
+    ctrl_frame.pack(fill=tk.X, padx=4, pady=(4, 4))
+
+    _BTN = dict(bg="#3c3c3c", fg="#cccccc", activebackground="#505050",
+                activeforeground="#ffffff", relief=tk.FLAT,
+                font=("Segoe UI", 9), padx=8, pady=4, cursor="hand2")
+
+    def _toggle_play() -> None:
+        _playing[0] = not _playing[0]
+        if _playing[0]:
+            _t_start[0] = time.perf_counter()
+            _f_start[0] = _pos[0]
+            btn_play.config(text="⏸ Pause")
+        else:
+            btn_play.config(text="▶ Play")
+
+    def _seek(delta: int) -> None:
+        _pos[0] = max(0, _pos[0] + delta)
+        _t_start[0] = time.perf_counter()
+        _f_start[0] = _pos[0]
+        _buf_wait[0] = False
+
+    tk.Button(ctrl_frame, text="◀◀", command=lambda: _seek(-int(target_fps * 5)), **_BTN).pack(side=tk.LEFT, padx=2)
+    tk.Button(ctrl_frame, text="◀",  command=lambda: _seek(-int(target_fps)),      **_BTN).pack(side=tk.LEFT, padx=2)
+    btn_play = tk.Button(ctrl_frame, text="⏸ Pause", command=_toggle_play, **_BTN)
+    btn_play.pack(side=tk.LEFT, padx=2)
+    tk.Button(ctrl_frame, text="▶",  command=lambda: _seek(int(target_fps)),       **_BTN).pack(side=tk.LEFT, padx=2)
+    tk.Button(ctrl_frame, text="▶▶", command=lambda: _seek(int(target_fps * 5)),   **_BTN).pack(side=tk.LEFT, padx=2)
+
+    frame_label = tk.Label(ctrl_frame, text="Frame: 0  |  0.0s",
+                           bg="#1e1e1e", fg="#888888", font=("Consolas", 9))
+    frame_label.pack(side=tk.LEFT, padx=12)
+
+    pos_label = tk.Label(ctrl_frame, text="pos=…",
+                         bg="#1e1e1e", fg="#4ec9b0", font=("Consolas", 10, "bold"))
+    pos_label.pack(side=tk.LEFT, padx=4)
+
+    speed_var = tk.DoubleVar(value=1.0)
+    tk.Label(ctrl_frame, text="Speed:", bg="#1e1e1e", fg="#888888",
+             font=("Segoe UI", 9)).pack(side=tk.LEFT, padx=(12, 2))
+    for spd in (0.25, 0.5, 1.0, 2.0):
+        def _set_spd(s: float = spd) -> None:
+            _speed[0] = s
+            speed_var.set(s)
+            _t_start[0] = time.perf_counter()
+            _f_start[0] = _pos[0]
+        tk.Radiobutton(
+            ctrl_frame, text=f"{spd}×", variable=speed_var, value=spd,
+            bg="#1e1e1e", fg="#cccccc", selectcolor="#1e1e1e",
+            activebackground="#1e1e1e", font=("Segoe UI", 9),
+            command=_set_spd,
+        ).pack(side=tk.LEFT, padx=2)
+
+    worker_status_label = tk.Label(ctrl_frame, text="● Starting…",
+                                   bg="#1e1e1e", fg="#d79921", font=("Segoe UI", 9))
+    worker_status_label.pack(side=tk.RIGHT, padx=8)
+
+    root.bind("<space>",   lambda e: _toggle_play())
+    root.bind("<Left>",    lambda e: _seek(-int(target_fps)))
+    root.bind("<Right>",   lambda e: _seek(int(target_fps)))
+    root.bind("<q>",       lambda e: root.destroy())
+    root.bind("<Escape>",  lambda e: root.destroy())
+
+    def _on_close() -> None:
+        _running[0] = False
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", _on_close)
+
+    # ── Update helpers ─────────────────────────────────────────────────────
+    def _update_stats(st: dict, cur_frame: int) -> None:
+        n_dec  = st["frames_decoded"]
+        n_pred = st["frames_predicted"]
+        t_cur  = cur_frame / max(target_fps, 1.0)
+        lag    = max(0.0, (n_dec - n_pred) / max(target_fps, 1.0))
+        buf_sz = len(st["frames"])
+        status = st["status"]
+        total_est = st["total_est"]
+
+        stats_text.config(state=tk.NORMAL)
+        stats_text.delete("1.0", tk.END)
+
+        def row(label: str, value: str, tag: str = "val") -> None:
+            stats_text.insert(tk.END, f"  {label:<18}", "dim")
+            stats_text.insert(tk.END, f"{value}\n", tag)
+
+        stats_text.insert(tk.END, "  PLAYBACK\n", "head")
+        row("Position:", f"{t_cur:.1f}s")
+        row("Frame:", f"{cur_frame}")
+        row("Speed:", f"{_speed[0]}×")
+        row("Playing:", "Yes" if _playing[0] else "No", "ok" if _playing[0] else "warn")
+        if _buf_wait[0]:
+            stats_text.insert(tk.END, "  ⏸ Buffering…\n", "warn")
+
+        stats_text.insert(tk.END, "\n  PIPELINE\n", "head")
+        row("Decode fps:",  f"{st['decode_fps']:.1f}")
+        row("YOLO fps:",    f"{st['yolo_fps']:.1f}")
+        row("Decoded:",     f"{n_dec} fr")
+        row("Predicted:",   f"{n_pred} fr")
+        if total_est > 0:
+            pct = n_dec / total_est * 100
+            row("Progress:", f"{pct:.0f}%  ({n_dec}/{total_est})")
+
+        lag_tag = "ok" if lag < 5 else ("warn" if lag < 15 else "err")
+        row("Inf. lag:",  f"{lag:.1f}s", lag_tag)
+        buf_tag = "ok" if buf_sz > 60 else ("warn" if buf_sz > 10 else "err")
+        row("Frame buf:", f"{buf_sz} fr", buf_tag)
+
+        stats_text.insert(tk.END, "\n  STATUS\n", "head")
+        s_tag = "ok" if status == "Done" else ("err" if "Error" in status else "warn")
+        stats_text.insert(tk.END, f"  {status}\n", s_tag)
+        stats_text.config(state=tk.DISABLED)
+
+        wc = "● Done" if status == "Done" else ("● Error" if "Error" in status else "● Processing")
+        wfg = "#6a9955" if status == "Done" else ("#f44747" if "Error" in status else "#d79921")
+        worker_status_label.config(text=wc, fg=wfg)
+
+    def _update_graph(preds: np.ndarray, cur_frame: int) -> None:
+        if preds is None or len(preds) == 0:
+            return
+        t_all = np.arange(len(preds)) / target_fps
+        t_cur = cur_frame / target_fps
+        half  = 15.0  # half-window in seconds
+        t0w   = max(0.0, t_cur - half)
+        t1w   = t0w + half * 2
+        if t1w > t_all[-1]:
+            t1w = t_all[-1]
+            t0w = max(0.0, t1w - half * 2)
+        mask  = (t_all >= t0w) & (t_all <= t1w)
+        pred_line.set_data(t_all[mask], preds[mask])
+        cursor_line.set_data([t_cur, t_cur], [-0.05, 1.05])
+        ax.set_xlim(t0w, t1w)
+        timeline_canvas.draw_idle()
+
+    # ── Main display loop ──────────────────────────────────────────────────
+    def _tick_display() -> None:
+        if not _running[0]:
+            return
+
+        # Snapshot shared state (minimal lock hold)
+        with _lock:
+            st     = dict(_state)            # shallow copy of scalars/refs
+            frames = dict(_state["frames"])  # copy frame dict
+            preds  = _state["predictions"]   # np.ndarray ref (immutable content)
+
+        n_decoded = st["frames_decoded"]
+        n_pred    = len(preds) if preds is not None else 0
+
+        # Advance playback clock
+        if _playing[0]:
+            elapsed_s  = (time.perf_counter() - _t_start[0]) * _speed[0]
+            target_idx = int(_f_start[0] + elapsed_s * target_fps)
+        else:
+            target_idx = _pos[0]
+
+        # Buffer-wait: if display has caught up to decode position
+        if frames and target_idx > max(frames.keys()):
+            _buf_wait[0] = True
+            target_idx   = max(frames.keys())
+            # Freeze clock at current position to avoid jump when buffer refills
+            _t_start[0] = time.perf_counter()
+            _f_start[0] = target_idx
+        elif frames:
+            _buf_wait[0] = False
+
+        _pos[0] = target_idx
+
+        # Auto-stop when worker done and all frames displayed
+        if st["done"] and n_pred > 0 and _pos[0] >= n_pred - 1:
+            _playing[0] = False
+            btn_play.config(text="▶ Play")
+
+        # ── Render frame ──────────────────────────────────────────────────
+        frame_rgb = frames.get(_pos[0])
+        if frame_rgb is not None:
+            frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+
+            # Draw position meter if we have a prediction
+            pred_val: float | None = None
+            if preds is not None and len(preds) > 0:
+                idx = min(_pos[0], len(preds) - 1)
+                pred_val = float(preds[idx])
+            if pred_val is not None:
+                frame_bgr = _draw_position_meter(frame_bgr, pred_val)
+                pos_label.config(text=f"pos={pred_val:.3f}")
             else:
-                frame = frame[:, half_w:]
+                pos_label.config(text="pos=…")
 
-        frame_np = frame.cpu().numpy()
-        h, w = frame_np.shape[:2]
-        scale = display_height / h
-        disp_w = int(w * scale)
-        frame_disp = cv2.resize(frame_np, (disp_w, display_height))
-        frame_disp = cv2.cvtColor(frame_disp, cv2.COLOR_RGB2BGR)
+            # Buffering banner
+            if _buf_wait[0]:
+                cv2.putText(frame_bgr, "BUFFERING…", (12, 36),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 200, 255), 2, cv2.LINE_AA)
 
-        # Build prediction graph
-        graph = np.zeros((graph_height, disp_w, 3), dtype=np.uint8)
-        graph[:] = (30, 30, 30)
+            img = Image.fromarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+            photo = ImageTk.PhotoImage(image=img)
+            _tk_photo[0] = photo
+            h_f, w_f = frame_bgr.shape[:2]
+            video_canvas.config(width=w_f, height=h_f)
+            video_canvas.create_image(0, 0, anchor=tk.NW, image=photo)
 
-        # Show 10s window centered on current frame
-        window = int(10 * fps)
-        view_start = max(0, i - window // 2)
-        view_end = min(n_pred, view_start + window)
-        if view_end - view_start < window:
-            view_start = max(0, view_end - window)
+        # Frame / time label
+        t_sec = _pos[0] / max(target_fps, 1.0)
+        frame_label.config(text=f"Frame: {_pos[0]} / {n_decoded}  |  {t_sec:.1f}s")
 
-        view_preds = predictions[view_start:view_end]
-        n_view = len(view_preds)
+        # Periodic stats + graph updates
+        _tick[0] += 1
+        if _tick[0] % STATS_EVERY_N == 0:
+            _update_stats(st, _pos[0])
+        if _tick[0] % GRAPH_EVERY_N == 0:
+            _update_graph(preds, _pos[0])
 
-        # Draw grid lines
-        for g in [0.0, 0.25, 0.5, 0.75, 1.0]:
-            gy = int((1 - g) * (graph_height - 20)) + 10
-            cv2.line(graph, (0, gy), (disp_w, gy), (60, 60, 60), 1)
+        root.after(frame_delay_ms, _tick_display)
 
-        # Draw prediction curve
-        if n_view > 1:
-            pts = []
-            for j in range(n_view):
-                x = int(j / (n_view - 1) * (disp_w - 1))
-                y = int((1 - view_preds[j]) * (graph_height - 20)) + 10
-                pts.append((x, y))
-            for j in range(1, len(pts)):
-                cv2.line(graph, pts[j - 1], pts[j], (0, 180, 255), 2)
+    # Kick off the display loop once the window is ready
+    root.after(100, _tick_display)
+    root.mainloop()
 
-        # Draw playback cursor
-        if n_view > 1:
-            cursor_x = int((i - view_start) / (n_view - 1) * (disp_w - 1))
-        else:
-            cursor_x = disp_w // 2
-        cv2.line(graph, (cursor_x, 0), (cursor_x, graph_height), (0, 255, 0), 2)
+    # ── Cleanup ────────────────────────────────────────────────────────────
+    try:
+        plt.close(fig)
+    except Exception:
+        pass
 
-        # Info text
-        pos_val = predictions[i]
-        info = f"pos={pos_val:.2f}  frame={i}/{n_pred}  time={i / fps:.1f}s"
-        cv2.putText(graph, info, (10, graph_height - 8),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
+    with _lock:
+        final_preds = _state["predictions"]
+        err         = _state["error"]
 
-        combined = np.vstack([frame_disp, graph])
-        cv2.imshow("Prediction Playback", combined)
+    if err is not None:
+        print(f"Warning: worker thread encountered an error: {err}")
 
-        # Real-time pacing
-        if not paused:
-            elapsed = time.perf_counter() - t_start
-            target = (i + 1) * frame_time
-            wait_ms = max(1, int((target - elapsed) * 1000))
-        else:
-            wait_ms = 50
+    return final_preds if final_preds is not None else np.array([], dtype=np.float32)
 
-        key = cv2.waitKey(wait_ms) & 0xFF
-        if key == 27 or key == ord("q"):
-            break
-        elif key == ord(" "):
-            paused = not paused
-            if not paused:
-                t_start = time.perf_counter() - i * frame_time
 
-    cv2.destroyAllWindows()
+def _plot_predictions(
+    predictions: np.ndarray,
+    labels: np.ndarray | None,
+    fps: float,
+    source_name: str,
+    args,
+) -> None:
+    """Show / save a matplotlib prediction plot."""
+    matplotlib.use("TkAgg" if args.plot else "Agg")
+    time_axis = np.arange(len(predictions)) / fps
+    fig, axes = plt.subplots(
+        2 if labels is not None else 1, 1,
+        figsize=(16, 6 if labels is not None else 4),
+        sharex=True,
+    )
+    if labels is None:
+        axes = [axes]
+
+    axes[0].plot(time_axis, predictions, lw=1.5, color="darkorange", label="TCN prediction")
+    if labels is not None:
+        axes[0].plot(time_axis, labels, lw=1.2, alpha=0.7, color="steelblue", label="Ground truth")
+    axes[0].set_ylim(-0.05, 1.05)
+    axes[0].set_ylabel("Position")
+    axes[0].legend(fontsize=9)
+    axes[0].set_title(f"TCN Prediction — {source_name}")
+    axes[0].grid(alpha=0.3)
+
+    if labels is not None:
+        error = predictions - labels
+        axes[1].fill_between(time_axis, error, color="red", alpha=0.4, label="Error (pred - target)")
+        axes[1].axhline(0, color="black", lw=0.8)
+        axes[1].set_ylim(-1.05, 1.05)
+        axes[1].set_ylabel("Error")
+        axes[1].set_xlabel("Time (s)")
+        axes[1].legend(fontsize=9)
+        axes[1].grid(alpha=0.3)
+
+    plt.tight_layout()
+
+    if args.save_plot:
+        args.save_plot.parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(args.save_plot, dpi=150)
+        print(f"Saved plot: {args.save_plot}")
+
+    if args.plot:
+        plt.show()
+
+    plt.close(fig)
 
 
 def main() -> None:
@@ -640,9 +1137,52 @@ def main() -> None:
         device = torch.device(args.device)
     print(f"Device: {device}")
 
-    # ── Load or extract features ────────────────────────────────────────
     labels = None
+    source_name = ""
 
+    # ── Live playback path (--playback --video) ───────────────────────────
+    if args.playback and args.video is not None:
+        if not args.video.exists():
+            print(f"Error: video file not found: {args.video}")
+            sys.exit(1)
+
+        emb_mean, emb_std, flow_mean, flow_std = load_stats(args.data_dir)
+        model = load_model(args.checkpoint, device)
+        source_name = args.video.stem
+
+        print(f"Starting live playback + prediction for {args.video}...")
+        predictions = live_playback_with_prediction(
+            args.video, args.pose_model, model, device,
+            vr_mode=args.vr_mode, sbs_crop=args.sbs_crop,
+            start_time=args.start_time, duration=args.duration,
+            target_fps=args.fps, frame_size=args.frame_size,
+            max_persons=args.max_persons, seq_len=args.seq_len,
+            emb_mean=emb_mean, emb_std=emb_std,
+            flow_mean=flow_mean, flow_std=flow_std,
+        )
+
+        if len(predictions) == 0:
+            print("No predictions produced (window closed before processing completed).")
+            return
+
+        n_frames = len(predictions)
+        print(f"  Predictions: {n_frames} frames, "
+              f"range=[{predictions.min():.4f}, {predictions.max():.4f}]")
+
+        # Save funscript
+        out_path = args.out or args.video.with_suffix(".funscript")
+        funscript = predictions_to_funscript(predictions, args.fps, args.start_time or 0.0)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_path, "w") as f:
+            json.dump(funscript, f)
+        print(f"Saved funscript: {out_path} ({len(funscript['actions'])} actions)")
+
+        # Optional plot after playback
+        if args.plot or args.save_plot:
+            _plot_predictions(predictions, None, args.fps, source_name, args)
+        return
+
+    # ── Batch path (no --playback) ───────────────────────────────────────
     if args.scene:
         # Load pre-extracted features from scene directory
         scene_dir = args.data_dir / "processed" / args.scene
@@ -737,55 +1277,9 @@ def main() -> None:
             json.dump(funscript, f)
         print(f"Saved funscript: {auto_out} ({len(funscript['actions'])} actions)")
 
-    # Playback
-    if args.playback and args.video is not None:
-        playback_with_prediction(
-            args.video, predictions, args.fps,
-            vr_mode=args.vr_mode, sbs_crop=args.sbs_crop,
-            start_time=args.start_time or 0.0,
-        )
-
     # Plot
     if args.plot or args.save_plot:
-        matplotlib.use("TkAgg" if args.plot else "Agg")
-        time_axis = np.arange(n_frames) / args.fps
-
-        fig, axes = plt.subplots(2 if labels is not None else 1, 1,
-                                  figsize=(16, 6 if labels is not None else 4),
-                                  sharex=True)
-        if labels is None:
-            axes = [axes]
-
-        axes[0].plot(time_axis, predictions, lw=1.5, color="darkorange", label="TCN prediction")
-        if labels is not None:
-            axes[0].plot(time_axis, labels, lw=1.2, alpha=0.7, color="steelblue", label="Ground truth")
-        axes[0].set_ylim(-0.05, 1.05)
-        axes[0].set_ylabel("Position")
-        axes[0].legend(fontsize=9)
-        axes[0].set_title(f"TCN Prediction — {source_name}")
-        axes[0].grid(alpha=0.3)
-
-        if labels is not None:
-            error = predictions - labels
-            axes[1].fill_between(time_axis, error, color="red", alpha=0.4, label="Error (pred - target)")
-            axes[1].axhline(0, color="black", lw=0.8)
-            axes[1].set_ylim(-1.05, 1.05)
-            axes[1].set_ylabel("Error")
-            axes[1].set_xlabel("Time (s)")
-            axes[1].legend(fontsize=9)
-            axes[1].grid(alpha=0.3)
-
-        plt.tight_layout()
-
-        if args.save_plot:
-            args.save_plot.parent.mkdir(parents=True, exist_ok=True)
-            plt.savefig(args.save_plot, dpi=150)
-            print(f"Saved plot: {args.save_plot}")
-
-        if args.plot:
-            plt.show()
-
-        plt.close(fig)
+        _plot_predictions(predictions, labels, args.fps, source_name, args)
 
 
 if __name__ == "__main__":
