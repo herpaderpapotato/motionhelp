@@ -8,6 +8,8 @@ __pycache__/
 *.ipynb
 *.bat
 
+/tmp/*
+
 # Distribution / packaging
 .Python
 build/

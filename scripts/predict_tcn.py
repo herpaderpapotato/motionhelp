@@ -35,14 +35,10 @@ from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.models.tcn import FunscriptTCN
-from src.data.pose import load_pose_model, extract_pose_batch
-from src.data.embeddings import YOLOEmbeddingExtractor, EMBED_DIM
+from src.data.pose import load_pose_model
+from src.data.extraction import SinglePassExtractor, extract_single_pass_batched
+from src.data.decode import stream_video_gpu
 from src.data.flow import compute_flow_raft_batched
-from src.config import Config
-from src.data.curation import (
-    discover_scenes, flow_path,
-    resolve_keypoints_path, resolve_flow_path,
-)
 
 import os
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
@@ -267,15 +263,15 @@ def extract_features_from_video(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Extract keypoints, embeddings, and flow features from a raw video.
 
-    Streaming pipeline: decodes and processes one chunk of frames at a time so
-    only ~chunk_size frame images are held in RAM simultaneously. Feature arrays
-    (keypoints, embeddings, flow) are accumulated as they are produced and are
-    much smaller than the raw frames.
+    Uses single-pass YOLO extraction (pose + RoI Align embeddings from one
+    forward pass) and torchcodec GPU decode for maximum throughput.
     """
-    timings: dict[str, float] = {"model_load": 0.0, "video_decode": 0.0,
-                                  "yolo_pose": 0.0, "yolo_embed": 0.0, "raft_flow": 0.0}
+    timings: dict[str, float] = {
+        "model_load": 0.0, "video_decode": 0.0,
+        "yolo_single_pass": 0.0, "raft_flow": 0.0,
+    }
 
-    # ── Load pose model ──────────────────────────────────────────────────
+    # ── Load pose model + single-pass extractor ──────────────────────────
     t0 = time.perf_counter()
     print(f"Loading pose model from {pose_model_path}...")
     pose_model = load_pose_model(
@@ -283,108 +279,91 @@ def extract_features_from_video(
         model_path=str(pose_model_path),
         device=str(device),
     )
-    extractor = YOLOEmbeddingExtractor(
-        pose_model, layer_idx=10, max_persons=max_persons, device=str(device),
+    extractor = SinglePassExtractor(
+        pose_model, max_persons=max_persons, n_keypoints=21,
+        confidence_threshold=0.02, device=str(device),
     )
     timings["model_load"] = time.perf_counter() - t0
 
     batch_size = 32
-    flow_size = max(64, int(0.5 * 640))  # 320
+    flow_size = 320
+    crop_left_half = vr_mode and sbs_crop == "left"
 
     all_keypoints: list[np.ndarray] = []
     all_embeddings: list[np.ndarray] = []
     all_flow: list[np.ndarray] = []
-
-    # prev_flow_frame: last flow-size frame from previous chunk, for RAFT continuity
     prev_flow_frame: np.ndarray | None = None
     n_frames = 0
-    first_chunk = True
 
-    print(f"  Streaming video in chunks of {chunk_size} frames...")
-    t_stream_start = time.perf_counter()
+    # Estimate total frames for progress bar
+    total_est = None
+    try:
+        from torchcodec.decoders import VideoDecoder as _VD
+        _tmp = _VD(str(video_path))
+        src_fps = _tmp.metadata.average_fps or 30.0
+        src_n = _tmp.metadata.num_frames or 0
+        _tmp = None
+        eff_fps = target_fps or src_fps
+        if duration:
+            total_est = int(duration * eff_fps)
+        elif src_fps > 0:
+            total_est = int(src_n * eff_fps / src_fps)
+    except Exception:
+        pass
 
-    totalframes = None
-    import cv2
-    cap = cv2.VideoCapture(str(video_path))
-    if cap.isOpened():
-        totalframes = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        video_fps = cap.get(cv2.CAP_PROP_FPS)
-        if video_fps > 0 and target_fps is not None:
-            totalframes = int(totalframes * (target_fps / video_fps))
-        cap.release()
-    if duration is not None and target_fps is not None:
-        totalframes = min(totalframes or float("inf"), int(duration * target_fps))
-    tp = tqdm(total=(totalframes // chunk_size), unit=f"{chunk_size} frames", desc="Processing video", dynamic_ncols=True)
+    tp = tqdm(
+        total=max(1, total_est // chunk_size) if total_est else None,
+        unit=f"×{chunk_size}f", desc="Processing", dynamic_ncols=True,
+    )
 
-    for chunk in _stream_frames_ffmpeg(
+    t_last = time.perf_counter()
+
+    for chunk_data in stream_video_gpu(
         video_path,
+        device=str(device),
+        crop_left_half=crop_left_half,
         target_size=frame_size,
-        crop_left_half=(vr_mode and sbs_crop == "left"),
+        target_fps=target_fps,
         start_time=start_time,
         duration=duration,
-        target_fps=target_fps,
         chunk_size=chunk_size,
+        as_numpy=False,
     ):
         t_decode_end = time.perf_counter()
-        timings["video_decode"] += t_decode_end - (t_stream_start if first_chunk else t_proc_end)
+        timings["video_decode"] += t_decode_end - t_last
 
-        chunk_n = len(chunk)
-        n_frames += chunk_n
-
-        # ── Detect SBS on first chunk only ───────────────────────────────
-        if first_chunk:
-            h, w = chunk[0].shape[:2]
-            is_vr_sbs = w > h * 1.8
-            decode_method = "ffmpeg+nvdec" if (h == frame_size and w == frame_size) else "cv2/cpu"
-            #print(f"  First chunk: {chunk_n} frames {w}×{h} via {decode_method}")
-            first_chunk = False
-
-        # ── Preprocess: pose frames & flow frames ─────────────────────────
-        h, w = chunk[0].shape[:2]
-        if h == frame_size and w == frame_size:
-            pose_frames = chunk
-        elif vr_mode and is_vr_sbs:
-            half_w = w // 2
-            if sbs_crop == "left":
-                pose_frames = [cv2.resize(f[:, :half_w], (frame_size, frame_size)) for f in chunk]
-            else:
-                pose_frames = [cv2.resize(f[:, half_w:], (frame_size, frame_size)) for f in chunk]
+        # Convert to numpy for YOLO compatibility
+        if isinstance(chunk_data, torch.Tensor):
+            chunk_np = chunk_data.cpu().numpy()
+        elif isinstance(chunk_data, list):
+            chunk_np = np.stack(chunk_data)
         else:
-            pose_frames = [cv2.resize(f, (frame_size, frame_size)) for f in chunk]
+            chunk_np = chunk_data
 
-        flow_frames = [cv2.resize(f, (flow_size, flow_size)) for f in chunk]
-        del chunk  # free raw frames ASAP
+        chunk_n = len(chunk_np)
+        n_frames += chunk_n
+        pose_frames = list(chunk_np)
 
-        # ── YOLO pose ─────────────────────────────────────────────────────
+        # Resize for flow (320×320)
+        flow_frames = [cv2.resize(f, (flow_size, flow_size)) for f in pose_frames]
+
+        # ── Single-pass YOLO: keypoints + embeddings ─────────────────────
         t0 = time.perf_counter()
-        kpts = _extract_pose_batched(pose_model, pose_frames, max_persons, chunk_n, batch_size)
-        all_keypoints.append(kpts)
-        timings["yolo_pose"] += time.perf_counter() - t0
-
-        # ── YOLO embed ────────────────────────────────────────────────────
-        t0 = time.perf_counter()
-        chunk_emb = []
-        for i in range(0, chunk_n, batch_size):
-            batch = np.stack(pose_frames[i : i + batch_size])
-            chunk_emb.append(extractor.extract_batch(batch))
-        all_embeddings.append(np.concatenate(chunk_emb, axis=0))
-        timings["yolo_embed"] += time.perf_counter() - t0
+        kp, emb = extract_single_pass_batched(extractor, pose_frames, batch_size)
+        all_keypoints.append(kp)
+        all_embeddings.append(emb)
+        timings["yolo_single_pass"] += time.perf_counter() - t0
 
         del pose_frames
 
-        # ── RAFT flow ─────────────────────────────────────────────────────
-        # Prepend the last frame of the previous chunk so the first frame of
-        # this chunk gets a valid flow vector instead of a copy of frame 1.
+        # ── RAFT flow (with cross-chunk continuity) ──────────────────────
         t0 = time.perf_counter()
         if prev_flow_frame is not None:
-            flow_input = np.stack([prev_flow_frame] + flow_frames)  # [chunk_n+1, H, W, C]
+            flow_input = np.stack([prev_flow_frame] + flow_frames)
             flow_chunk = compute_flow_raft_batched(
                 flow_input, output_features=64, device=str(device), batch_size=64,
             )
-            # flow_input[0]=prev_last, flow_input[1]=frame0, ...
-            # flow_chunk[1] = flow(prev_last→frame0) — correct for frame0
-            # flow_chunk[2] = flow(frame0→frame1) — correct for frame1, etc.
-            all_flow.append(flow_chunk[1:])  # [chunk_n, 64]
+            all_flow.append(flow_chunk[1:])
         else:
             flow_input = np.stack(flow_frames)
             flow_chunk = compute_flow_raft_batched(
@@ -395,9 +374,10 @@ def extract_features_from_video(
         del flow_frames
         timings["raft_flow"] += time.perf_counter() - t0
 
-        t_proc_end = time.perf_counter()
+        t_last = time.perf_counter()
         tp.update(1)
 
+    tp.close()
     extractor.close()
     if device.type == "cuda":
         torch.cuda.synchronize()
@@ -500,6 +480,122 @@ def predictions_to_funscript(positions: np.ndarray, fps: float = 30.0, start_tim
     }
 
 
+def playback_with_prediction(
+    video_path: Path,
+    predictions: np.ndarray,
+    fps: float,
+    vr_mode: bool,
+    sbs_crop: str,
+    start_time: float = 0.0,
+    display_height: int = 720,
+) -> None:
+    """Real-time video playback with prediction graph overlay."""
+    try:
+        from torchcodec.decoders import VideoDecoder
+        decoder = VideoDecoder(str(video_path), device="cuda", dimension_order="NHWC")
+        src_fps = decoder.metadata.average_fps or 30.0
+    except Exception:
+        print("Error: torchcodec CUDA required for playback mode")
+        return
+
+    start_frame = int(start_time * src_fps) if start_time else 0
+    step = src_fps / fps if fps < src_fps else 1.0
+    n_pred = len(predictions)
+    graph_height = 140
+
+    cv2.namedWindow("Prediction Playback", cv2.WINDOW_NORMAL)
+    frame_time = 1.0 / fps
+    t_start = time.perf_counter()
+    paused = False
+
+    print(f"  Playback: {n_pred} frames at {fps} fps. Press Q/ESC to quit, SPACE to pause.")
+
+    for i in range(n_pred):
+        src_idx = start_frame + int(i * step)
+        if src_idx >= len(decoder):
+            break
+
+        frame = decoder[src_idx]  # [H, W, C] uint8 CUDA
+
+        # VR crop
+        if vr_mode:
+            half_w = frame.shape[1] // 2
+            if sbs_crop == "left":
+                frame = frame[:, :half_w]
+            else:
+                frame = frame[:, half_w:]
+
+        frame_np = frame.cpu().numpy()
+        h, w = frame_np.shape[:2]
+        scale = display_height / h
+        disp_w = int(w * scale)
+        frame_disp = cv2.resize(frame_np, (disp_w, display_height))
+        frame_disp = cv2.cvtColor(frame_disp, cv2.COLOR_RGB2BGR)
+
+        # Build prediction graph
+        graph = np.zeros((graph_height, disp_w, 3), dtype=np.uint8)
+        graph[:] = (30, 30, 30)
+
+        # Show 10s window centered on current frame
+        window = int(10 * fps)
+        view_start = max(0, i - window // 2)
+        view_end = min(n_pred, view_start + window)
+        if view_end - view_start < window:
+            view_start = max(0, view_end - window)
+
+        view_preds = predictions[view_start:view_end]
+        n_view = len(view_preds)
+
+        # Draw grid lines
+        for g in [0.0, 0.25, 0.5, 0.75, 1.0]:
+            gy = int((1 - g) * (graph_height - 20)) + 10
+            cv2.line(graph, (0, gy), (disp_w, gy), (60, 60, 60), 1)
+
+        # Draw prediction curve
+        if n_view > 1:
+            pts = []
+            for j in range(n_view):
+                x = int(j / (n_view - 1) * (disp_w - 1))
+                y = int((1 - view_preds[j]) * (graph_height - 20)) + 10
+                pts.append((x, y))
+            for j in range(1, len(pts)):
+                cv2.line(graph, pts[j - 1], pts[j], (0, 180, 255), 2)
+
+        # Draw playback cursor
+        if n_view > 1:
+            cursor_x = int((i - view_start) / (n_view - 1) * (disp_w - 1))
+        else:
+            cursor_x = disp_w // 2
+        cv2.line(graph, (cursor_x, 0), (cursor_x, graph_height), (0, 255, 0), 2)
+
+        # Info text
+        pos_val = predictions[i]
+        info = f"pos={pos_val:.2f}  frame={i}/{n_pred}  time={i / fps:.1f}s"
+        cv2.putText(graph, info, (10, graph_height - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
+
+        combined = np.vstack([frame_disp, graph])
+        cv2.imshow("Prediction Playback", combined)
+
+        # Real-time pacing
+        if not paused:
+            elapsed = time.perf_counter() - t_start
+            target = (i + 1) * frame_time
+            wait_ms = max(1, int((target - elapsed) * 1000))
+        else:
+            wait_ms = 50
+
+        key = cv2.waitKey(wait_ms) & 0xFF
+        if key == 27 or key == ord("q"):
+            break
+        elif key == ord(" "):
+            paused = not paused
+            if not paused:
+                t_start = time.perf_counter() - i * frame_time
+
+    cv2.destroyAllWindows()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="TCN funscript prediction")
     input_group = parser.add_mutually_exclusive_group(required=True)
@@ -533,6 +629,8 @@ def main() -> None:
                         help="Show matplotlib plot of prediction vs ground truth")
     parser.add_argument("--save-plot", type=Path, default=None,
                         help="Save the plot to this path (PNG)")
+    parser.add_argument("--playback", action="store_true",
+                        help="Real-time video playback with prediction overlay")
     args = parser.parse_args()
 
     # Device
@@ -638,6 +736,14 @@ def main() -> None:
         with open(auto_out, "w") as f:
             json.dump(funscript, f)
         print(f"Saved funscript: {auto_out} ({len(funscript['actions'])} actions)")
+
+    # Playback
+    if args.playback and args.video is not None:
+        playback_with_prediction(
+            args.video, predictions, args.fps,
+            vr_mode=args.vr_mode, sbs_crop=args.sbs_crop,
+            start_time=args.start_time or 0.0,
+        )
 
     # Plot
     if args.plot or args.save_plot:
