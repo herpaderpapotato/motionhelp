@@ -50,6 +50,7 @@ class MotionDataset(Dataset):
 
     KP_FILE = "keypoints/pose-vrlens-finetunes-large.npy"
     EMB_FILE = "embeddings/pose-vrlens-finetunes-large.npy"
+    EMB_FILE_META = "embeddings/pose-vrlens-finetunes-large.json"
     FLOW_FILE = "flow/raft_f64_s0.5.npy"
 
     def __init__(
@@ -88,12 +89,29 @@ class MotionDataset(Dataset):
             vid_dir = processed / vid_id
             kp_path = vid_dir / self.KP_FILE
             emb_path = vid_dir / self.EMB_FILE
+            emb_meta_path = vid_dir / self.EMB_FILE_META
             flow_path = vid_dir / self.FLOW_FILE
             label_path = vid_dir / "labels.npy"
 
-            if not all(p.exists() for p in [kp_path, emb_path, flow_path, label_path]):
+            if not all(p.exists() for p in [kp_path, emb_path, emb_meta_path, flow_path, label_path]):
                 skipped += 1
                 continue
+            
+            # check for review.json in scene directory and skip if "status": "rejected" or "stage2_status": "rejected"
+            review_path = vid_dir / "review.json"
+            if review_path.exists():
+                review = json.loads(review_path.read_text(encoding="utf-8"))
+                if review.get("status") == "rejected" or review.get("stage2_status") == "rejected":
+                    skipped += 1
+                    continue
+            # check if embeddings/pose-vrlens-finetunes-large.json says "method": "single_pass_hook_roi_align" otherwise skip to avoid training on scenes that haven't been reprocessed with the new method
+            if emb_meta_path.exists():
+                meta = json.loads(emb_meta_path.read_text(encoding="utf-8"))
+                if meta.get("method") != "single_pass_hook_roi_align":
+                    skipped += 1
+                    continue
+            
+
 
             n_frames = np.load(str(label_path), mmap_mode="r").shape[0]
             if n_frames < seq_len:
@@ -312,11 +330,11 @@ def train() -> None:
         dropout=args.dropout,
     ).to(device)
 
-    # checkpoint = Path("best_tcn.pt")
-    # if checkpoint.exists():
-    #     log.info("Loading checkpoint from %s", checkpoint)
-    #     ckpt = torch.load(checkpoint, map_location=device, weights_only=False)
-    #     model.load_state_dict(ckpt["model_state_dict"])
+    checkpoint = Path("data\\models\\checkpoints_tcn\\tcn_epoch500.pt")
+    if checkpoint.exists():
+        log.info("Loading checkpoint from %s", checkpoint)
+        ckpt = torch.load(checkpoint, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model_state_dict"])
 
     params = model.count_parameters()
     log.info("Model: %s trainable / %s total parameters",
@@ -350,7 +368,7 @@ def train() -> None:
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
             mode="min",
-            factor=0.98,
+            factor=0.99,
             patience=10,
             min_lr=args.lr * 0.001,
         )
@@ -428,7 +446,10 @@ def train() -> None:
             grad_norm = nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             scaler.step(optimizer)
             scaler.update()
-            scheduler.step()
+            if args.scheduler == "ReduceLROnPlateau":
+                scheduler.step(loss)
+            else:
+                scheduler.step()
 
             train_losses.append(loss.item())
             train_pos_losses.append(pos_loss.item())
