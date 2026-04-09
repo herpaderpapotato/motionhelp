@@ -282,7 +282,29 @@ def _apply_phase_freezing(model: FunscriptTCN, phase: int) -> None:
     Phase 2: Train only pose pathways (freeze emb, flow, TCN, output)
     Phase 3: Train only embedding pathways (freeze pose, flow, TCN, output)
     Phase 4: Train only flow pathway (freeze pose, emb, TCN, output)
-    Phase 5: Train only fusion + output head (freeze encoders + TCN)
+    5 flow encoder + fusion + output head
+    6 embeddings + fusion + output head
+    7 pose pathways + fusion + output head
+    8 flow encoder, embedding encoders, fusion + output head + TCN backbone
+    9 fusion + output head + TCN backbone
+    10  only pose pathways
+    11 fusion + output head + TCN backbone
+    12 phase 1 again (but do it at a low lr)
+
+    So:
+    We get it to a reasonable state.
+    We make sure we're doing the best we can with pose.
+    We make sure we're doing the best we can with embedding
+    We make sure we're doing the best we can with flow
+    We give flow a chance to dominate the path
+    We give embeddings a chance to dominate the path
+    We give pose a chance to dominate the path
+    We optimize the path again
+    We just tune pose for the path.
+    We optimize the path again
+    We make extremely small changes to the whole thing.
+
+    Ideally I'd also zero out the data or handle the augmentation differently. I probably do need to stop augmentation zeroing out the primary input in that scenario.
     """
     # First, freeze everything
     if phase > 1:
@@ -314,6 +336,65 @@ def _apply_phase_freezing(model: FunscriptTCN, phase: int) -> None:
         for p in model.flow_encoder.parameters():
             p.requires_grad = True
     elif phase == 5:
+        # Unfreeze flow encoder, fusion + output head + TCN backbone
+        for p in model.flow_encoder.parameters():
+            p.requires_grad = True 
+        for p in model.fusion.parameters():
+            p.requires_grad = True
+        for p in model.output_head.parameters():
+            p.requires_grad = True
+        for p in model.tcn_blocks.parameters():
+            p.requires_grad = True
+    elif phase == 6:
+        # Unfreeze embedding encoders
+        for p in model.emb_encoder.parameters():
+            p.requires_grad = True
+        for p in model.emb_attn.parameters():
+            p.requires_grad = True
+        if model.multiclass:
+            for p in model.beholder_emb_encoder.parameters():
+                p.requires_grad = True
+        for p in model.fusion.parameters():
+            p.requires_grad = True
+        for p in model.output_head.parameters():
+            p.requires_grad = True
+        for p in model.tcn_blocks.parameters():
+            p.requires_grad = True
+    elif phase == 7:
+        # Unfreeze pose encoders
+        for p in model.pose_encoder.parameters():
+            p.requires_grad = True
+        for p in model.pose_attn.parameters():
+            p.requires_grad = True
+        if model.multiclass:
+            for p in model.beholder_pose_encoder.parameters():
+                p.requires_grad = True
+        for p in model.flow_encoder.parameters():
+            p.requires_grad = True 
+        for p in model.fusion.parameters():
+            p.requires_grad = True
+        for p in model.output_head.parameters():
+            p.requires_grad = True
+        for p in model.tcn_blocks.parameters():
+            p.requires_grad = True
+    elif phase == 8:
+        # Unfreeze flow encoder, embedding encoders, fusion + output head + TCN backbone
+        for p in model.emb_encoder.parameters():
+            p.requires_grad = True
+        for p in model.emb_attn.parameters():
+            p.requires_grad = True
+        if model.multiclass:
+            for p in model.beholder_emb_encoder.parameters():
+                p.requires_grad = True
+        for p in model.flow_encoder.parameters():
+            p.requires_grad = True 
+        for p in model.fusion.parameters():
+            p.requires_grad = True
+        for p in model.output_head.parameters():
+            p.requires_grad = True
+        for p in model.tcn_blocks.parameters():
+            p.requires_grad = True
+    elif phase == 9:
         # Unfreeze fusion + output head + TCN backbone
         for p in model.fusion.parameters():
             p.requires_grad = True
@@ -321,8 +402,27 @@ def _apply_phase_freezing(model: FunscriptTCN, phase: int) -> None:
             p.requires_grad = True
         for p in model.tcn_blocks.parameters():
             p.requires_grad = True
+    elif phase == 10:
+        # Unfreeze pose encoders only
+        for p in model.pose_encoder.parameters():
+            p.requires_grad = True
+        for p in model.pose_attn.parameters():
+            p.requires_grad = True
+        if model.multiclass:
+            for p in model.beholder_pose_encoder.parameters():
+                p.requires_grad = True
+    elif phase == 11:
+        # Unfreeze fusion + output head + TCN backbone
+        for p in model.fusion.parameters():
+            p.requires_grad = True
+        for p in model.output_head.parameters():
+            p.requires_grad = True
+        for p in model.tcn_blocks.parameters():
+            p.requires_grad = True
+    elif phase == 12:
+        pass  # all trainable
     else:
-        raise ValueError(f"Invalid phase: {phase}. Must be 1-5.")
+        raise ValueError(f"Invalid phase: {phase}. Must be 1-12.")
 
     log.info("Phase %d freezing applied", phase)
 
@@ -356,7 +456,7 @@ def train() -> None:
     parser.add_argument("--n-beholders", type=int, default=1)
     parser.add_argument("--n-beholder-keypoints", type=int, default=7)
     parser.add_argument("--phase", type=int, default=None,
-                        help="Training phase (1-5) for multi-phase training")
+                        help="Training phase (1-6) for multi-phase training")
     parser.add_argument("--resume", type=Path, default=None,
                         help="Resume from checkpoint (for multi-phase training)")
     parser.add_argument("--early-stopping-patience", type=int, default=50,

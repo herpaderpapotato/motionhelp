@@ -531,7 +531,7 @@ def live_playback_with_prediction(
     from PIL import Image, ImageTk
 
     #MAX_FRAME_BUF = 600       # max decoded frames to keep in RAM (~150MB at 640px)
-    MAX_FRAME_BUF = 480 # 4 x seq_len
+    MAX_FRAME_BUF = 200
     STATS_EVERY_N = 8         # update stats panel every N display ticks
     GRAPH_EVERY_N = 4         # update matplotlib graph every N display ticks
 
@@ -787,7 +787,7 @@ def live_playback_with_prediction(
     # Buffer thresholds
     BUF_START_THRESHOLD = MAX_FRAME_BUF       # must fill completely before initial play
     BUF_RESUME_THRESHOLD = MAX_FRAME_BUF
-    BUF_LOW_THRESHOLD    = seq_len * 2                 # pause playback when buffer drops below this
+    BUF_LOW_THRESHOLD    = 120                 # pause playback when buffer drops below this
 
     frame_delay_ms = max(16, int(1000.0 / target_fps))
 
