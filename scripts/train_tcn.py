@@ -315,6 +315,7 @@ def _apply_phase_freezing(model: FunscriptTCN, phase: int) -> None:
         pass  # all trainable
     elif phase == 2:
         # Unfreeze pose encoders only
+        print("Unfreezing pose encoders only")
         for p in model.pose_encoder.parameters():
             p.requires_grad = True
         for p in model.pose_attn.parameters():
@@ -324,6 +325,7 @@ def _apply_phase_freezing(model: FunscriptTCN, phase: int) -> None:
                 p.requires_grad = True
     elif phase == 3:
         # Unfreeze embedding encoders only
+        print("Unfreezing embedding encoders only")
         for p in model.emb_encoder.parameters():
             p.requires_grad = True
         for p in model.emb_attn.parameters():
@@ -333,10 +335,12 @@ def _apply_phase_freezing(model: FunscriptTCN, phase: int) -> None:
                 p.requires_grad = True
     elif phase == 4:
         # Unfreeze flow encoder only
+        print("Unfreezing flow encoder only")
         for p in model.flow_encoder.parameters():
             p.requires_grad = True
     elif phase == 5:
         # Unfreeze flow encoder, fusion + output head + TCN backbone
+        print("Unfreezing flow encoder, fusion + output head + TCN backbone")
         for p in model.flow_encoder.parameters():
             p.requires_grad = True 
         for p in model.fusion.parameters():
@@ -347,6 +351,7 @@ def _apply_phase_freezing(model: FunscriptTCN, phase: int) -> None:
             p.requires_grad = True
     elif phase == 6:
         # Unfreeze embedding encoders
+        print("Unfreezing embedding encoders only")
         for p in model.emb_encoder.parameters():
             p.requires_grad = True
         for p in model.emb_attn.parameters():
@@ -362,6 +367,7 @@ def _apply_phase_freezing(model: FunscriptTCN, phase: int) -> None:
             p.requires_grad = True
     elif phase == 7:
         # Unfreeze pose encoders
+        print("Unfreezing pose encoders only")
         for p in model.pose_encoder.parameters():
             p.requires_grad = True
         for p in model.pose_attn.parameters():
@@ -379,6 +385,7 @@ def _apply_phase_freezing(model: FunscriptTCN, phase: int) -> None:
             p.requires_grad = True
     elif phase == 8:
         # Unfreeze flow encoder, embedding encoders, fusion + output head + TCN backbone
+        print("Unfreezing flow encoder, embedding encoders, fusion + output head + TCN backbone")
         for p in model.emb_encoder.parameters():
             p.requires_grad = True
         for p in model.emb_attn.parameters():
@@ -396,6 +403,7 @@ def _apply_phase_freezing(model: FunscriptTCN, phase: int) -> None:
             p.requires_grad = True
     elif phase == 9:
         # Unfreeze fusion + output head + TCN backbone
+        print("Unfreezing fusion + output head + TCN backbone")
         for p in model.fusion.parameters():
             p.requires_grad = True
         for p in model.output_head.parameters():
@@ -404,6 +412,7 @@ def _apply_phase_freezing(model: FunscriptTCN, phase: int) -> None:
             p.requires_grad = True
     elif phase == 10:
         # Unfreeze pose encoders only
+        print("Unfreezing pose encoders only")
         for p in model.pose_encoder.parameters():
             p.requires_grad = True
         for p in model.pose_attn.parameters():
@@ -413,6 +422,7 @@ def _apply_phase_freezing(model: FunscriptTCN, phase: int) -> None:
                 p.requires_grad = True
     elif phase == 11:
         # Unfreeze fusion + output head + TCN backbone
+        print("Unfreezing fusion + output head + TCN backbone")
         for p in model.fusion.parameters():
             p.requires_grad = True
         for p in model.output_head.parameters():
@@ -420,6 +430,7 @@ def _apply_phase_freezing(model: FunscriptTCN, phase: int) -> None:
         for p in model.tcn_blocks.parameters():
             p.requires_grad = True
     elif phase == 12:
+        print("Phase 12: all trainable (but do it at a low lr)")
         pass  # all trainable
     else:
         raise ValueError(f"Invalid phase: {phase}. Must be 1-12.")
@@ -459,8 +470,10 @@ def train() -> None:
                         help="Training phase (1-6) for multi-phase training")
     parser.add_argument("--resume", type=Path, default=None,
                         help="Resume from checkpoint (for multi-phase training)")
-    parser.add_argument("--early-stopping-patience", type=int, default=50,
+    parser.add_argument("--early-stopping-patience", type=int, default=20,
                         help="Stop training if val loss has not improved for this many epochs (0 = disabled)")
+    parser.add_argument("--load-best-val-loss", action="store_true", default=False,
+                        help="When resuming, load the best_val_loss from the checkpoint to continue early stopping correctly")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -594,6 +607,18 @@ def train() -> None:
     #     optimizer.load_state_dict(ckpt["optimizer_state_dict"])
     #     scheduler.load_state_dict(ckpt["scheduler_state_dict"])
     #     log.info("Loaded optimizer and scheduler state from checkpoint")
+
+    if args.resume is not None:
+        if "optimizer_state_dict" in ckpt and "scheduler_state_dict" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+            log.info("Loaded optimizer and scheduler state from checkpoint")
+        else:
+            log.warning("No optimizer/scheduler state found in checkpoint — starting with fresh optimizer/scheduler")
+        if "val_loss" in ckpt and args.load_best_val_loss:
+            best_val_loss = ckpt["val_loss"]
+            log.info("Resuming with best_val_loss = %.6f", best_val_loss)
+    
 
 
     # ── Logging / Checkpoints ─────────────────────────────────────────────
