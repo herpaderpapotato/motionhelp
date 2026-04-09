@@ -530,7 +530,8 @@ def live_playback_with_prediction(
     from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
     from PIL import Image, ImageTk
 
-    MAX_FRAME_BUF = 600       # max decoded frames to keep in RAM (~150MB at 640px)
+    #MAX_FRAME_BUF = 600       # max decoded frames to keep in RAM (~150MB at 640px)
+    MAX_FRAME_BUF = 480 # 4 x seq_len
     STATS_EVERY_N = 8         # update stats panel every N display ticks
     GRAPH_EVERY_N = 4         # update matplotlib graph every N display ticks
 
@@ -776,12 +777,17 @@ def live_playback_with_prediction(
 
     # Playback state
     _pos      = [0]                  # current display frame index
-    _playing  = [True]
+    _playing  = [False]              # start paused until buffer fills
     _speed    = [1.0]
     _t_start  = [time.perf_counter()]
     _f_start  = [0]                  # frame index when timer was last reset
-    _buf_wait = [False]              # True when display has caught up to decode
+    _buf_wait = [True]               # True while waiting for buffer to fill
     _tick     = [0]                  # display update counter
+
+    # Buffer thresholds
+    BUF_START_THRESHOLD = MAX_FRAME_BUF       # must fill completely before initial play
+    BUF_RESUME_THRESHOLD = MAX_FRAME_BUF
+    BUF_LOW_THRESHOLD    = seq_len * 2                 # pause playback when buffer drops below this
 
     frame_delay_ms = max(16, int(1000.0 / target_fps))
 
@@ -855,7 +861,7 @@ def live_playback_with_prediction(
         _pos[0] = target_frame
         _t_start[0] = time.perf_counter()
         _f_start[0] = target_frame
-        _buf_wait[0] = False
+        _buf_wait[0] = False  # user manually seeked
 
     timeline_canvas.mpl_connect("button_press_event", _on_timeline_click)
 
@@ -907,11 +913,11 @@ def live_playback_with_prediction(
         _pos[0] = max(0, _pos[0] + delta)
         _t_start[0] = time.perf_counter()
         _f_start[0] = _pos[0]
-        _buf_wait[0] = False
+        _buf_wait[0] = False  # user manually seeked, start playing immediately
 
     tk.Button(ctrl_frame, text="◀◀", command=lambda: _seek(-int(target_fps * 5)), **_BTN).pack(side=tk.LEFT, padx=2)
     tk.Button(ctrl_frame, text="◀",  command=lambda: _seek(-int(target_fps)),      **_BTN).pack(side=tk.LEFT, padx=2)
-    btn_play = tk.Button(ctrl_frame, text="⏸ Pause", command=_toggle_play, **_BTN)
+    btn_play = tk.Button(ctrl_frame, text="▶ Play", command=_toggle_play, **_BTN)
     btn_play.pack(side=tk.LEFT, padx=2)
     tk.Button(ctrl_frame, text="▶",  command=lambda: _seek(int(target_fps)),       **_BTN).pack(side=tk.LEFT, padx=2)
     tk.Button(ctrl_frame, text="▶▶", command=lambda: _seek(int(target_fps * 5)),   **_BTN).pack(side=tk.LEFT, padx=2)
@@ -1086,15 +1092,35 @@ def live_playback_with_prediction(
         else:
             target_idx = _pos[0]
 
-        # Buffer-wait: if display has caught up to decode position
-        if frames and target_idx > max(frames.keys()):
-            _buf_wait[0] = True
-            target_idx   = max(frames.keys())
-            # Freeze clock at current position to avoid jump when buffer refills
-            _t_start[0] = time.perf_counter()
-            _f_start[0] = target_idx
-        elif frames:
-            _buf_wait[0] = False
+        # Buffer management: auto-pause when buffer is low, auto-resume when refilled
+        buf_sz = len(frames)
+        worker_done = st["done"]
+
+        if _buf_wait[0]:
+            # Decide which threshold to use: full buffer on initial load,
+            # half-buffer when resuming after a catch-up stall
+            needed = BUF_START_THRESHOLD if _pos[0] == 0 else BUF_RESUME_THRESHOLD
+            if buf_sz >= needed or worker_done:
+                # Buffer is full enough — start/resume playback
+                _buf_wait[0] = False
+                if not _playing[0]:
+                    _playing[0] = True
+                    _t_start[0] = time.perf_counter()
+                    _f_start[0] = _pos[0]
+                    btn_play.config(text="⏸ Pause")
+                    # Recalculate target after resuming
+                    elapsed_s  = (time.perf_counter() - _t_start[0]) * _speed[0]
+                    target_idx = int(_f_start[0] + elapsed_s * target_fps)
+        elif not worker_done:
+            # Check if we've caught up and the buffer is running low
+            if buf_sz < BUF_LOW_THRESHOLD or (frames and target_idx > max(frames.keys())):
+                _buf_wait[0] = True
+                _playing[0] = False
+                btn_play.config(text="▶ Play")
+                # Freeze clock so position doesn't jump when we resume
+                _t_start[0] = time.perf_counter()
+                _f_start[0] = _pos[0]
+                target_idx = _pos[0]
 
         _pos[0] = target_idx
 
