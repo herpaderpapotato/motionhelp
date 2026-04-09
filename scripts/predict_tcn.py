@@ -24,13 +24,10 @@ Usage:
 import argparse
 import json
 import sys
-import threading
 import time
 from pathlib import Path
 
 import cv2
-import matplotlib
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from tqdm import tqdm
@@ -522,6 +519,8 @@ def live_playback_with_prediction(
 
     Returns the final predictions array (for downstream funscript saving).
     """
+    import os
+    import signal
     import threading
     import tkinter as tk
     from tkinter import ttk
@@ -531,9 +530,9 @@ def live_playback_with_prediction(
     from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
     from PIL import Image, ImageTk
 
-    MAX_FRAME_BUF = 300       # max decoded frames to keep in RAM (~150MB at 640px)
+    MAX_FRAME_BUF = 600       # max decoded frames to keep in RAM (~150MB at 640px)
     STATS_EVERY_N = 8         # update stats panel every N display ticks
-    GRAPH_EVERY_N = 20        # update matplotlib graph every N display ticks
+    GRAPH_EVERY_N = 4         # update matplotlib graph every N display ticks
 
     # ── Shared state (protected by _lock) ─────────────────────────────────
     _lock = threading.Lock()
@@ -612,11 +611,13 @@ def live_playback_with_prediction(
                 chunk_size=256,
                 as_numpy=True,
             ):
+                if not _running[0]:
+                    break
                 chunk_len = len(chunk_np)
 
-                strategy = "evict"
+                strategy = "suspend"
                 if strategy == "evict":
-                    # Store decoded frames  (evict oldest when buffer full)
+                    # Store decoded frames (evict oldest when buffer full)
                     with _lock:
                         for i, f in enumerate(chunk_np):
                             _state["frames"][frame_count + i] = f
@@ -624,10 +625,18 @@ def live_playback_with_prediction(
                             oldest = min(_state["frames"])
                             del _state["frames"][oldest]
                 elif strategy == "suspend":
-                    # delay processing until buffer has room, but keep all frames in memory
+                    # Wait until buffer has room, then store all frames
+                    while _running[0]:
+                        with _lock:
+                            buf_sz = len(_state["frames"])
+                        if buf_sz + chunk_len <= MAX_FRAME_BUF:
+                            break
+                        time.sleep(0.05)
+                    if not _running[0]:
+                        break
                     with _lock:
-                        while len(_state["frames"]) + chunk_len > MAX_FRAME_BUF:
-                            time.sleep(0.1)
+                        for i, f in enumerate(chunk_np):
+                            _state["frames"][frame_count + i] = f
 
 
                 pose_frames = list(chunk_np)
@@ -825,14 +834,57 @@ def live_playback_with_prediction(
     ax.set_xlabel("Time (s)",  color="#888888", fontsize=8)
     for g_val in (0.0, 0.25, 0.5, 0.75, 1.0):
         ax.axhline(g_val, color="#333333", lw=0.5, linestyle=":")
-    [pred_line]   = ax.plot([], [], lw=1.5,  color="#e37933", label="Prediction")
-    [cursor_line] = ax.plot([], [], lw=1.5,  color="#4ee344", linestyle="--", label="Now")
+    [pred_line]   = ax.plot([], [], lw=1.5,  color="#e37933", label="Prediction", animated=True)
+    [cursor_line] = ax.plot([], [], lw=1.5,  color="#4ee344", linestyle="--", label="Now", animated=True)
     ax.legend(fontsize=7, labelcolor="#888888", facecolor="#252526", edgecolor="#444444",
               loc="upper left")
     fig.tight_layout(pad=0.6)
 
     timeline_canvas = FigureCanvasTkAgg(fig, master=graph_frame)
     timeline_canvas.get_tk_widget().pack(fill=tk.X)
+
+    # Initial draw to capture background for blitting
+    timeline_canvas.draw()
+    _graph_bg = [timeline_canvas.copy_from_bbox(ax.bbox)]
+
+    # Make timeline clickable for seeking
+    def _on_timeline_click(event) -> None:
+        if event.inaxes != ax or event.xdata is None:
+            return
+        target_frame = max(0, int(event.xdata * target_fps))
+        _pos[0] = target_frame
+        _t_start[0] = time.perf_counter()
+        _f_start[0] = target_frame
+        _buf_wait[0] = False
+
+    timeline_canvas.mpl_connect("button_press_event", _on_timeline_click)
+
+    # Row 2.5: seek slider spanning full video duration
+    _seek_var = tk.IntVar(value=0)
+    _seek_updating = [False]  # prevent feedback loops
+
+    def _on_seek_slider(val: str) -> None:
+        if _seek_updating[0]:
+            return
+        frame = int(float(val))
+        _pos[0] = frame
+        _t_start[0] = time.perf_counter()
+        _f_start[0] = frame
+        _buf_wait[0] = False
+
+    seek_frame = tk.Frame(root, bg="#1e1e1e")
+    seek_frame.pack(fill=tk.X, padx=4, pady=(2, 0))
+    seek_slider = tk.Scale(
+        seek_frame, from_=0, to=1, orient=tk.HORIZONTAL,
+        variable=_seek_var, command=_on_seek_slider,
+        bg="#1e1e1e", fg="#888888", troughcolor="#3c3c3c",
+        highlightthickness=0, showvalue=False, length=600,
+        sliderrelief=tk.FLAT, sliderlength=12,
+    )
+    seek_slider.pack(fill=tk.X, expand=True)
+    seek_time_label = tk.Label(seek_frame, text="0:00 / 0:00",
+                               bg="#1e1e1e", fg="#888888", font=("Consolas", 8))
+    seek_time_label.pack()
 
     # Row 3: controls
     ctrl_frame = tk.Frame(root, bg="#1e1e1e")
@@ -895,15 +947,40 @@ def live_playback_with_prediction(
     root.bind("<space>",   lambda e: _toggle_play())
     root.bind("<Left>",    lambda e: _seek(-int(target_fps)))
     root.bind("<Right>",   lambda e: _seek(int(target_fps)))
-    root.bind("<q>",       lambda e: root.destroy())
-    root.bind("<Escape>",  lambda e: root.destroy())
+    # All close paths go through _on_close so pending after callbacks are cancelled
+    _after_id = [None]  # track the scheduled tick so we can cancel it
 
     def _on_close() -> None:
         _running[0] = False
-        root.destroy()
+        if _after_id[0] is not None:
+            try:
+                root.after_cancel(_after_id[0])
+            except Exception:
+                pass
+            _after_id[0] = None
+        # Close matplotlib BEFORE destroying Tk root — avoids hang in plt.close
+        try:
+            plt.close(fig)
+        except Exception:
+            pass
+        try:
+            root.destroy()
+        except Exception:
+            pass
 
     root.protocol("WM_DELETE_WINDOW", _on_close)
+    root.bind("<q>",      lambda e: _on_close())
+    root.bind("<Escape>", lambda e: _on_close())
 
+    # Ctrl+C handler — schedule close on the main thread
+    def _sigint_handler(sig, frame) -> None:
+        _running[0] = False
+        try:
+            root.after(0, _on_close)
+        except Exception:
+            os._exit(1)
+
+    signal.signal(signal.SIGINT, _sigint_handler)
     # ── Update helpers ─────────────────────────────────────────────────────
     def _update_stats(st: dict, cur_frame: int) -> None:
         n_dec  = st["frames_decoded"]
@@ -952,6 +1029,8 @@ def live_playback_with_prediction(
         wfg = "#6a9955" if status == "Done" else ("#f44747" if "Error" in status else "#d79921")
         worker_status_label.config(text=wc, fg=wfg)
 
+    _prev_xlim = [0.0, 30.0]  # track previous x-axis limits for blitting
+
     def _update_graph(preds: np.ndarray, cur_frame: int) -> None:
         if preds is None or len(preds) == 0:
             return
@@ -966,14 +1045,31 @@ def live_playback_with_prediction(
         mask  = (t_all >= t0w) & (t_all <= t1w)
         pred_line.set_data(t_all[mask], preds[mask])
         cursor_line.set_data([t_cur, t_cur], [-0.05, 1.05])
-        ax.set_xlim(t0w, t1w)
-        timeline_canvas.draw_idle()
+
+        # If x-limits changed, we need a full redraw to update axes/ticks
+        new_xlim = [t0w, t1w]
+        if abs(new_xlim[0] - _prev_xlim[0]) > 0.5 or abs(new_xlim[1] - _prev_xlim[1]) > 0.5:
+            ax.set_xlim(t0w, t1w)
+            _prev_xlim[:] = new_xlim
+            timeline_canvas.draw()
+            _graph_bg[0] = timeline_canvas.copy_from_bbox(ax.bbox)
+
+        # Blit: restore background, draw animated artists, blit
+        timeline_canvas.restore_region(_graph_bg[0])
+        ax.draw_artist(pred_line)
+        ax.draw_artist(cursor_line)
+        timeline_canvas.blit(ax.bbox)
 
     # ── Main display loop ──────────────────────────────────────────────────
     def _tick_display() -> None:
         if not _running[0]:
             return
+        try:
+            _tick_display_inner()
+        except Exception:
+            pass  # silently stop if widgets were destroyed during close
 
+    def _tick_display_inner() -> None:
         # Snapshot shared state (minimal lock hold)
         with _lock:
             st     = dict(_state)            # shallow copy of scalars/refs
@@ -1034,11 +1130,30 @@ def live_playback_with_prediction(
             h_f, w_f = frame_bgr.shape[:2]
             video_canvas.config(width=w_f, height=h_f)
             video_canvas.create_image(0, 0, anchor=tk.NW, image=photo)
-            # evict the frame from the
+
+        # Evict frames behind the playback position to free memory
+        if _playing[0] and _pos[0] > 30:
+            evict_below = _pos[0] - 30  # keep a small lookback for seeking
+            with _lock:
+                to_del = [k for k in _state["frames"] if k < evict_below]
+                for k in to_del:
+                    del _state["frames"][k]
 
         # Frame / time label
         t_sec = _pos[0] / max(target_fps, 1.0)
         frame_label.config(text=f"Frame: {_pos[0]} / {n_decoded}  |  {t_sec:.1f}s")
+
+        # Update seek slider range and position
+        max_frame = max(n_decoded, n_pred, 1)
+        if seek_slider.cget("to") != max_frame:
+            seek_slider.config(to=max_frame)
+        _seek_updating[0] = True
+        _seek_var.set(_pos[0])
+        _seek_updating[0] = False
+        total_sec = max_frame / max(target_fps, 1.0)
+        cur_min, cur_s = divmod(int(t_sec), 60)
+        tot_min, tot_s = divmod(int(total_sec), 60)
+        seek_time_label.config(text=f"{cur_min}:{cur_s:02d} / {tot_min}:{tot_s:02d}")
 
         # Periodic stats + graph updates
         _tick[0] += 1
@@ -1047,17 +1162,21 @@ def live_playback_with_prediction(
         if _tick[0] % GRAPH_EVERY_N == 0:
             _update_graph(preds, _pos[0])
 
-        root.after(frame_delay_ms, _tick_display)
+        try:
+            _after_id[0] = root.after(frame_delay_ms, _tick_display)
+        except Exception:
+            pass
 
     # Kick off the display loop once the window is ready
-    root.after(100, _tick_display)
+    _after_id[0] = root.after(100, _tick_display)
     root.mainloop()
 
     # ── Cleanup ────────────────────────────────────────────────────────────
-    try:
-        plt.close(fig)
-    except Exception:
-        pass
+    _running[0] = False
+    # plt.close already called in _on_close; nothing matplotlib to clean up here
+
+    # Wait for worker thread to finish (timeout to avoid hanging forever)
+    worker_thread.join(timeout=5.0)
 
     with _lock:
         final_preds = _state["predictions"]
@@ -1066,7 +1185,14 @@ def live_playback_with_prediction(
     if err is not None:
         print(f"Warning: worker thread encountered an error: {err}")
 
-    return final_preds if final_preds is not None else np.array([], dtype=np.float32)
+    result = final_preds if final_preds is not None else np.array([], dtype=np.float32)
+
+    # Force exit if threads are still alive (e.g. RAFT/YOLO blocking)
+    if worker_thread.is_alive():
+        print("Worker thread still running — forcing exit.")
+        os._exit(0)
+
+    return result
 
 
 def _plot_predictions(
@@ -1077,6 +1203,8 @@ def _plot_predictions(
     args,
 ) -> None:
     """Show / save a matplotlib prediction plot."""
+    import matplotlib
+    import matplotlib.pyplot as plt
     matplotlib.use("TkAgg" if args.plot else "Agg")
     time_axis = np.arange(len(predictions)) / fps
     fig, axes = plt.subplots(

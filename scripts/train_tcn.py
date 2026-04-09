@@ -359,6 +359,8 @@ def train() -> None:
                         help="Training phase (1-5) for multi-phase training")
     parser.add_argument("--resume", type=Path, default=None,
                         help="Resume from checkpoint (for multi-phase training)")
+    parser.add_argument("--early-stopping-patience", type=int, default=50,
+                        help="Stop training if val loss has not improved for this many epochs (0 = disabled)")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -527,6 +529,7 @@ def train() -> None:
     # ── Training loop ─────────────────────────────────────────────────────
     best_val_loss = float("inf")
     global_step = 0
+    _early_stop_counter = 0
 
     for epoch in range(1, args.epochs + 1):
         epoch_start = time.time()
@@ -673,6 +676,7 @@ def train() -> None:
         # --- Checkpoint ---
         if avg_val < best_val_loss:
             best_val_loss = avg_val
+            _early_stop_counter = 0
             torch.save({
                 "epoch": epoch,
                 "model_state_dict": model.state_dict(),
@@ -683,6 +687,14 @@ def train() -> None:
                 "model_config": model_config,
             }, checkpoint_dir / "best_tcn.pt")
             log.info("  → New best val loss: %.6f", avg_val)
+        else:
+            _early_stop_counter += 1
+            if args.early_stopping_patience > 0 and _early_stop_counter >= args.early_stopping_patience:
+                log.info(
+                    "Early stopping: no improvement for %d epochs (best val=%.6f)",
+                    _early_stop_counter, best_val_loss,
+                )
+                break
 
         if epoch % 10 == 0:
             torch.save({
