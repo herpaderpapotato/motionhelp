@@ -79,9 +79,14 @@ class FunscriptTCN(nn.Module):
     """Temporal convolutional network for per-frame funscript prediction.
 
     Input features (per frame):
-        keypoints:  [B, T, N_persons, N_keypoints, 3]  (x, y, confidence)
-        embeddings: [B, T, N_persons, embed_dim]
+        keypoints:  [B, T, N_total, N_keypoints, 3]  (x, y, confidence)
+        embeddings: [B, T, N_total, embed_dim]
         flow:       [B, T, flow_dim]
+
+    In multiclass mode (n_partners is set):
+        N_total = n_partners + n_beholders
+        Slots 0..n_partners-1 are partner detections
+        Slots n_partners.. are beholder detections (keypoints truncated to n_beholder_keypoints)
 
     Output: [B, T] position values in [0, 1]
     """
@@ -96,17 +101,33 @@ class FunscriptTCN(nn.Module):
         n_keypoints: int = 21,
         embed_dim: int = 512,
         flow_dim: int = 64,
+        # Multiclass extensions
+        n_partners: int | None = None,
+        n_beholders: int = 1,
+        n_beholder_keypoints: int = 7,
+        beholder_pose_dim: int = 32,
+        beholder_emb_dim: int = 32,
     ):
         super().__init__()
         self.d_model = d_model
-        self.n_persons = n_persons
         self.n_keypoints = n_keypoints
         self.embed_dim = embed_dim
         self.flow_dim = flow_dim
+        self.multiclass = n_partners is not None
+
+        if self.multiclass:
+            self.n_partners = n_partners
+            self.n_beholders = n_beholders
+            self.n_persons = n_partners  # PersonAttention uses partner count
+            self.n_beholder_keypoints = n_beholder_keypoints
+            self.beholder_pose_dim = beholder_pose_dim
+            self.beholder_emb_dim = beholder_emb_dim
+        else:
+            self.n_persons = n_persons
 
         kp_feat_dim = n_keypoints * 3  # 63
 
-        # -- Per-person feature encoders --
+        # -- Per-person feature encoders (partners in multiclass, all in single) --
         self.pose_encoder = nn.Sequential(
             nn.Linear(kp_feat_dim, 128),
             nn.LayerNorm(128),
@@ -127,8 +148,24 @@ class FunscriptTCN(nn.Module):
             nn.GELU(),
         )
 
-        # -- Feature fusion: 128 (pose) + 128 (emb) + 64 (flow) = 320 --
-        fusion_in = 128 + 128 + 64
+        # -- Beholder encoders (multiclass only) --
+        if self.multiclass:
+            beh_kp_dim = n_beholder_keypoints * 3  # 21
+            self.beholder_pose_encoder = nn.Sequential(
+                nn.Linear(beh_kp_dim, beholder_pose_dim),
+                nn.LayerNorm(beholder_pose_dim),
+                nn.GELU(),
+            )
+            self.beholder_emb_encoder = nn.Sequential(
+                nn.Linear(embed_dim, beholder_emb_dim),
+                nn.LayerNorm(beholder_emb_dim),
+                nn.GELU(),
+            )
+            fusion_in = 128 + 128 + 64 + beholder_pose_dim + beholder_emb_dim
+        else:
+            fusion_in = 128 + 128 + 64  # 320
+
+        # -- Feature fusion --
         self.fusion = nn.Sequential(
             nn.Linear(fusion_in, d_model),
             nn.LayerNorm(d_model),
@@ -157,38 +194,78 @@ class FunscriptTCN(nn.Module):
     ) -> torch.Tensor:
         """
         Args:
-            keypoints:  [B, T, N, K, 3]
+            keypoints:  [B, T, N, K, 3]  — N = n_partners + n_beholders (multiclass)
+                                            or n_persons (single-class)
             embeddings: [B, T, N, E]
             flow:       [B, T, F]
         Returns: [B, T] positions in [0, 1]
         """
         B, T = keypoints.shape[:2]
 
-        # -- Pose --
-        kp_flat = keypoints.reshape(B, T, self.n_persons, -1)     # [B, T, N, K*3]
-        kp_conf = keypoints[:, :, :, :, 2].mean(dim=-1)           # [B, T, N]
-        pose_feat = self.pose_encoder(kp_flat)                     # [B, T, N, 128]
-        pose_out = self.pose_attn(pose_feat, kp_conf)              # [B, T, 128]
+        if self.multiclass:
+            # -- Split partner and beholder --
+            partner_kp = keypoints[:, :, :self.n_partners]            # [B, T, Np, K, 3]
+            beholder_kp = keypoints[
+                :, :,
+                self.n_partners : self.n_partners + self.n_beholders,
+                :self.n_beholder_keypoints,
+            ]                                                          # [B, T, Nb, Kb, 3]
+            partner_emb = embeddings[:, :, :self.n_partners]           # [B, T, Np, E]
+            beholder_emb = embeddings[
+                :, :,
+                self.n_partners : self.n_partners + self.n_beholders,
+            ]                                                          # [B, T, Nb, E]
 
-        # -- Embeddings --
-        emb_feat = self.emb_encoder(embeddings)                    # [B, T, N, 128]
-        emb_out = self.emb_attn(emb_feat, kp_conf)                # [B, T, 128]
+            # -- Partner pose (existing path) --
+            kp_flat = partner_kp.reshape(B, T, self.n_partners, -1)    # [B, T, Np, K*3]
+            kp_conf = partner_kp[:, :, :, :, 2].mean(dim=-1)          # [B, T, Np]
+            pose_feat = self.pose_encoder(kp_flat)                     # [B, T, Np, 128]
+            pose_out = self.pose_attn(pose_feat, kp_conf)              # [B, T, 128]
 
-        # -- Flow --
-        flow_out = self.flow_encoder(flow)                         # [B, T, 64]
+            # -- Partner embeddings (existing path) --
+            emb_feat = self.emb_encoder(partner_emb)                   # [B, T, Np, 128]
+            emb_out = self.emb_attn(emb_feat, kp_conf)                # [B, T, 128]
 
-        # -- Fusion --
-        fused = torch.cat([pose_out, emb_out, flow_out], dim=-1)   # [B, T, 320]
-        x = self.fusion(fused)                                     # [B, T, d_model]
+            # -- Beholder pose --
+            beh_kp_flat = beholder_kp.reshape(B, T, self.n_beholders, -1)  # [B, T, Nb, Kb*3]
+            beh_pose_feat = self.beholder_pose_encoder(beh_kp_flat)    # [B, T, Nb, beh_pose_dim]
+            beh_pose_out = beh_pose_feat.mean(dim=2)                   # [B, T, beh_pose_dim]
+
+            # -- Beholder embeddings --
+            beh_emb_feat = self.beholder_emb_encoder(beholder_emb)     # [B, T, Nb, beh_emb_dim]
+            beh_emb_out = beh_emb_feat.mean(dim=2)                     # [B, T, beh_emb_dim]
+
+            # -- Flow --
+            flow_out = self.flow_encoder(flow)                         # [B, T, 64]
+
+            # -- Fusion (augmented with beholder) --
+            fused = torch.cat(
+                [pose_out, emb_out, flow_out, beh_pose_out, beh_emb_out], dim=-1,
+            )                                                          # [B, T, 384]
+        else:
+            # -- Original single-class path --
+            kp_flat = keypoints.reshape(B, T, self.n_persons, -1)      # [B, T, N, K*3]
+            kp_conf = keypoints[:, :, :, :, 2].mean(dim=-1)           # [B, T, N]
+            pose_feat = self.pose_encoder(kp_flat)                     # [B, T, N, 128]
+            pose_out = self.pose_attn(pose_feat, kp_conf)              # [B, T, 128]
+
+            emb_feat = self.emb_encoder(embeddings)                    # [B, T, N, 128]
+            emb_out = self.emb_attn(emb_feat, kp_conf)                # [B, T, 128]
+
+            flow_out = self.flow_encoder(flow)                         # [B, T, 64]
+
+            fused = torch.cat([pose_out, emb_out, flow_out], dim=-1)   # [B, T, 320]
+
+        x = self.fusion(fused)                                         # [B, T, d_model]
 
         # -- TCN (expects channels-first) --
-        x = x.transpose(1, 2)                                     # [B, d_model, T]
+        x = x.transpose(1, 2)                                         # [B, d_model, T]
         for block in self.tcn_blocks:
             x = block(x)
-        x = x.transpose(1, 2)                                     # [B, T, d_model]
+        x = x.transpose(1, 2)                                         # [B, T, d_model]
 
         # -- Output --
-        out = self.output_head(x).squeeze(-1)                      # [B, T]
+        out = self.output_head(x).squeeze(-1)                          # [B, T]
         return torch.sigmoid(out)
 
     def count_parameters(self) -> dict[str, int]:

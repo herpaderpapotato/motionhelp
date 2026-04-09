@@ -1,13 +1,15 @@
 """Re-extract embeddings for all processed scenes using SinglePassExtractor.
 
-Replaces model.embed() embeddings with hook-based RoI Align per-person
-embeddings. Also re-extracts keypoints for consistency (same predict() call
-produces both). Existing flow and labels are preserved.
+Supports both single-class and multiclass (partner + beholder) models.
+Multiclass mode stores keypoints and embeddings with class-aware slot layout:
+  - Slots 0..max_partners-1 → partner detections
+  - Slots max_partners.. → beholder detections
 
 Usage:
     python scripts/reprocess_embeddings.py --data-dir data
     python scripts/reprocess_embeddings.py --data-dir data --dry-run
     python scripts/reprocess_embeddings.py --data-dir data --scenes scene_00018_t00799_40s scene_00018_t00926_40s
+    python scripts/reprocess_embeddings.py --data-dir data --multiclass
 """
 
 import argparse
@@ -27,8 +29,13 @@ from src.data.extraction import SinglePassExtractor, extract_single_pass_batched
 
 log = logging.getLogger(__name__)
 
-KP_FILE = "keypoints/pose-vrlens-finetunes-large.npy"
-EMB_FILE = "embeddings/pose-vrlens-finetunes-large.npy"
+# Old (single-class) file names
+KP_FILE_LEGACY = "keypoints/pose-vrlens-finetunes-large.npy"
+EMB_FILE_LEGACY = "embeddings/pose-vrlens-finetunes-large.npy"
+
+# New (multiclass) file names
+KP_FILE_MULTICLASS = "keypoints/vrlens-finetunes-multiclass-v2-yolo11m-pose.npy"
+EMB_FILE_MULTICLASS = "embeddings/vrlens-finetunes-multiclass-v2-yolo11m-pose.npy"
 
 
 def reprocess_scene(
@@ -37,6 +44,7 @@ def reprocess_scene(
     extractor: SinglePassExtractor,
     batch_size: int = 32,
     dry_run: bool = False,
+    multiclass: bool = False,
 ) -> bool:
     """Re-extract keypoints and embeddings for a single scene.
 
@@ -45,6 +53,8 @@ def reprocess_scene(
 
     Returns True on success, False on skip/error.
     """
+    kp_file = KP_FILE_MULTICLASS if multiclass else KP_FILE_LEGACY
+    emb_file = EMB_FILE_MULTICLASS if multiclass else EMB_FILE_LEGACY
     video_path = data_dir / "preprocessed" / f"{scene_id}.mp4"
     scene_dir = data_dir / "processed" / scene_id
 
@@ -93,19 +103,24 @@ def reprocess_scene(
     kp_dir.mkdir(parents=True, exist_ok=True)
     emb_dir.mkdir(parents=True, exist_ok=True)
 
-    np.save(str(scene_dir / KP_FILE), keypoints)
-    np.save(str(scene_dir / EMB_FILE), embeddings)
+    np.save(str(scene_dir / kp_file), keypoints)
+    np.save(str(scene_dir / emb_file), embeddings)
 
     # Save embedding metadata for validation
     meta = {
-        "format_version": 3,
+        "format_version": 4 if multiclass else 3,
         "method": "single_pass_hook_roi_align",
+        "multiclass": multiclass,
         "shape": list(embeddings.shape),
         "dtype": str(embeddings.dtype),
         "embed_dim": 512,
         "max_persons": extractor.max_persons,
     }
-    meta_path = (scene_dir / EMB_FILE).with_suffix(".json")
+    if multiclass:
+        meta["max_partners"] = extractor.max_partners
+        meta["max_beholders"] = extractor.max_beholders
+        meta["n_beholder_keypoints"] = extractor.n_beholder_keypoints
+    meta_path = (scene_dir / emb_file).with_suffix(".json")
     meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
     return True
@@ -127,7 +142,17 @@ def main() -> None:
                         help="Specific scene IDs to process (default: all)")
     parser.add_argument("--split", default=None,
                         help="Process only scenes in this split (train/val/test)")
+    parser.add_argument("--multiclass", action="store_true",
+                        help="Use multiclass model (partner + beholder)")
+    parser.add_argument("--max-partners", type=int, default=5,
+                        help="Max partner detections per frame (multiclass mode)")
+    parser.add_argument("--max-beholders", type=int, default=1,
+                        help="Max beholder detections per frame (multiclass mode)")
     args = parser.parse_args()
+
+    # Override defaults for multiclass mode
+    if args.multiclass and args.pose_model == Path("data/models/pose/pose-vrlens-finetunes-large.pt"):
+        args.pose_model = Path("data/models/pose/vrlens-finetunes-multiclass-v2-yolo11m-pose.pt")
 
     logging.basicConfig(
         level=logging.INFO,
@@ -159,8 +184,14 @@ def main() -> None:
         device=str(device),
     )
     extractor = SinglePassExtractor(
-        pose_model, max_persons=args.max_persons, n_keypoints=21,
-        confidence_threshold=0.02, device=str(device),
+        pose_model,
+        max_persons=args.max_persons,
+        n_keypoints=21,
+        confidence_threshold=0.02,
+        device=str(device),
+        multiclass=args.multiclass,
+        max_partners=args.max_partners,
+        max_beholders=args.max_beholders,
     )
     log.info(
         "Extractor: layer %d (%s), stride %d",
@@ -177,15 +208,24 @@ def main() -> None:
     random.shuffle(scene_ids)
 
     for i, scene_id in enumerate(scene_ids):
-        # check if embeddings\pose-vrlens-finetunes-large.json says "method": "ultralytics_model.embed" or if "method": "single_pass_hook_roi_align" and skip if already "single_pass_hook_roi_align"
-        meta_path = args.data_dir / "processed" / scene_id / "embeddings" / "pose-vrlens-finetunes-large.json"
+        # check if metadata says already processed with current method
+        if args.multiclass:
+            meta_path = args.data_dir / "processed" / scene_id / "embeddings" / "vrlens-finetunes-multiclass-v2-yolo11m-pose.json"
+        else:
+            meta_path = args.data_dir / "processed" / scene_id / "embeddings" / "pose-vrlens-finetunes-large.json"
         if meta_path.exists():
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
             if meta.get("method") == "single_pass_hook_roi_align":
-                log.info("[%d/%d] %s already processed with single-pass method, skipping",
-                         i + 1, len(scene_ids), scene_id)
-                success += 1
-                continue
+                if args.multiclass and meta.get("multiclass", False):
+                    log.info("[%d/%d] %s already processed with multiclass method, skipping",
+                             i + 1, len(scene_ids), scene_id)
+                    success += 1
+                    continue
+                elif not args.multiclass:
+                    log.info("[%d/%d] %s already processed with single-pass method, skipping",
+                             i + 1, len(scene_ids), scene_id)
+                    success += 1
+                    continue
         review_path = args.data_dir / "processed" / scene_id / "review.json"
         if review_path.exists():
             review = json.loads(review_path.read_text(encoding="utf-8"))
@@ -202,6 +242,7 @@ def main() -> None:
             ok = reprocess_scene(
                 scene_id, args.data_dir, extractor,
                 batch_size=args.batch_size, dry_run=args.dry_run,
+                multiclass=args.multiclass,
             )
             dt = time.perf_counter() - t0
             if ok:

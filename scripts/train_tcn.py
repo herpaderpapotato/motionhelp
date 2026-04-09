@@ -43,14 +43,11 @@ class MotionDataset(Dataset):
 
     Expects data layout:
         data/processed/{scene_id}/labels.npy                              [T]
-        data/processed/{scene_id}/keypoints/pose-vrlens-finetunes-large.npy  [T, N, K, 3]
-        data/processed/{scene_id}/embeddings/pose-vrlens-finetunes-large.npy [T, N, E]
+        data/processed/{scene_id}/keypoints/{model_name}.npy              [T, N, K, 3]
+        data/processed/{scene_id}/embeddings/{model_name}.npy             [T, N, E]
         data/processed/{scene_id}/flow/raft_f64_s0.5.npy                  [T, F]
     """
 
-    KP_FILE = "keypoints/pose-vrlens-finetunes-large.npy"
-    EMB_FILE = "embeddings/pose-vrlens-finetunes-large.npy"
-    EMB_FILE_META = "embeddings/pose-vrlens-finetunes-large.json"
     FLOW_FILE = "flow/raft_f64_s0.5.npy"
 
     def __init__(
@@ -64,7 +61,25 @@ class MotionDataset(Dataset):
         embed_dim: int = 512,
         flow_dim: int = 64,
         augment: bool = False,
+        multiclass: bool = False,
     ):
+        self.data_dir = Path(data_dir)
+        self.seq_len = seq_len
+        self.n_persons = n_persons
+        self.n_keypoints = n_keypoints
+        self.embed_dim = embed_dim
+        self.flow_dim = flow_dim
+        self.augment = augment
+        self.multiclass = multiclass
+
+        if multiclass:
+            self.KP_FILE = "keypoints/vrlens-finetunes-multiclass-v2-yolo11m-pose.npy"
+            self.EMB_FILE = "embeddings/vrlens-finetunes-multiclass-v2-yolo11m-pose.npy"
+            self.EMB_FILE_META = "embeddings/vrlens-finetunes-multiclass-v2-yolo11m-pose.json"
+        else:
+            self.KP_FILE = "keypoints/pose-vrlens-finetunes-large.npy"
+            self.EMB_FILE = "embeddings/pose-vrlens-finetunes-large.npy"
+            self.EMB_FILE_META = "embeddings/pose-vrlens-finetunes-large.json"
         self.data_dir = Path(data_dir)
         self.seq_len = seq_len
         self.n_persons = n_persons
@@ -104,10 +119,13 @@ class MotionDataset(Dataset):
                 if review.get("status") == "rejected" or review.get("stage2_status") == "rejected":
                     skipped += 1
                     continue
-            # check if embeddings/pose-vrlens-finetunes-large.json says "method": "single_pass_hook_roi_align" otherwise skip to avoid training on scenes that haven't been reprocessed with the new method
+            # check embedding metadata is valid for current extraction method
             if emb_meta_path.exists():
                 meta = json.loads(emb_meta_path.read_text(encoding="utf-8"))
                 if meta.get("method") != "single_pass_hook_roi_align":
+                    skipped += 1
+                    continue
+                if self.multiclass and not meta.get("multiclass", False):
                     skipped += 1
                     continue
             
@@ -254,6 +272,62 @@ class MotionDataset(Dataset):
 
 
 # ---------------------------------------------------------------------------
+# Phase-specific freezing for multi-phase training
+# ---------------------------------------------------------------------------
+
+def _apply_phase_freezing(model: FunscriptTCN, phase: int) -> None:
+    """Freeze/unfreeze model parameters based on training phase.
+
+    Phase 1: Normal full training (all params trainable)
+    Phase 2: Train only pose pathways (freeze emb, flow, TCN, output)
+    Phase 3: Train only embedding pathways (freeze pose, flow, TCN, output)
+    Phase 4: Train only flow pathway (freeze pose, emb, TCN, output)
+    Phase 5: Train only fusion + output head (freeze encoders + TCN)
+    """
+    # First, freeze everything
+    if phase > 1:
+        for p in model.parameters():
+            p.requires_grad = False
+
+    if phase == 1:
+        pass  # all trainable
+    elif phase == 2:
+        # Unfreeze pose encoders only
+        for p in model.pose_encoder.parameters():
+            p.requires_grad = True
+        for p in model.pose_attn.parameters():
+            p.requires_grad = True
+        if model.multiclass:
+            for p in model.beholder_pose_encoder.parameters():
+                p.requires_grad = True
+    elif phase == 3:
+        # Unfreeze embedding encoders only
+        for p in model.emb_encoder.parameters():
+            p.requires_grad = True
+        for p in model.emb_attn.parameters():
+            p.requires_grad = True
+        if model.multiclass:
+            for p in model.beholder_emb_encoder.parameters():
+                p.requires_grad = True
+    elif phase == 4:
+        # Unfreeze flow encoder only
+        for p in model.flow_encoder.parameters():
+            p.requires_grad = True
+    elif phase == 5:
+        # Unfreeze fusion + output head + TCN backbone
+        for p in model.fusion.parameters():
+            p.requires_grad = True
+        for p in model.output_head.parameters():
+            p.requires_grad = True
+        for p in model.tcn_blocks.parameters():
+            p.requires_grad = True
+    else:
+        raise ValueError(f"Invalid phase: {phase}. Must be 1-5.")
+
+    log.info("Phase %d freezing applied", phase)
+
+
+# ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
 
@@ -276,6 +350,15 @@ def train() -> None:
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--scheduler", type=str, default="OneCycleLR",
                         choices=["OneCycleLR", "CosineAnnealingLR", "CosineWarmupLR", "ReduceLROnPlateau"])
+    parser.add_argument("--multiclass", action="store_true",
+                        help="Use multiclass model (partner + beholder)")
+    parser.add_argument("--n-partners", type=int, default=5)
+    parser.add_argument("--n-beholders", type=int, default=1)
+    parser.add_argument("--n-beholder-keypoints", type=int, default=7)
+    parser.add_argument("--phase", type=int, default=None,
+                        help="Training phase (1-5) for multi-phase training")
+    parser.add_argument("--resume", type=Path, default=None,
+                        help="Resume from checkpoint (for multi-phase training)")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -296,11 +379,15 @@ def train() -> None:
         torch.cuda.manual_seed_all(args.seed)
 
     # ── Datasets ──────────────────────────────────────────────────────────
+    n_total = (args.n_partners + args.n_beholders) if args.multiclass else 10
+
     train_ds = MotionDataset(
-        args.data_dir, "train", args.seq_len, args.stride, augment=True,
+        args.data_dir, "train", args.seq_len, args.stride,
+        n_persons=n_total, augment=True, multiclass=args.multiclass,
     )
     val_ds = MotionDataset(
-        args.data_dir, "val", args.seq_len, args.stride, augment=False,
+        args.data_dir, "val", args.seq_len, args.stride,
+        n_persons=n_total, augment=False, multiclass=args.multiclass,
     )
 
     train_loader = DataLoader(
@@ -324,21 +411,44 @@ def train() -> None:
     log.info("Val:   %d sequences (%d batches)", len(val_ds), len(val_loader))
 
     # ── Model ─────────────────────────────────────────────────────────────
-    model = FunscriptTCN(
-        d_model=args.d_model,
-        n_blocks=args.n_blocks,
-        dropout=args.dropout,
-    ).to(device)
+    model_kwargs = {
+        "d_model": args.d_model,
+        "n_blocks": args.n_blocks,
+        "dropout": args.dropout,
+    }
+    if args.multiclass:
+        model_kwargs.update({
+            "n_partners": args.n_partners,
+            "n_beholders": args.n_beholders,
+            "n_beholder_keypoints": args.n_beholder_keypoints,
+        })
 
-    checkpoint = Path("data\\models\\checkpoints_tcn\\tcn_epoch500.pt")
-    if checkpoint.exists():
-        log.info("Loading checkpoint from %s", checkpoint)
-        ckpt = torch.load(checkpoint, map_location=device, weights_only=False)
+    model = FunscriptTCN(**model_kwargs).to(device)
+
+    # checkpoint = Path("data\\models\\checkpoints_tcn\\tcn_epoch500.pt")
+    # if checkpoint.exists():
+    #     log.info("Loading checkpoint from %s", checkpoint)
+    #     ckpt = torch.load(checkpoint, map_location=device, weights_only=False)
+    #     model.load_state_dict(ckpt["model_state_dict"])
+
+    # Resume from checkpoint (for multi-phase training)
+    if args.resume is not None:
+        log.info("Resuming from checkpoint: %s", args.resume)
+        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model_state_dict"])
+        log.info("  Loaded model (epoch %s, val_loss=%s)",
+                 ckpt.get("epoch", "?"), f"{ckpt.get('val_loss', 0):.6f}")
 
     params = model.count_parameters()
     log.info("Model: %s trainable / %s total parameters",
              f"{params['trainable']:,}", f"{params['total']:,}")
+
+    # ── Phase-specific freezing ───────────────────────────────────────────
+    if args.phase is not None:
+        _apply_phase_freezing(model, args.phase)
+        params = model.count_parameters()
+        log.info("Phase %d: %s trainable / %s total parameters",
+                 args.phase, f"{params['trainable']:,}", f"{params['total']:,}")
 
     # ── Optimizer / Scheduler ─────────────────────────────────────────────
     optimizer = torch.optim.AdamW(
@@ -398,11 +508,18 @@ def train() -> None:
         "n_blocks": args.n_blocks,
         "kernel_size": 3,
         "dropout": args.dropout,
-        "n_persons": 10,
         "n_keypoints": 21,
         "embed_dim": 512,
         "flow_dim": 64,
     }
+    if args.multiclass:
+        model_config.update({
+            "n_partners": args.n_partners,
+            "n_beholders": args.n_beholders,
+            "n_beholder_keypoints": args.n_beholder_keypoints,
+        })
+    else:
+        model_config["n_persons"] = 10
 
     log.info("Run dir: %s", run_dir)
     log.info("Checkpoint dir: %s", checkpoint_dir)

@@ -47,6 +47,8 @@ os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 KP_FILE = "keypoints/pose-vrlens-finetunes-large.npy"
 EMB_FILE = "embeddings/pose-vrlens-finetunes-large.npy"
+KP_FILE_MULTICLASS = "keypoints/vrlens-finetunes-multiclass-v2-yolo11m-pose.npy"
+EMB_FILE_MULTICLASS = "embeddings/vrlens-finetunes-multiclass-v2-yolo11m-pose.npy"
 FLOW_FILE = "flow/raft_f64_s0.5.npy"
 
 
@@ -68,15 +70,18 @@ def _extract_pose_batched(
     return np.concatenate(all_kpts, axis=0)
 
 
-def load_model(checkpoint_path: Path, device: torch.device) -> FunscriptTCN:
+def load_model(checkpoint_path: Path, device: torch.device) -> tuple[FunscriptTCN, dict]:
+    """Load TCN model from checkpoint. Returns (model, model_config)."""
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     cfg = ckpt["model_config"]
     model = FunscriptTCN(**cfg)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
     model.to(device)
-    print(f"Loaded checkpoint: epoch {ckpt.get('epoch', '?')}, val_loss={ckpt.get('val_loss', '?'):.6f}")
-    return model
+    is_mc = cfg.get("n_partners") is not None
+    print(f"Loaded checkpoint: epoch {ckpt.get('epoch', '?')}, val_loss={ckpt.get('val_loss', '?'):.6f}"
+          f" [{'multiclass' if is_mc else 'single-class'}]")
+    return model, cfg
 
 
 def load_stats(data_dir: Path, n_persons: int = 10, embed_dim: int = 512, flow_dim: int = 64):
@@ -262,6 +267,9 @@ def extract_features_from_video(
     duration: float | None = None,
     target_fps: float | None = None,
     chunk_size: int = 512,
+    multiclass: bool = False,
+    max_partners: int = 5,
+    max_beholders: int = 1,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Extract keypoints, embeddings, and flow features from a raw video.
 
@@ -284,6 +292,9 @@ def extract_features_from_video(
     extractor = SinglePassExtractor(
         pose_model, max_persons=max_persons, n_keypoints=21,
         confidence_threshold=0.02, device=str(device),
+        multiclass=multiclass,
+        max_partners=max_partners,
+        max_beholders=max_beholders,
     )
     timings["model_load"] = time.perf_counter() - t0
 
@@ -499,6 +510,9 @@ def live_playback_with_prediction(
     emb_std: np.ndarray | None = None,
     flow_mean: np.ndarray | None = None,
     flow_std: np.ndarray | None = None,
+    multiclass: bool = False,
+    max_partners: int = 5,
+    max_beholders: int = 1,
 ) -> np.ndarray:
     """Live video playback with simultaneous feature extraction and TCN prediction.
 
@@ -550,6 +564,9 @@ def live_playback_with_prediction(
             extractor = SinglePassExtractor(
                 pose_model, max_persons=max_persons, n_keypoints=21,
                 confidence_threshold=0.02, device=str(device),
+                multiclass=multiclass,
+                max_partners=max_partners,
+                max_beholders=max_beholders,
             )
 
             # Estimate total frames
@@ -597,13 +614,21 @@ def live_playback_with_prediction(
             ):
                 chunk_len = len(chunk_np)
 
-                # Store decoded frames (evict oldest when buffer full)
-                with _lock:
-                    for i, f in enumerate(chunk_np):
-                        _state["frames"][frame_count + i] = f
-                    while len(_state["frames"]) > MAX_FRAME_BUF:
-                        oldest = min(_state["frames"])
-                        del _state["frames"][oldest]
+                strategy = "evict"
+                if strategy == "evict":
+                    # Store decoded frames  (evict oldest when buffer full)
+                    with _lock:
+                        for i, f in enumerate(chunk_np):
+                            _state["frames"][frame_count + i] = f
+                        while len(_state["frames"]) > MAX_FRAME_BUF:
+                            oldest = min(_state["frames"])
+                            del _state["frames"][oldest]
+                elif strategy == "suspend":
+                    # delay processing until buffer has room, but keep all frames in memory
+                    with _lock:
+                        while len(_state["frames"]) + chunk_len > MAX_FRAME_BUF:
+                            time.sleep(0.1)
+
 
                 pose_frames = list(chunk_np)
                 flow_frames = [cv2.resize(f, (flow_size, flow_size)) for f in pose_frames]
@@ -1009,6 +1034,7 @@ def live_playback_with_prediction(
             h_f, w_f = frame_bgr.shape[:2]
             video_canvas.config(width=w_f, height=h_f)
             video_canvas.create_image(0, 0, anchor=tk.NW, image=photo)
+            # evict the frame from the
 
         # Frame / time label
         t_sec = _pos[0] / max(target_fps, 1.0)
@@ -1102,7 +1128,7 @@ def main() -> None:
     parser.add_argument("--checkpoint", type=Path,
                         default=Path("data/models/checkpoints_tcn/best_tcn.pt"))
     parser.add_argument("--pose-model", type=Path,
-                        default=Path("pose-vrlens-finetunes-large.pt"),
+                        default=Path("data/models/pose/pose-vrlens-finetunes-large.pt"),
                         help="Path to YOLO pose model weights")
     parser.add_argument("--vr", dest="vr_mode", action="store_true", default=True,
                         help="Video is VR side-by-side (default)")
@@ -1146,19 +1172,31 @@ def main() -> None:
             print(f"Error: video file not found: {args.video}")
             sys.exit(1)
 
-        emb_mean, emb_std, flow_mean, flow_std = load_stats(args.data_dir)
-        model = load_model(args.checkpoint, device)
+        model, model_cfg = load_model(args.checkpoint, device)
+        is_multiclass = model_cfg.get("n_partners") is not None
+        n_total = (model_cfg.get("n_partners", 5) + model_cfg.get("n_beholders", 1)) if is_multiclass else model_cfg.get("n_persons", 10)
+
+        # Auto-select pose model for multiclass
+        pose_model_path = args.pose_model
+        if is_multiclass and "multiclass" not in str(pose_model_path):
+            pose_model_path = Path("data/models/pose/vrlens-finetunes-multiclass-v2-yolo11m-pose.pt")
+            print(f"  Auto-selected multiclass pose model: {pose_model_path}")
+
+        emb_mean, emb_std, flow_mean, flow_std = load_stats(args.data_dir, n_persons=n_total)
         source_name = args.video.stem
 
         print(f"Starting live playback + prediction for {args.video}...")
         predictions = live_playback_with_prediction(
-            args.video, args.pose_model, model, device,
+            args.video, pose_model_path, model, device,
             vr_mode=args.vr_mode, sbs_crop=args.sbs_crop,
             start_time=args.start_time, duration=args.duration,
             target_fps=args.fps, frame_size=args.frame_size,
-            max_persons=args.max_persons, seq_len=args.seq_len,
+            max_persons=n_total, seq_len=args.seq_len,
             emb_mean=emb_mean, emb_std=emb_std,
             flow_mean=flow_mean, flow_std=flow_std,
+            multiclass=is_multiclass,
+            max_partners=model_cfg.get("n_partners", 5),
+            max_beholders=model_cfg.get("n_beholders", 1),
         )
 
         if len(predictions) == 0:
@@ -1183,6 +1221,11 @@ def main() -> None:
         return
 
     # ── Batch path (no --playback) ───────────────────────────────────────
+    # Load model first to determine multiclass mode
+    model, model_cfg = load_model(args.checkpoint, device)
+    is_multiclass = model_cfg.get("n_partners") is not None
+    n_total = (model_cfg.get("n_partners", 5) + model_cfg.get("n_beholders", 1)) if is_multiclass else model_cfg.get("n_persons", 10)
+
     if args.scene:
         # Load pre-extracted features from scene directory
         scene_dir = args.data_dir / "processed" / args.scene
@@ -1190,8 +1233,11 @@ def main() -> None:
             print(f"Error: scene directory not found: {scene_dir}")
             sys.exit(1)
 
+        kp_file = KP_FILE_MULTICLASS if is_multiclass else KP_FILE
+        emb_file = EMB_FILE_MULTICLASS if is_multiclass else EMB_FILE
+
         missing = []
-        for fname in [KP_FILE, EMB_FILE, FLOW_FILE]:
+        for fname in [kp_file, emb_file, FLOW_FILE]:
             if not (scene_dir / fname).exists():
                 missing.append(fname)
         if missing:
@@ -1201,8 +1247,8 @@ def main() -> None:
             sys.exit(1)
 
         print(f"Loading features from {scene_dir}...")
-        keypoints  = np.load(str(scene_dir / KP_FILE))
-        embeddings = np.load(str(scene_dir / EMB_FILE))
+        keypoints  = np.load(str(scene_dir / kp_file))
+        embeddings = np.load(str(scene_dir / emb_file))
         flow       = np.load(str(scene_dir / FLOW_FILE))
 
         labels_path = scene_dir / "labels.npy"
@@ -1217,15 +1263,24 @@ def main() -> None:
             print(f"Error: video file not found: {args.video}")
             sys.exit(1)
 
+        # Auto-select pose model for multiclass
+        pose_model_path = args.pose_model
+        if is_multiclass and "multiclass" not in str(pose_model_path):
+            pose_model_path = Path("data/models/pose/vrlens-finetunes-multiclass-v2-yolo11m-pose.pt")
+            print(f"  Auto-selected multiclass pose model: {pose_model_path}")
+
         print(f"Extracting features from {args.video}...")
         keypoints, embeddings, flow = extract_features_from_video(
-            args.video, args.pose_model,
+            args.video, pose_model_path,
             vr_mode=args.vr_mode, sbs_crop=args.sbs_crop,
-            frame_size=args.frame_size, max_persons=args.max_persons,
+            frame_size=args.frame_size, max_persons=n_total,
             device=device,
             start_time=args.start_time,
             duration=args.duration,
             target_fps=args.fps,
+            multiclass=is_multiclass,
+            max_partners=model_cfg.get("n_partners", 5),
+            max_beholders=model_cfg.get("n_beholders", 1),
         )
 
         source_name = args.video.stem
@@ -1237,7 +1292,7 @@ def main() -> None:
     print(f"  frames:     {n_frames} ({n_frames / args.fps:.1f}s @ {args.fps}fps)")
 
     # Normalize features
-    emb_mean, emb_std, flow_mean, flow_std = load_stats(args.data_dir)
+    emb_mean, emb_std, flow_mean, flow_std = load_stats(args.data_dir, n_persons=n_total)
     if emb_mean is not None:
         embeddings = (embeddings - emb_mean) / (emb_std + 1e-8)
         print("  Embeddings normalized (z-score)")
@@ -1245,8 +1300,7 @@ def main() -> None:
         flow = (flow - flow_mean) / (flow_std + 1e-8)
         print("  Flow normalized (z-score)")
 
-    # Load model
-    model = load_model(args.checkpoint, device)
+    # Model already loaded above
 
     # Predict
     print(f"Predicting with sliding window (seq_len={args.seq_len}, stride={args.stride})...")
