@@ -29,7 +29,7 @@ _COCO_KEYPOINT_BONES = [
 
 @dataclass
 class PoseConfig:
-    model_name: str = "yolo11m-pose"
+    model_name: str = "vrlens-finetunes-multiclass-v2-yolo11m-pose"
     model_path: str = ""  # auto-download if empty. For VR use herpaderpapotato/pose-vrlens-finetunes-multiclass
     keypoint_format: str = "coco"  # "coco" or "custom"
     keypoint_names: List[str] = field(default_factory=lambda: list(_COCO_KEYPOINT_NAMES))
@@ -58,7 +58,7 @@ class ModelConfig:
     sequence_length: int = 120  # frames per prediction window
     # Feature sources
     use_embeddings: bool = True   # YOLO model.embed features
-    use_pose: bool = False        # COCO keypoints (legacy)
+    use_pose: bool = True        # COCO keypoints (legacy)
     use_flow: bool = True         # RAFT optical flow
     embedding_features: int = 1024  # max_persons * embed_dim
     embed_dim: int = 512            # per-person embedding dimension

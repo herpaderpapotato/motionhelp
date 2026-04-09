@@ -608,6 +608,7 @@ def train() -> None:
     #     scheduler.load_state_dict(ckpt["scheduler_state_dict"])
     #     log.info("Loaded optimizer and scheduler state from checkpoint")
 
+    best_val_loss = float("inf")
     if args.resume is not None:
         if "optimizer_state_dict" in ckpt and "scheduler_state_dict" in ckpt:
             optimizer.load_state_dict(ckpt["optimizer_state_dict"])
@@ -652,7 +653,6 @@ def train() -> None:
     log.info("Checkpoint dir: %s", checkpoint_dir)
 
     # ── Training loop ─────────────────────────────────────────────────────
-    best_val_loss = float("inf")
     global_step = 0
     _early_stop_counter = 0
 
@@ -814,7 +814,7 @@ def train() -> None:
             log.info("  → New best val loss: %.6f", avg_val)
         else:
             _early_stop_counter += 1
-            if args.early_stopping_patience > 0 and _early_stop_counter >= args.early_stopping_patience:
+            if args.early_stopping_patience > 0 and _early_stop_counter >= args.early_stopping_patience and epoch > 50:
                 log.info(
                     "Early stopping: no improvement for %d epochs (best val=%.6f)",
                     _early_stop_counter, best_val_loss,
