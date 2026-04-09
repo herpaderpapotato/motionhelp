@@ -271,7 +271,9 @@ def main() -> None:
         all_scenes = discover_scenes(data_dir, include_rejected=False, require_labels=True)
         pending = []
         for sid, state in all_scenes:
-            if state["status"] != "approved":
+            # if state["status"] != "approved":
+            #     continue
+            if state["status"] == "rejected":
                 continue
             sd = processed_dir / sid
             if args.scenes and sid not in args.scenes:
