@@ -17,8 +17,8 @@ log = logging.getLogger(__name__)
 
 DEFAULT_BACKBONE_LAYER = 10
 EMBED_DIM = 512
-EMBEDDING_FORMAT_VERSION = 2
-EMBEDDING_METHOD = "ultralytics_model.embed"
+EMBEDDING_FORMAT_VERSION = 4
+EMBEDDING_METHOD = "single_pass_hook_roi_align"
 
 
 def embeddings_metadata_path(embeddings_path: str | Path) -> Path:

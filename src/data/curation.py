@@ -83,6 +83,7 @@ def inspect_embeddings_path(
             return candidate, "ok"
 
         valid, reason = validate_embeddings_file(candidate, max_persons=max_persons)
+
         if valid:
             return candidate, "ok"
         reasons.append(f"{candidate.name}: {reason}")

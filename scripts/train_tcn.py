@@ -499,7 +499,7 @@ def train() -> None:
 
     train_ds = MotionDataset(
         args.data_dir, "train", args.seq_len, args.stride,
-        n_persons=n_total, augment=True, multiclass=args.multiclass,
+        n_persons=n_total, augment=False, multiclass=args.multiclass,
     )
     val_ds = MotionDataset(
         args.data_dir, "val", args.seq_len, args.stride,
@@ -815,7 +815,7 @@ def train() -> None:
             log.info("  → New best val loss: %.6f", avg_val)
         else:
             _early_stop_counter += 1
-            if args.early_stopping_patience > 0 and _early_stop_counter >= args.early_stopping_patience and epoch > 100:
+            if args.early_stopping_patience > 0 and _early_stop_counter >= args.early_stopping_patience and epoch > (args.epochs // 4):
                 log.info(
                     "Early stopping: no improvement for %d epochs (best val=%.6f)",
                     _early_stop_counter, best_val_loss,

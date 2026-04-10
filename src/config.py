@@ -65,7 +65,7 @@ class ModelConfig:
     pose_features: int = 126       # max_persons × n_keypoints × 3 (x, y, conf); 2×17×3=102 for COCO, 2×21×3=126 for custom
     flow_features: int = 64
     use_scene: bool = False
-    max_persons: int = 2
+    max_persons: int = 5
     output_mode: str = "direct"     # "direct" (per-frame) or "latent" (sequence-level, needs decoder)
     latent_dim: int = 32            # only used when output_mode is "latent"
 
