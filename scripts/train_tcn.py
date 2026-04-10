@@ -443,6 +443,7 @@ def _apply_phase_freezing(model: FunscriptTCN, phase: int) -> None:
 # ---------------------------------------------------------------------------
 
 def train() -> None:
+    import random
     parser = argparse.ArgumentParser(description="Train TCN funscript model")
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
     parser.add_argument("--epochs", type=int, default=100)
@@ -457,7 +458,7 @@ def train() -> None:
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--temporal-weight", type=float, default=0.1)
     parser.add_argument("--device", type=str, default="auto")
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--seed", type=int, default=random.randint(0, 1_000_000))
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--scheduler", type=str, default="OneCycleLR",
                         choices=["OneCycleLR", "CosineAnnealingLR", "CosineWarmupLR", "ReduceLROnPlateau"])
@@ -814,7 +815,7 @@ def train() -> None:
             log.info("  → New best val loss: %.6f", avg_val)
         else:
             _early_stop_counter += 1
-            if args.early_stopping_patience > 0 and _early_stop_counter >= args.early_stopping_patience and epoch > 50:
+            if args.early_stopping_patience > 0 and _early_stop_counter >= args.early_stopping_patience and epoch > 100:
                 log.info(
                     "Early stopping: no improvement for %d epochs (best val=%.6f)",
                     _early_stop_counter, best_val_loss,

@@ -393,7 +393,7 @@ class DataVisualizer:
         self.root.configure(bg="#1e1e1e")
 
         # ── Left sidebar: scene list ──────────────────────────────────────
-        sidebar = tk.Frame(self.root, bg="#252526", width=240)
+        sidebar = tk.Frame(self.root, bg="#252526", width=340)
         sidebar.pack(side=tk.LEFT, fill=tk.Y, padx=(4, 0), pady=4)
         sidebar.pack_propagate(False)
 
@@ -1856,7 +1856,7 @@ def main():
     cfg = Config.from_yaml(str(config_path)) if config_path.exists() else Config()
 
     root = tk.Tk()
-    root.minsize(900, 560)
+    root.minsize(900, 660)
     _sw = root.winfo_screenwidth()
     _sh = root.winfo_screenheight()
     root.maxsize(_sw, _sh - 46)
