@@ -126,6 +126,7 @@ class SinglePassExtractor:
             verbose=False,
             save=False,
             conf=self.conf_threshold,
+            iou=0.97,
         )
 
         features = self._features  # [B, 512, H_feat, W_feat]
