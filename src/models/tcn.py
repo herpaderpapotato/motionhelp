@@ -75,6 +75,39 @@ class TCNBlock(nn.Module):
         return self.act(x + self.net(x))
 
 
+class DualDilatedBlock(nn.Module):
+    """Dual Dilated Layer inspired by MS-TCN++.
+
+    Uses two parallel dilated convolutions with different dilation rates
+    (d and 2d) to capture both fine-grained and coarse temporal patterns,
+    eliminating the gridding artifacts of single-dilation TCN blocks.
+    """
+
+    def __init__(self, channels: int, kernel_size: int, dilation: int, dropout: float):
+        super().__init__()
+        # Branch 1: standard dilation
+        pad1 = dilation * (kernel_size - 1) // 2
+        self.conv1 = nn.Conv1d(channels, channels, kernel_size,
+                               padding=pad1, dilation=dilation)
+        self.bn1 = nn.BatchNorm1d(channels)
+
+        # Branch 2: doubled dilation for broader context
+        large_d = dilation * 2
+        pad2 = large_d * (kernel_size - 1) // 2
+        self.conv2 = nn.Conv1d(channels, channels, kernel_size,
+                               padding=pad2, dilation=large_d)
+        self.bn2 = nn.BatchNorm1d(channels)
+
+        self.dropout = nn.Dropout(dropout)
+        self.act = nn.GELU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: [B, C, T] → [B, C, T]"""
+        out1 = self.act(self.bn1(self.conv1(x)))
+        out2 = self.act(self.bn2(self.conv2(x)))
+        return self.act(x + self.dropout(out1 + out2))
+
+
 class FunscriptTCN(nn.Module):
     """Temporal convolutional network for per-frame funscript prediction.
 
@@ -107,6 +140,10 @@ class FunscriptTCN(nn.Module):
         n_beholder_keypoints: int = 7,
         beholder_pose_dim: int = 32,
         beholder_emb_dim: int = 32,
+        # Enhanced feature options
+        use_kinematics: bool = False,
+        use_ddl: bool = False,
+        kin_dim: int = 64,
     ):
         super().__init__()
         self.d_model = d_model
@@ -114,6 +151,9 @@ class FunscriptTCN(nn.Module):
         self.embed_dim = embed_dim
         self.flow_dim = flow_dim
         self.multiclass = n_partners is not None
+        self.use_kinematics = use_kinematics
+        self.use_ddl = use_ddl
+        self.kin_dim = kin_dim
 
         if self.multiclass:
             self.n_partners = n_partners
@@ -148,6 +188,16 @@ class FunscriptTCN(nn.Module):
             nn.GELU(),
         )
 
+        # -- Kinematic derivative encoder (velocity + acceleration) --
+        if self.use_kinematics:
+            kin_feat_dim = n_keypoints * 4  # vel(K*2) + acc(K*2)
+            self.kin_encoder = nn.Sequential(
+                nn.Linear(kin_feat_dim, kin_dim),
+                nn.LayerNorm(kin_dim),
+                nn.GELU(),
+            )
+            self.kin_attn = PersonAttention(kin_dim)
+
         # -- Beholder encoders (multiclass only) --
         if self.multiclass:
             beh_kp_dim = n_beholder_keypoints * 3  # 21
@@ -162,8 +212,12 @@ class FunscriptTCN(nn.Module):
                 nn.GELU(),
             )
             fusion_in = 128 + 128 + 64 + beholder_pose_dim + beholder_emb_dim
+            if self.use_kinematics:
+                fusion_in += kin_dim
         else:
             fusion_in = 128 + 128 + 64  # 320
+            if self.use_kinematics:
+                fusion_in += kin_dim
 
         # -- Feature fusion --
         self.fusion = nn.Sequential(
@@ -174,8 +228,9 @@ class FunscriptTCN(nn.Module):
 
         # -- TCN backbone --
         dilations = [2 ** i for i in range(n_blocks)]  # [1, 2, 4, 8, 16, 32]
+        block_cls = DualDilatedBlock if self.use_ddl else TCNBlock
         self.tcn_blocks = nn.ModuleList([
-            TCNBlock(d_model, kernel_size, d, dropout) for d in dilations
+            block_cls(d_model, kernel_size, d, dropout) for d in dilations
         ])
 
         # -- Output head --
@@ -238,10 +293,17 @@ class FunscriptTCN(nn.Module):
             # -- Flow --
             flow_out = self.flow_encoder(flow)                         # [B, T, 64]
 
-            # -- Fusion (augmented with beholder) --
-            fused = torch.cat(
-                [pose_out, emb_out, flow_out, beh_pose_out, beh_emb_out], dim=-1,
-            )                                                          # [B, T, 384]
+            # -- Kinematics (velocity + acceleration from partner keypoints) --
+            if self.use_kinematics:
+                kin_out = self._compute_kinematics(
+                    partner_kp, self.n_partners, kp_conf,
+                )                                                      # [B, T, kin_dim]
+
+            # -- Fusion (augmented with beholder + optional kinematics) --
+            fusion_parts = [pose_out, emb_out, flow_out, beh_pose_out, beh_emb_out]
+            if self.use_kinematics:
+                fusion_parts.append(kin_out)
+            fused = torch.cat(fusion_parts, dim=-1)
         else:
             # -- Original single-class path --
             kp_flat = keypoints.reshape(B, T, self.n_persons, -1)      # [B, T, N, K*3]
@@ -254,7 +316,16 @@ class FunscriptTCN(nn.Module):
 
             flow_out = self.flow_encoder(flow)                         # [B, T, 64]
 
-            fused = torch.cat([pose_out, emb_out, flow_out], dim=-1)   # [B, T, 320]
+            # -- Kinematics (velocity + acceleration from keypoints) --
+            if self.use_kinematics:
+                kin_out = self._compute_kinematics(
+                    keypoints, self.n_persons, kp_conf,
+                )                                                      # [B, T, kin_dim]
+
+            fusion_parts = [pose_out, emb_out, flow_out]
+            if self.use_kinematics:
+                fusion_parts.append(kin_out)
+            fused = torch.cat(fusion_parts, dim=-1)
 
         x = self.fusion(fused)                                         # [B, T, d_model]
 
@@ -267,6 +338,31 @@ class FunscriptTCN(nn.Module):
         # -- Output --
         out = self.output_head(x).squeeze(-1)                          # [B, T]
         return torch.sigmoid(out)
+
+    def _compute_kinematics(
+        self,
+        kp: torch.Tensor,
+        n_persons: int,
+        kp_conf: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute velocity and acceleration features from keypoints.
+
+        Args:
+            kp: [B, T, N, K, 3] keypoints (x, y, confidence)
+            n_persons: number of persons in the N dimension
+            kp_conf: [B, T, N] confidence scores
+        Returns: [B, T, kin_dim]
+        """
+        pos_xy = kp[:, :, :, :, :2]                        # [B, T, N, K, 2]
+        vel = torch.zeros_like(pos_xy)
+        vel[:, 1:] = pos_xy[:, 1:] - pos_xy[:, :-1]        # first derivative
+        acc = torch.zeros_like(pos_xy)
+        acc[:, 2:] = vel[:, 2:] - vel[:, 1:-1]              # second derivative
+        kin = torch.cat([vel, acc], dim=-1)                  # [B, T, N, K, 4]
+        B, T = kp.shape[:2]
+        kin = kin.reshape(B, T, n_persons, -1)               # [B, T, N, K*4]
+        kin_feat = self.kin_encoder(kin)                      # [B, T, N, kin_dim]
+        return self.kin_attn(kin_feat, kp_conf)               # [B, T, kin_dim]
 
     def count_parameters(self) -> dict[str, int]:
         total = sum(p.numel() for p in self.parameters())

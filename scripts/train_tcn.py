@@ -277,34 +277,6 @@ class MotionDataset(Dataset):
 
 def _apply_phase_freezing(model: FunscriptTCN, phase: int) -> None:
     """Freeze/unfreeze model parameters based on training phase.
-
-    Phase 1: Normal full training (all params trainable)
-    Phase 2: Train only pose pathways (freeze emb, flow, TCN, output)
-    Phase 3: Train only embedding pathways (freeze pose, flow, TCN, output)
-    Phase 4: Train only flow pathway (freeze pose, emb, TCN, output)
-    5 flow encoder + fusion + output head
-    6 embeddings + fusion + output head
-    7 pose pathways + fusion + output head
-    8 flow encoder, embedding encoders, fusion + output head + TCN backbone
-    9 fusion + output head + TCN backbone
-    10  only pose pathways
-    11 fusion + output head + TCN backbone
-    12 phase 1 again (but do it at a low lr)
-
-    So:
-    We get it to a reasonable state.
-    We make sure we're doing the best we can with pose.
-    We make sure we're doing the best we can with embedding
-    We make sure we're doing the best we can with flow
-    We give flow a chance to dominate the path
-    We give embeddings a chance to dominate the path
-    We give pose a chance to dominate the path
-    We optimize the path again
-    We just tune pose for the path.
-    We optimize the path again
-    We make extremely small changes to the whole thing.
-
-    Ideally I'd also zero out the data or handle the augmentation differently. I probably do need to stop augmentation zeroing out the primary input in that scenario.
     """
     # First, freeze everything
     if phase > 1:
@@ -467,6 +439,14 @@ def train() -> None:
     parser.add_argument("--n-partners", type=int, default=5)
     parser.add_argument("--n-beholders", type=int, default=1)
     parser.add_argument("--n-beholder-keypoints", type=int, default=7)
+    parser.add_argument("--use-kinematics", action="store_true",
+                        help="Add velocity/acceleration features from keypoints")
+    parser.add_argument("--use-ddl", action="store_true",
+                        help="Use Dual Dilated Layers (MS-TCN++ style)")
+    parser.add_argument("--kin-dim", type=int, default=64,
+                        help="Kinematic feature dimension")
+    parser.add_argument("--velocity-weight", type=float, default=0.0,
+                        help="Weight for velocity-matching loss (first derivative)")
     parser.add_argument("--phase", type=int, default=None,
                         help="Training phase (1-6) for multi-phase training")
     parser.add_argument("--resume", type=Path, default=None,
@@ -540,6 +520,11 @@ def train() -> None:
             "n_beholders": args.n_beholders,
             "n_beholder_keypoints": args.n_beholder_keypoints,
         })
+    if args.use_kinematics:
+        model_kwargs["use_kinematics"] = True
+        model_kwargs["kin_dim"] = args.kin_dim
+    if args.use_ddl:
+        model_kwargs["use_ddl"] = True
 
     model = FunscriptTCN(**model_kwargs).to(device)
 
@@ -651,6 +636,11 @@ def train() -> None:
         })
     else:
         model_config["n_persons"] = 10
+    if args.use_kinematics:
+        model_config["use_kinematics"] = True
+        model_config["kin_dim"] = args.kin_dim
+    if args.use_ddl:
+        model_config["use_ddl"] = True
 
     log.info("Run dir: %s", run_dir)
     log.info("Checkpoint dir: %s", checkpoint_dir)
@@ -687,7 +677,15 @@ def train() -> None:
                 else:
                     temp_loss = torch.tensor(0.0, device=device)
 
-                loss = pos_loss + args.temporal_weight * temp_loss
+                # Velocity-matching loss (first derivative)
+                if args.velocity_weight > 0 and pred.shape[1] > 1:
+                    pred_vel = pred[:, 1:] - pred[:, :-1]
+                    tgt_vel = lbl[:, 1:] - lbl[:, :-1]
+                    vel_loss = nn.functional.mse_loss(pred_vel, tgt_vel)
+                else:
+                    vel_loss = torch.tensor(0.0, device=device)
+
+                loss = pos_loss + args.temporal_weight * temp_loss + args.velocity_weight * vel_loss
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -707,6 +705,7 @@ def train() -> None:
                 writer.add_scalar("train/loss", loss.item(), global_step)
                 writer.add_scalar("train/pos_loss", pos_loss.item(), global_step)
                 writer.add_scalar("train/temp_loss", temp_loss.item(), global_step)
+                writer.add_scalar("train/vel_loss", vel_loss.item(), global_step)
                 writer.add_scalar("train/pred_mean", pred.mean().item(), global_step)
                 writer.add_scalar("train/pred_std", pred.std().item(), global_step)
                 writer.add_scalar("train/grad_norm", grad_norm.item(), global_step)
