@@ -204,6 +204,8 @@ def get_scene_stage(
     state = read_review(scene_dir)
     if state["status"] == "rejected" or state["stage2_status"] == "rejected":
         return "rejected"
+    if state["status"] == "pending":
+        return "pending"
 
     has_kpts = resolve_keypoints_path(scene_dir, model_name) is not None
     has_flow = resolve_flow_path(scene_dir, flow_method, flow_output_features, flow_scale) is not None
