@@ -247,14 +247,25 @@ class MotionDataset(Dataset):
         flow: torch.Tensor,
         labels: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # All augmentations are independent (not elif) so multiple can apply
+
         # Time reversal (50%)
         if torch.rand(1).item() < 0.5:
             kp = kp.flip(0)
             emb = emb.flip(0)
             flow = -flow.flip(0)
             labels = labels.flip(0)
-        elif torch.rand(1).item() < 0.1:
-            # zero out a random input, kp, emb, or flow (but not labels)
+
+        # Position inversion (50%) — flip labels 0↔1, doubles effective dataset
+        if torch.rand(1).item() < 0.5:
+            labels = 1.0 - labels
+            # Flip pose Y coordinates to match
+            kp_view = kp.clone()
+            kp_view[:, :, :, 1] = 1.0 - kp_view[:, :, :, 1]  # flip Y coord
+            kp = kp_view
+
+        # Input stream dropout (10%) — zero out one random input
+        if torch.rand(1).item() < 0.1:
             choice = torch.randint(3, (1,)).item()
             if choice == 0:
                 kp = torch.zeros_like(kp)
@@ -262,13 +273,65 @@ class MotionDataset(Dataset):
                 emb = torch.zeros_like(emb)
             else:
                 flow = torch.zeros_like(flow)
-        elif torch.rand(1).item() < 0.1:
-            # Add small noise to embeddings or flow
-            if torch.rand(1).item() < 0.5:
-                emb += torch.randn_like(emb) * 0.02
+
+        # Gaussian noise on embeddings (20%)
+        if torch.rand(1).item() < 0.2:
+            emb = emb + torch.randn_like(emb) * 0.02
+
+        # Gaussian noise on flow (20%)
+        if torch.rand(1).item() < 0.2:
+            flow = flow + torch.randn_like(flow) * 0.02
+
+        # Speed perturbation (15%) — slight time stretch/compress
+        if torch.rand(1).item() < 0.15:
+            T = labels.shape[0]
+            scale = 0.9 + torch.rand(1).item() * 0.2  # 0.9x to 1.1x
+            new_len = int(T * scale)
+            indices = torch.linspace(0, T - 1, new_len).long().clamp(0, T - 1)
+            kp = kp[indices]
+            emb = emb[indices]
+            flow = flow[indices]
+            labels = labels[indices]
+            # Resize back to original length
+            if len(labels) >= T:
+                kp, emb, flow, labels = kp[:T], emb[:T], flow[:T], labels[:T]
             else:
-                flow += torch.randn_like(flow) * 0.02
+                pad_n = T - len(labels)
+                kp = torch.cat([kp, kp[-1:].expand(pad_n, *kp.shape[1:])], 0)
+                emb = torch.cat([emb, emb[-1:].expand(pad_n, *emb.shape[1:])], 0)
+                flow = torch.cat([flow, flow[-1:].expand(pad_n, *flow.shape[1:])], 0)
+                labels = torch.cat([labels, labels[-1:].expand(pad_n)], 0)
+
         return kp, emb, flow, labels
+
+
+# ---------------------------------------------------------------------------
+# Loss helpers
+# ---------------------------------------------------------------------------
+
+def _highfreq_loss(pred: torch.Tensor, target: torch.Tensor, kernel_size: int) -> torch.Tensor:
+    """Compute MSE on high-frequency components (original - moving-average smoothed).
+
+    This forces the model to learn subtle motion details that are drowned out
+    by the macro-movement MSE.  The low-pass filter is a uniform 1-D moving
+    average applied per-sample.
+    """
+    # pred, target: [B, T]
+    pad = kernel_size // 2
+    weight = torch.ones(1, 1, kernel_size, device=pred.device, dtype=pred.dtype) / kernel_size
+    # Smooth via 1-D convolution (replicate-pad to preserve length)
+    pred_3d = pred.unsqueeze(1)    # [B, 1, T]
+    tgt_3d = target.unsqueeze(1)   # [B, 1, T]
+    pred_smooth = nn.functional.conv1d(
+        nn.functional.pad(pred_3d, (pad, pad), mode="replicate"), weight
+    ).squeeze(1)                    # [B, T]
+    tgt_smooth = nn.functional.conv1d(
+        nn.functional.pad(tgt_3d, (pad, pad), mode="replicate"), weight
+    ).squeeze(1)                    # [B, T]
+    # High-frequency residual
+    pred_hf = pred - pred_smooth
+    tgt_hf = target - tgt_smooth
+    return nn.functional.mse_loss(pred_hf, tgt_hf)
 
 
 # ---------------------------------------------------------------------------
@@ -447,6 +510,10 @@ def train() -> None:
                         help="Kinematic feature dimension")
     parser.add_argument("--velocity-weight", type=float, default=0.0,
                         help="Weight for velocity-matching loss (first derivative)")
+    parser.add_argument("--spectral-weight", type=float, default=0.0,
+                        help="Weight for high-frequency detail loss (multi-scale spectral)")
+    parser.add_argument("--spectral-kernel", type=int, default=15,
+                        help="Moving-average kernel size for spectral loss low-pass filter")
     parser.add_argument("--phase", type=int, default=None,
                         help="Training phase (1-6) for multi-phase training")
     parser.add_argument("--resume", type=Path, default=None,
@@ -480,7 +547,7 @@ def train() -> None:
 
     train_ds = MotionDataset(
         args.data_dir, "train", args.seq_len, args.stride,
-        n_persons=n_total, augment=False, multiclass=args.multiclass,
+        n_persons=n_total, augment=True, multiclass=args.multiclass,
     )
     val_ds = MotionDataset(
         args.data_dir, "val", args.seq_len, args.stride,
@@ -685,7 +752,16 @@ def train() -> None:
                 else:
                     vel_loss = torch.tensor(0.0, device=device)
 
-                loss = pos_loss + args.temporal_weight * temp_loss + args.velocity_weight * vel_loss
+                # High-frequency spectral loss
+                if args.spectral_weight > 0:
+                    spec_loss = _highfreq_loss(pred, lbl, args.spectral_kernel)
+                else:
+                    spec_loss = torch.tensor(0.0, device=device)
+
+                loss = (pos_loss
+                        + args.temporal_weight * temp_loss
+                        + args.velocity_weight * vel_loss
+                        + args.spectral_weight * spec_loss)
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -706,6 +782,7 @@ def train() -> None:
                 writer.add_scalar("train/pos_loss", pos_loss.item(), global_step)
                 writer.add_scalar("train/temp_loss", temp_loss.item(), global_step)
                 writer.add_scalar("train/vel_loss", vel_loss.item(), global_step)
+                writer.add_scalar("train/spec_loss", spec_loss.item(), global_step)
                 writer.add_scalar("train/pred_mean", pred.mean().item(), global_step)
                 writer.add_scalar("train/pred_std", pred.std().item(), global_step)
                 writer.add_scalar("train/grad_norm", grad_norm.item(), global_step)
@@ -739,7 +816,14 @@ def train() -> None:
                     else:
                         temp_loss = torch.tensor(0.0, device=device)
 
-                    loss = pos_loss + args.temporal_weight * temp_loss
+                    if args.spectral_weight > 0:
+                        spec_loss = _highfreq_loss(pred, lbl, args.spectral_kernel)
+                    else:
+                        spec_loss = torch.tensor(0.0, device=device)
+
+                    loss = (pos_loss
+                            + args.temporal_weight * temp_loss
+                            + args.spectral_weight * spec_loss)
 
                 val_losses.append(loss.item())
                 val_pos_losses.append(pos_loss.item())

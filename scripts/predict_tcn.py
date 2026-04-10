@@ -184,7 +184,7 @@ def _stream_frames_ffmpeg(
     start_time: float | None = None,
     duration: float | None = None,
     target_fps: float | None = None,
-    chunk_size: int = 512,
+    chunk_size: int = 240,
 ):
     """Yield chunks of RGB uint8 frames via ffmpeg NVDEC. Falls back to cv2 on error.
 
