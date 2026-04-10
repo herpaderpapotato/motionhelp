@@ -55,7 +55,7 @@ class SinglePassExtractor:
         layer_idx: int = BACKBONE_LAYER,
         max_persons: int = 10,
         n_keypoints: int = 21,
-        confidence_threshold: float = 0.02,
+        confidence_threshold: float = 0.001,
         device: str = "cuda",
         # Multiclass options
         multiclass: bool = False,

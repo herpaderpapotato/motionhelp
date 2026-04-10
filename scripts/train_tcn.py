@@ -492,6 +492,7 @@ def train() -> None:
     # Reproducibility
     torch.manual_seed(args.seed)
     if device.type == "cuda":
+        print("Setting CUDA seeds for reproducibility")
         torch.cuda.manual_seed_all(args.seed)
 
     # ── Datasets ──────────────────────────────────────────────────────────
@@ -511,15 +512,16 @@ def train() -> None:
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
-        pin_memory=device.type == "cuda",
+        pin_memory=(device.type == "cuda" or device.type == "cuda:0"),  # allow pinned memory for CUDA even if using a specific GPU
         persistent_workers=args.num_workers > 0,
+        
     )
     val_loader = DataLoader(
         val_ds,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
-        pin_memory=device.type == "cuda",
+        pin_memory=(device.type == "cuda" or device.type == "cuda:0"),  # allow pinned memory for CUDA even if using a specific GPU
         persistent_workers=args.num_workers > 0,
     )
 
