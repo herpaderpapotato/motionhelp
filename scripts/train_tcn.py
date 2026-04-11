@@ -87,6 +87,7 @@ class MotionDataset(Dataset):
         self.embed_dim = embed_dim
         self.flow_dim = flow_dim
         self.augment = augment
+        self.augment_scale: float = 0.0  # 0=min augmentation, 1=max augmentation
 
         # Load split
         with open(self.data_dir / "splits" / f"{split}.json") as f:
@@ -248,24 +249,10 @@ class MotionDataset(Dataset):
         labels: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # All augmentations are independent (not elif) so multiple can apply
+        s = self.augment_scale  # [0, 1] — 0=min values, 1=max values
 
-        # Time reversal (50%)
-        if torch.rand(1).item() < 0.5:
-            kp = kp.flip(0)
-            emb = emb.flip(0)
-            flow = -flow.flip(0)
-            labels = labels.flip(0)
-
-        # Position inversion (50%) — flip labels 0↔1, doubles effective dataset
-        if torch.rand(1).item() < 0.5:
-            labels = 1.0 - labels
-            # Flip pose Y coordinates to match
-            kp_view = kp.clone()
-            kp_view[:, :, :, 1] = 1.0 - kp_view[:, :, :, 1]  # flip Y coord
-            kp = kp_view
-
-        # Input stream dropout (10%) — zero out one random input
-        if torch.rand(1).item() < 0.1:
+        dropout_prob = 0.1 + s * (0.5 - 0.1)   # minimum 10%, maximum 50%
+        if torch.rand(1).item() < dropout_prob:
             choice = torch.randint(3, (1,)).item()
             if choice == 0:
                 kp = torch.zeros_like(kp)
@@ -274,33 +261,15 @@ class MotionDataset(Dataset):
             else:
                 flow = torch.zeros_like(flow)
 
-        # Gaussian noise on embeddings (20%)
-        if torch.rand(1).item() < 0.2:
-            emb = emb + torch.randn_like(emb) * 0.02
+        emb_noise_prob = 0.2 + s * (0.6 - 0.2)    # minimum 20%, maximum 60%
+        emb_noise_mag  = 0.02 + s * (0.1 - 0.02)  # minimum 0.02, maximum 0.1
+        if torch.rand(1).item() < emb_noise_prob:
+            emb = emb + torch.randn_like(emb) * emb_noise_mag
 
-        # Gaussian noise on flow (20%)
-        if torch.rand(1).item() < 0.2:
-            flow = flow + torch.randn_like(flow) * 0.02
-
-        # Speed perturbation (15%) — slight time stretch/compress
-        if torch.rand(1).item() < 0.15:
-            T = labels.shape[0]
-            scale = 0.9 + torch.rand(1).item() * 0.2  # 0.9x to 1.1x
-            new_len = int(T * scale)
-            indices = torch.linspace(0, T - 1, new_len).long().clamp(0, T - 1)
-            kp = kp[indices]
-            emb = emb[indices]
-            flow = flow[indices]
-            labels = labels[indices]
-            # Resize back to original length
-            if len(labels) >= T:
-                kp, emb, flow, labels = kp[:T], emb[:T], flow[:T], labels[:T]
-            else:
-                pad_n = T - len(labels)
-                kp = torch.cat([kp, kp[-1:].expand(pad_n, *kp.shape[1:])], 0)
-                emb = torch.cat([emb, emb[-1:].expand(pad_n, *emb.shape[1:])], 0)
-                flow = torch.cat([flow, flow[-1:].expand(pad_n, *flow.shape[1:])], 0)
-                labels = torch.cat([labels, labels[-1:].expand(pad_n)], 0)
+        flow_noise_prob = 0.2 + s * (0.6 - 0.2)    # minimum 20%, maximum 60%
+        flow_noise_mag  = 0.02 + s * (0.1 - 0.02)  # minimum 0.02, maximum 0.1
+        if torch.rand(1).item() < flow_noise_prob:
+            flow = flow + torch.randn_like(flow) * flow_noise_mag
 
         return kp, emb, flow, labels
 
@@ -308,6 +277,23 @@ class MotionDataset(Dataset):
 # ---------------------------------------------------------------------------
 # Loss helpers
 # ---------------------------------------------------------------------------
+
+def _compute_augment_scale(val_loss: float, train_loss: float) -> float:
+    """Map val/train loss ratio to augmentation scale [0, 1].
+
+    ratio < 1.5  → 0.0 (minimum augmentation)
+    ratio >= 5.0 → 1.0 (maximum augmentation)
+    Linear interpolation in between.
+    """
+    if train_loss <= 0:
+        return 0.0
+    ratio = val_loss / train_loss
+    if ratio < 1.5:
+        return 0.0
+    if ratio >= 5.0:
+        return 1.0
+    return (ratio - 1.5) / (5.0 - 1.5)
+
 
 def _highfreq_loss(pred: torch.Tensor, target: torch.Tensor, kernel_size: int) -> torch.Tensor:
     """Compute MSE on high-frequency components (original - moving-average smoothed).
@@ -493,7 +479,7 @@ def train() -> None:
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--temporal-weight", type=float, default=0.1)
     parser.add_argument("--device", type=str, default="auto")
-    parser.add_argument("--seed", type=int, default=random.randint(0, 1_000_000))
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--scheduler", type=str, default="OneCycleLR",
                         choices=["OneCycleLR", "CosineAnnealingLR", "CosineWarmupLR", "ReduceLROnPlateau"])
@@ -508,6 +494,8 @@ def train() -> None:
                         help="Use Dual Dilated Layers (MS-TCN++ style)")
     parser.add_argument("--kin-dim", type=int, default=64,
                         help="Kinematic feature dimension")
+    parser.add_argument("--use-gated-fusion", action="store_true",
+                        help="Use context-aware gated multimodal fusion instead of concat+linear")
     parser.add_argument("--velocity-weight", type=float, default=0.0,
                         help="Weight for velocity-matching loss (first derivative)")
     parser.add_argument("--spectral-weight", type=float, default=0.0,
@@ -592,6 +580,8 @@ def train() -> None:
         model_kwargs["kin_dim"] = args.kin_dim
     if args.use_ddl:
         model_kwargs["use_ddl"] = True
+    if args.use_gated_fusion:
+        model_kwargs["use_gated_fusion"] = True
 
     model = FunscriptTCN(**model_kwargs).to(device)
 
@@ -708,6 +698,8 @@ def train() -> None:
         model_config["kin_dim"] = args.kin_dim
     if args.use_ddl:
         model_config["use_ddl"] = True
+    if args.use_gated_fusion:
+        model_config["use_gated_fusion"] = True
 
     log.info("Run dir: %s", run_dir)
     log.info("Checkpoint dir: %s", checkpoint_dir)
@@ -851,6 +843,12 @@ def train() -> None:
         writer.add_scalar("val/pred_std", avg_pred_std, epoch)
         writer.add_scalar("train/loss_epoch", avg_train, epoch)
         writer.add_scalar("train/pos_loss_epoch", avg_train_pos, epoch)
+
+        # Update augmentation scale based on val/train loss ratio
+        augment_scale = _compute_augment_scale(avg_val, avg_train)
+        train_ds.augment_scale = augment_scale
+        writer.add_scalar("train/augment_scale", augment_scale, epoch)
+        log.info("  Augment scale: %.3f (val/train ratio=%.3f)", augment_scale, avg_val / max(avg_train, 1e-9))
 
         # --- Prediction overlay plots every 10 epochs (like old train.py) ---
         if epoch % 2 == 0 or epoch == 1:

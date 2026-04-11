@@ -75,6 +75,48 @@ class TCNBlock(nn.Module):
         return self.act(x + self.net(x))
 
 
+class GatedFusion(nn.Module):
+    """Context-aware gated multimodal fusion.
+
+    Each modality stream gets a learned sigmoid gate that sees the full
+    cross-modal context, allowing per-frame dynamic suppression of noisy
+    or irrelevant modalities. Inspired by:
+      - Gated Fusion Networks (Ahmad et al. 2025): per-modality gating
+      - Gated Recursive Fusion (Shihata 2025): cross-modal information flow
+
+    Replaces the concat→Linear baseline fusion with:
+        context = cat(streams)          # full cross-modal view
+        g_m = sigmoid(W_m · context)    # per-modality gate
+        gated_m = g_m ⊙ stream_m       # gated features
+        output = proj(cat(gated_m))     # project to d_model
+    """
+
+    def __init__(self, stream_dims: list[int], d_model: int):
+        super().__init__()
+        total_in = sum(stream_dims)
+        self.gates = nn.ModuleList([
+            nn.Linear(total_in, dim) for dim in stream_dims
+        ])
+        self.proj = nn.Sequential(
+            nn.Linear(total_in, d_model),
+            nn.LayerNorm(d_model),
+            nn.GELU(),
+        )
+
+    def forward(self, streams: list[torch.Tensor]) -> torch.Tensor:
+        """
+        Args:
+            streams: list of [B, T, dim_i] tensors, one per modality
+        Returns: [B, T, d_model] fused representation
+        """
+        context = torch.cat(streams, dim=-1)             # [B, T, total_in]
+        gated = []
+        for stream, gate_fn in zip(streams, self.gates):
+            gate = torch.sigmoid(gate_fn(context))       # [B, T, dim_i]
+            gated.append(gate * stream)                  # [B, T, dim_i]
+        return self.proj(torch.cat(gated, dim=-1))       # [B, T, d_model]
+
+
 class DualDilatedBlock(nn.Module):
     """Dual Dilated Layer inspired by MS-TCN++.
 
@@ -144,6 +186,7 @@ class FunscriptTCN(nn.Module):
         use_kinematics: bool = False,
         use_ddl: bool = False,
         kin_dim: int = 64,
+        use_gated_fusion: bool = False,
     ):
         super().__init__()
         self.d_model = d_model
@@ -154,6 +197,7 @@ class FunscriptTCN(nn.Module):
         self.use_kinematics = use_kinematics
         self.use_ddl = use_ddl
         self.kin_dim = kin_dim
+        self.use_gated_fusion = use_gated_fusion
 
         if self.multiclass:
             self.n_partners = n_partners
@@ -211,20 +255,25 @@ class FunscriptTCN(nn.Module):
                 nn.LayerNorm(beholder_emb_dim),
                 nn.GELU(),
             )
-            fusion_in = 128 + 128 + 64 + beholder_pose_dim + beholder_emb_dim
+            stream_dims = [128, 128, 64, beholder_pose_dim, beholder_emb_dim]
             if self.use_kinematics:
-                fusion_in += kin_dim
+                stream_dims.append(kin_dim)
+            fusion_in = sum(stream_dims)
         else:
-            fusion_in = 128 + 128 + 64  # 320
+            stream_dims = [128, 128, 64]
             if self.use_kinematics:
-                fusion_in += kin_dim
+                stream_dims.append(kin_dim)
+            fusion_in = sum(stream_dims)
 
         # -- Feature fusion --
-        self.fusion = nn.Sequential(
-            nn.Linear(fusion_in, d_model),
-            nn.LayerNorm(d_model),
-            nn.GELU(),
-        )
+        if self.use_gated_fusion:
+            self.fusion = GatedFusion(stream_dims, d_model)
+        else:
+            self.fusion = nn.Sequential(
+                nn.Linear(fusion_in, d_model),
+                nn.LayerNorm(d_model),
+                nn.GELU(),
+            )
 
         # -- TCN backbone --
         dilations = [2 ** i for i in range(n_blocks)]  # [1, 2, 4, 8, 16, 32]
@@ -303,7 +352,6 @@ class FunscriptTCN(nn.Module):
             fusion_parts = [pose_out, emb_out, flow_out, beh_pose_out, beh_emb_out]
             if self.use_kinematics:
                 fusion_parts.append(kin_out)
-            fused = torch.cat(fusion_parts, dim=-1)
         else:
             # -- Original single-class path --
             kp_flat = keypoints.reshape(B, T, self.n_persons, -1)      # [B, T, N, K*3]
@@ -325,9 +373,11 @@ class FunscriptTCN(nn.Module):
             fusion_parts = [pose_out, emb_out, flow_out]
             if self.use_kinematics:
                 fusion_parts.append(kin_out)
-            fused = torch.cat(fusion_parts, dim=-1)
 
-        x = self.fusion(fused)                                         # [B, T, d_model]
+        if self.use_gated_fusion:
+            x = self.fusion(fusion_parts)                              # [B, T, d_model]
+        else:
+            x = self.fusion(torch.cat(fusion_parts, dim=-1))           # [B, T, d_model]
 
         # -- TCN (expects channels-first) --
         x = x.transpose(1, 2)                                         # [B, d_model, T]
