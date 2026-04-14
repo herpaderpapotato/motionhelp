@@ -163,12 +163,15 @@ class MotionDataset(Dataset):
         return out
 
     def _load_stats(self) -> None:
-        stats_path = self.data_dir / "feature_stats.npz"
+        stats_path = self.data_dir / "featurestats" / "feature_stats.npz"
+        self.using_stats = False
         if not stats_path.exists():
             log.warning("No feature_stats.npz — features will NOT be normalized")
             self.emb_mean = self.emb_std = None
             self.flow_mean = self.flow_std = None
             return
+        self.stats_path = stats_path
+        self.using_stats = True
 
         stats = np.load(stats_path)
         emb_mean = stats.get("emb_mean")
@@ -189,6 +192,8 @@ class MotionDataset(Dataset):
             log.info("Loaded embedding normalization stats: [%d dims] from %s", self.embed_dim, stats_path)
         else:
             self.emb_mean = self.emb_std = None
+            
+            self.using_stats = False
             log.warning(
                 "Embedding stats shape %s does not match expected (%d,) or (%d,) — not normalizing embeddings",
                 emb_mean.shape if emb_mean is not None else "None",
@@ -203,6 +208,8 @@ class MotionDataset(Dataset):
             log.info("Loaded flow normalization stats: [%d dims] from %s", self.flow_dim, stats_path)
         else:
             self.flow_mean = self.flow_std = None
+            
+            self.using_stats = False
             log.warning("Flow stats not found or shape mismatch — not normalizing flow")
 
     def __len__(self) -> int:
@@ -251,7 +258,7 @@ class MotionDataset(Dataset):
         # All augmentations are independent (not elif) so multiple can apply
         s = self.augment_scale  # [0, 1] — 0=min values, 1=max values
 
-        dropout_prob = 0.1 + s * (0.5 - 0.1)   # minimum 10%, maximum 50%
+        dropout_prob = 0.1 + s * (0.9 - 0.1)
         if torch.rand(1).item() < dropout_prob:
             choice = torch.randint(3, (1,)).item()
             if choice == 0:
@@ -261,15 +268,39 @@ class MotionDataset(Dataset):
             else:
                 flow = torch.zeros_like(flow)
 
-        emb_noise_prob = 0.2 + s * (0.6 - 0.2)    # minimum 20%, maximum 60%
-        emb_noise_mag  = 0.02 + s * (0.1 - 0.02)  # minimum 0.02, maximum 0.1
+        emb_noise_prob = 0.2 + s * (0.9 - 0.2)    
+        emb_noise_mag  = 0.02 + s * (0.15 - 0.02)
         if torch.rand(1).item() < emb_noise_prob:
             emb = emb + torch.randn_like(emb) * emb_noise_mag
 
-        flow_noise_prob = 0.2 + s * (0.6 - 0.2)    # minimum 20%, maximum 60%
-        flow_noise_mag  = 0.02 + s * (0.1 - 0.02)  # minimum 0.02, maximum 0.1
+        flow_noise_prob = 0.2 + s * (0.9 - 0.2) 
+        flow_noise_mag  = 0.02 + s * (0.2 - 0.02)
         if torch.rand(1).item() < flow_noise_prob:
-            flow = flow + torch.randn_like(flow) * flow_noise_mag
+            # flow = flow + torch.randn_like(flow) * flow_noise_mag # makes B x Seq x FlowDim noise which may be too random
+            # Alternate: use same noise for all flow frames in a sequence to generalize better to different flow magnitudes
+            noise = torch.randn(flow.shape[1], device=flow.device) * flow_noise_mag
+            flow = flow + noise
+
+
+        kp_noise_prob = 0.2 + s * (0.3 - 0.2)
+        kp_noise_mag = 0.01 + s * (0.04 - 0.01) # 5% max jitter
+        if torch.rand(1).item() < kp_noise_prob:
+            kp = kp + torch.randn_like(kp) * kp_noise_mag
+            kp = torch.clamp(kp, 0.0, 1.0)
+            # decay all kp confidences by half
+            kp[..., 2] = kp[..., 2] * 0.5
+
+        kp_intermittent_drop_prob = 0.2 + s * (0.7 - 0.2)
+        if torch.rand(1).item() < kp_intermittent_drop_prob:
+            # Randomly zero out all keypoints for random contiguous segments (simulate occlusion)
+            T = kp.shape[0]
+            n_segments = max(1, int(T * 0.01))  # number of segments scales with sequence length
+            for _ in range(n_segments):
+                seg_len = torch.randint(5, 20, (1,)).item()  # segment length between 5 and 20 frames
+                start = torch.randint(0, T - seg_len, (1,)).item()
+                kp[start:start + seg_len] = 0.0
+
+
 
         return kp, emb, flow, labels
 
@@ -281,18 +312,18 @@ class MotionDataset(Dataset):
 def _compute_augment_scale(val_loss: float, train_loss: float) -> float:
     """Map val/train loss ratio to augmentation scale [0, 1].
 
-    ratio < 1.5  → 0.0 (minimum augmentation)
-    ratio >= 5.0 → 1.0 (maximum augmentation)
     Linear interpolation in between.
     """
+    start_threshold = 1.0
+    end_threshold = 2.0
     if train_loss <= 0:
         return 0.0
     ratio = val_loss / train_loss
-    if ratio < 1.5:
+    if ratio < start_threshold:
         return 0.0
-    if ratio >= 5.0:
+    if ratio >= end_threshold:
         return 1.0
-    return (ratio - 1.5) / (5.0 - 1.5)
+    return (ratio - start_threshold) / (end_threshold - start_threshold)
 
 
 def _highfreq_loss(pred: torch.Tensor, target: torch.Tensor, kernel_size: int) -> torch.Tensor:
@@ -324,17 +355,25 @@ def _highfreq_loss(pred: torch.Tensor, target: torch.Tensor, kernel_size: int) -
 # Phase-specific freezing for multi-phase training
 # ---------------------------------------------------------------------------
 
-def _apply_phase_freezing(model: FunscriptTCN, phase: int) -> None:
+def _apply_phase_freezing(model: FunscriptTCN, phase: int, fill_with_noise: bool = False) -> None:
     """Freeze/unfreeze model parameters based on training phase.
     """
     # First, freeze everything
     if phase > 1:
         for p in model.parameters():
             p.requires_grad = False
-
     if phase == 1:
         pass  # all trainable
     elif phase == 2:
+        if fill_with_noise:
+            print("Filling pose encoder with noise for phase 2")
+            for p in model.pose_encoder.parameters():
+                p.data = torch.randn_like(p.data) * 0.01
+            for p in model.pose_attn.parameters():
+                p.data = torch.randn_like(p.data) * 0.01
+            if model.multiclass:
+                for p in model.beholder_pose_encoder.parameters():
+                    p.data = torch.randn_like(p.data) * 0.01
         # Unfreeze pose encoders only
         print("Unfreezing pose encoders only")
         for p in model.pose_encoder.parameters():
@@ -345,6 +384,15 @@ def _apply_phase_freezing(model: FunscriptTCN, phase: int) -> None:
             for p in model.beholder_pose_encoder.parameters():
                 p.requires_grad = True
     elif phase == 3:
+        if fill_with_noise:
+            print("Filling embedding encoders with noise for phase 3")
+            for p in model.emb_encoder.parameters():
+                p.data = torch.randn_like(p.data) * 0.01
+            for p in model.emb_attn.parameters():
+                p.data = torch.randn_like(p.data) * 0.01
+            if model.multiclass:
+                for p in model.beholder_emb_encoder.parameters():
+                    p.data = torch.randn_like(p.data) * 0.01
         # Unfreeze embedding encoders only
         print("Unfreezing embedding encoders only")
         for p in model.emb_encoder.parameters():
@@ -355,6 +403,10 @@ def _apply_phase_freezing(model: FunscriptTCN, phase: int) -> None:
             for p in model.beholder_emb_encoder.parameters():
                 p.requires_grad = True
     elif phase == 4:
+        if fill_with_noise:
+            print("Filling flow encoder with noise for phase 4")
+            for p in model.flow_encoder.parameters():
+                p.data = torch.randn_like(p.data) * 0.01
         # Unfreeze flow encoder only
         print("Unfreezing flow encoder only")
         for p in model.flow_encoder.parameters():
@@ -423,6 +475,15 @@ def _apply_phase_freezing(model: FunscriptTCN, phase: int) -> None:
         for p in model.tcn_blocks.parameters():
             p.requires_grad = True
     elif phase == 9:
+        if fill_with_noise:
+            print("Filling fusion + output head + TCN backbone with noise for phase 9")
+            for p in model.fusion.parameters():
+                p.data = torch.randn_like(p.data) * 0.01
+            for p in model.output_head.parameters():
+                p.data = torch.randn_like(p.data) * 0.01
+            for p in model.tcn_blocks.parameters():
+                p.data = torch.randn_like(p.data) * 0.01
+
         # Unfreeze fusion + output head + TCN backbone
         print("Unfreezing fusion + output head + TCN backbone")
         for p in model.fusion.parameters():
@@ -479,9 +540,9 @@ def train() -> None:
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--temporal-weight", type=float, default=0.1)
     parser.add_argument("--device", type=str, default="auto")
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--seed", type=int, default=random.randint(0, 1_000_000))
     parser.add_argument("--num-workers", type=int, default=4)
-    parser.add_argument("--scheduler", type=str, default="OneCycleLR",
+    parser.add_argument("--scheduler", type=str, default="CosineWarmupLR",
                         choices=["OneCycleLR", "CosineAnnealingLR", "CosineWarmupLR", "ReduceLROnPlateau"])
     parser.add_argument("--multiclass", action="store_true",
                         help="Use multiclass model (partner + beholder)")
@@ -504,9 +565,11 @@ def train() -> None:
                         help="Moving-average kernel size for spectral loss low-pass filter")
     parser.add_argument("--phase", type=int, default=None,
                         help="Training phase (1-6) for multi-phase training")
+    parser.add_argument("--fill-with-noise", action="store_true", default=False,
+                        help="When resuming to a new phase, fill the newly unfrozen parts with noise instead of starting from the previous phase's weights")
     parser.add_argument("--resume", type=Path, default=None,
                         help="Resume from checkpoint (for multi-phase training)")
-    parser.add_argument("--early-stopping-patience", type=int, default=20,
+    parser.add_argument("--early-stopping-patience", type=int, default=10,
                         help="Stop training if val loss has not improved for this many epochs (0 = disabled)")
     parser.add_argument("--load-best-val-loss", action="store_true", default=False,
                         help="When resuming, load the best_val_loss from the checkpoint to continue early stopping correctly")
@@ -605,7 +668,7 @@ def train() -> None:
 
     # ── Phase-specific freezing ───────────────────────────────────────────
     if args.phase is not None:
-        _apply_phase_freezing(model, args.phase)
+        _apply_phase_freezing(model, args.phase, args.fill_with_noise)
         params = model.count_parameters()
         log.info("Phase %d: %s trainable / %s total parameters",
                  args.phase, f"{params['trainable']:,}", f"{params['total']:,}")
@@ -684,7 +747,17 @@ def train() -> None:
         "n_keypoints": 21,
         "embed_dim": 512,
         "flow_dim": 64,
+        "seq_len": args.seq_len,
     }
+    
+    if MotionDataset.using_stats:
+        stats = np.load(MotionDataset.stats_path)
+        if hasattr(stats, "emb_mean") and hasattr(stats, "emb_std"):
+            model_config["emb_mean"] = stats["emb_mean"].tolist()
+            model_config["emb_std"] = stats["emb_std"].tolist()
+        if hasattr(stats, "flow_mean") and hasattr(stats, "flow_std"):
+            model_config["flow_mean"] = stats["flow_mean"].tolist()
+            model_config["flow_std"] = stats["flow_std"].tolist()
     if args.multiclass:
         model_config.update({
             "n_partners": args.n_partners,
@@ -898,12 +971,30 @@ def train() -> None:
             log.info("  → New best val loss: %.6f", avg_val)
         else:
             _early_stop_counter += 1
-            if args.early_stopping_patience > 0 and _early_stop_counter >= args.early_stopping_patience and epoch > (args.epochs // 4):
+            if args.early_stopping_patience > 0 and _early_stop_counter >= args.early_stopping_patience:
                 log.info(
                     "Early stopping: no improvement for %d epochs (best val=%.6f)",
                     _early_stop_counter, best_val_loss,
                 )
-                break
+                _early_stop_counter = 0
+                # reusing this for model blending with best val model, since we want to continue training after early stopping anyway
+                best_model_path = checkpoint_dir / "best_tcn.pt"
+                best_model = FunscriptTCN(**model_config).to(device)
+                if best_model_path.exists():
+                    log.info("Loading best model from %s for continued training", best_model_path)
+                    ckpt = torch.load(best_model_path, map_location=device, weights_only=False)
+                    best_model.load_state_dict(ckpt["model_state_dict"])
+                    # blend weights onto the current model (simple moving average with blending factor)
+                    blending_factor = 0.5
+                    with torch.no_grad():
+                        for p, best_p in zip(model.parameters(), best_model.parameters()):
+                            p.data = blending_factor * p.data + (1 - blending_factor) * best_p.data
+                            
+
+                else:
+                    log.warning("Best model checkpoint not found at %s — cannot load for continued training", best_model_path)
+                    break
+                
 
         if epoch % 10 == 0:
             torch.save({

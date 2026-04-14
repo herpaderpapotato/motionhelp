@@ -198,6 +198,8 @@ class FunscriptTCN(nn.Module):
         self.use_ddl = use_ddl
         self.kin_dim = kin_dim
         self.use_gated_fusion = use_gated_fusion
+        self._kernel_size = kernel_size
+        self._dropout = dropout
 
         if self.multiclass:
             self.n_partners = n_partners
@@ -418,3 +420,4 @@ class FunscriptTCN(nn.Module):
         total = sum(p.numel() for p in self.parameters())
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
         return {"total": total, "trainable": trainable}
+
