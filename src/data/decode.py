@@ -73,6 +73,34 @@ class GPUVideoDecoder:
 
         self._frame_indices = self._compute_frame_indices()
         self.num_frames = len(self._frame_indices)
+        self._decode_batch = self._auto_decode_batch()
+
+    def _auto_decode_batch(self) -> int:
+        """Compute decode_batch to keep peak VRAM under ~2 GB during crop+resize.
+
+        The bottleneck is the float32 intermediate during F.interpolate:
+          peak_bytes ≈ eff_w * eff_h * 3 * 4  (float32 per frame)
+        For 8-K SBS this is ~199 MB/frame, so decode_batch=64 would need
+        ~12.7 GB just for the resize step.  This limits it to ~10 frames.
+        """
+        try:
+            src_w = getattr(self.metadata, "width", None)
+            src_h = getattr(self.metadata, "height", None)
+            if not src_w or not src_h:
+                return 16  # conservative fallback
+            eff_w = src_w // 2 if self.crop_left_half else src_w
+            eff_h = src_h
+            # float32 peak per frame in _process_chunk
+            bytes_per_frame = eff_w * eff_h * 3 * 4
+            target_bytes = 2 * 1024 ** 3  # 2 GB decode budget
+            batch = max(1, min(64, int(target_bytes / bytes_per_frame)))
+            log.info(
+                "Auto decode_batch=%d for %dx%d source (eff %dx%d, %.0f MB/frame float32)",
+                batch, src_w, src_h, eff_w, eff_h, bytes_per_frame / 1024 ** 2,
+            )
+            return batch
+        except Exception:
+            return 16
 
     def _compute_frame_indices(self) -> list[int]:
         """Compute which source frames to decode for the target FPS and time range."""
@@ -107,26 +135,31 @@ class GPUVideoDecoder:
         """Apply crop and resize on GPU. Input/output: [N, H, W, C] uint8 CUDA."""
         if self.crop_left_half:
             half_w = frames.shape[2] // 2
-            frames = frames[:, :, :half_w, :].contiguous()
+            cropped = frames[:, :, :half_w, :].contiguous()
+            del frames  # free raw full-width tensor before proceeding
+            frames = cropped
 
         if self.target_size is not None:
             h, w = frames.shape[1], frames.shape[2]
             if h != self.target_size or w != self.target_size:
                 # NCHW float for interpolate, then back to NHWC uint8
                 nchw = frames.permute(0, 3, 1, 2).float()
+                del frames  # free uint8 while float32 is processed
                 nchw = F.interpolate(
                     nchw,
                     size=(self.target_size, self.target_size),
                     mode="bilinear",
                     align_corners=False,
                 )
-                frames = nchw.permute(0, 2, 3, 1).clamp(0, 255).to(torch.uint8)
+                result = nchw.permute(0, 2, 3, 1).clamp(0, 255).to(torch.uint8)
+                del nchw  # free large float32 once uint8 result is ready
+                return result
 
         return frames
 
     def iter_chunks(
         self, chunk_size: int = 512, as_numpy: bool = False,
-        decode_batch: int = 64,
+        decode_batch: int | None = None,
     ):
         """Yield frame chunks as [N, H, W, C] uint8 tensors (CUDA) or numpy arrays.
 
@@ -134,9 +167,11 @@ class GPUVideoDecoder:
             chunk_size: Frames per output chunk.
             as_numpy: If True, yield numpy arrays on CPU. If False, yield CUDA tensors.
             decode_batch: Max frames to decode from source at once (prevents OOM
-                         on high-res videos). Decoded frames are cropped/resized
-                         before accumulating.
+                         on high-res videos). ``None`` uses the auto-computed value
+                         (based on video resolution, targeting ~2 GB peak VRAM).
         """
+        if decode_batch is None:
+            decode_batch = self._decode_batch
         indices = self._frame_indices
         accumulated = []
         acc_count = 0
@@ -177,7 +212,7 @@ class GPUVideoDecoder:
                 else:
                     yield final
 
-    def iter_chunks_numpy(self, chunk_size: int = 512, decode_batch: int = 64):
+    def iter_chunks_numpy(self, chunk_size: int = 512, decode_batch: int | None = None):
         """Yield frame chunks as lists of numpy arrays (backward compatible)."""
         for chunk in self.iter_chunks(chunk_size, as_numpy=True, decode_batch=decode_batch):
             yield list(chunk)
@@ -202,6 +237,7 @@ def stream_video_gpu(
     duration: float | None = None,
     chunk_size: int = 512,
     as_numpy: bool = False,
+    decode_batch: int | None = None,
 ):
     """Convenience generator: stream video frames in chunks via GPU decode.
 
@@ -229,9 +265,9 @@ def stream_video_gpu(
             decoder.num_frames, decoder.source_fps, video_path,
         )
         if as_numpy:
-            yield from decoder.iter_chunks_numpy(chunk_size)
+            yield from decoder.iter_chunks_numpy(chunk_size, decode_batch=decode_batch)
         else:
-            yield from decoder.iter_chunks(chunk_size, as_numpy=False)
+            yield from decoder.iter_chunks(chunk_size, as_numpy=False, decode_batch=decode_batch)
         decoder.close()
     except Exception as e:
         log.warning("torchcodec decode failed (%s), falling back to ffmpeg/cv2", e)

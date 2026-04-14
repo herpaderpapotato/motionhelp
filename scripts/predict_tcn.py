@@ -33,7 +33,7 @@ import torch
 from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from src.models.tcn import FunscriptTCN
+from src.models.tcn import FunscriptTCN, extract_model_config
 from src.data.pose import load_pose_model
 from src.data.extraction import SinglePassExtractor, extract_single_pass_batched
 from src.data.decode import stream_video_gpu
@@ -71,7 +71,7 @@ def load_model(checkpoint_path: Path, device: torch.device) -> tuple[FunscriptTC
     """Load TCN model from checkpoint. Returns (model, model_config)."""
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     cfg = ckpt["model_config"]
-    model = FunscriptTCN(**cfg)
+    model = FunscriptTCN(**extract_model_config(cfg))
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
     model.to(device)
@@ -84,8 +84,12 @@ def load_model(checkpoint_path: Path, device: torch.device) -> tuple[FunscriptTC
 def load_stats(data_dir: Path, n_persons: int = 10, embed_dim: int = 512, flow_dim: int = 64):
     stats_path = data_dir / "feature_stats.npz"
     if not stats_path.exists():
-        print("Warning: no feature_stats.npz — predictions will use un-normalized features")
-        return None, None, None, None
+        alt = data_dir / "featurestats" / "feature_stats.npz"
+        if alt.exists():
+            stats_path = alt
+        else:
+            print("Warning: no feature_stats.npz — predictions will use un-normalized features")
+            return None, None, None, None
 
     stats = np.load(stats_path)
     emb_mean = emb_std = None
@@ -342,11 +346,13 @@ def extract_features_from_video(
         t_decode_end = time.perf_counter()
         timings["video_decode"] += t_decode_end - t_last
 
-        # Convert to numpy for YOLO compatibility
+        # Convert to numpy for YOLO compatibility and free the CUDA tensor immediately
         if isinstance(chunk_data, torch.Tensor):
             chunk_np = chunk_data.cpu().numpy()
+            del chunk_data  # free CUDA tensor (~600 MB at 512×640²) before YOLO+RAFT
         elif isinstance(chunk_data, list):
             chunk_np = np.stack(chunk_data)
+            del chunk_data
         else:
             chunk_np = chunk_data
 
@@ -411,6 +417,10 @@ def extract_features_from_video(
     for k, v in timings.items():
         print(f"    {k:20s}: {v:6.2f}s ({v / total * 100:4.1f}%)")
     print(f"    {'TOTAL':20s}: {total:6.2f}s")
+    if device.type == "cuda":
+        peak_mb = torch.cuda.max_memory_allocated(device) / 1024 ** 2
+        reserved_mb = torch.cuda.max_memory_reserved(device) / 1024 ** 2
+        print(f"  Peak VRAM allocated: {peak_mb:.0f} MB  (reserved: {reserved_mb:.0f} MB)")
 
     return keypoints, embeddings, flow
 
@@ -531,7 +541,7 @@ def live_playback_with_prediction(
     from PIL import Image, ImageTk
 
     #MAX_FRAME_BUF = 600       # max decoded frames to keep in RAM (~150MB at 640px)
-    MAX_FRAME_BUF = 200
+    MAX_FRAME_BUF = 1200
     STATS_EVERY_N = 8         # update stats panel every N display ticks
     GRAPH_EVERY_N = 4         # update matplotlib graph every N display ticks
 
@@ -785,8 +795,8 @@ def live_playback_with_prediction(
     _tick     = [0]                  # display update counter
 
     # Buffer thresholds
-    BUF_START_THRESHOLD = MAX_FRAME_BUF       # must fill completely before initial play
-    BUF_RESUME_THRESHOLD = MAX_FRAME_BUF
+    BUF_START_THRESHOLD = MAX_FRAME_BUF//2       # must fill completely before initial play
+    BUF_RESUME_THRESHOLD = MAX_FRAME_BUF//2
     BUF_LOW_THRESHOLD    = 120                 # pause playback when buffer drops below this
 
     frame_delay_ms = max(16, int(1000.0 / target_fps))

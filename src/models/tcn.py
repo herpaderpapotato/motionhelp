@@ -23,6 +23,57 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+COCO_17_BONES = [
+    (0, 1), (0, 2), (1, 3), (2, 4),
+    (0, 5), (0, 6),
+    (5, 7), (6, 8), (7, 9), (8, 10),
+    (5, 11), (6, 12), (11, 13), (12, 14), (13, 15), (14, 16),
+]
+
+PERFORMER_21_BONES = [
+    (0, 1), (0, 2), (1, 3), (2, 4),
+    (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),
+    (5, 11), (6, 12), (11, 12),
+    (11, 13), (13, 15), (12, 14), (14, 16),
+    (11, 17), (12, 17), (17, 18),
+    (5, 19), (6, 20), (19, 20), (18, 19), (18, 20),
+]
+
+BEHOLDER_7_BONES = [
+    (0, 1),
+    (0, 2), (1, 3),
+    (0, 4), (1, 4),
+    (4, 5),
+]
+
+MODEL_CONFIG_KEYS = {
+    "d_model",
+    "n_blocks",
+    "kernel_size",
+    "dropout",
+    "n_persons",
+    "n_keypoints",
+    "embed_dim",
+    "flow_dim",
+    "n_partners",
+    "n_beholders",
+    "n_beholder_keypoints",
+    "beholder_pose_dim",
+    "beholder_emb_dim",
+    "use_kinematics",
+    "use_ddl",
+    "kin_dim",
+    "use_gated_fusion",
+    "use_difference_pathway",
+    "difference_dim",
+}
+
+
+def extract_model_config(config: dict[str, object]) -> dict[str, object]:
+    """Filter checkpoint config down to FunscriptTCN constructor kwargs."""
+    return {key: config[key] for key in MODEL_CONFIG_KEYS if key in config}
+
+
 class PersonAttention(nn.Module):
     """Attention pooling across person detections, biased by keypoint confidence.
 
@@ -46,6 +97,245 @@ class PersonAttention(nn.Module):
             scores = scores + conf.clamp(min=1e-6).log()
         weights = F.softmax(scores, dim=-1)  # [B, T, N]
         return (x * weights.unsqueeze(-1)).sum(dim=2)  # [B, T, D]
+
+
+class StructuredPoseEncoder(nn.Module):
+    """Encode per-person pose using relative joints, bones, and velocities."""
+
+    def __init__(
+        self,
+        n_keypoints: int,
+        output_dim: int,
+        kernel_size: int,
+        dropout: float,
+        bones: list[tuple[int, int]],
+        root_index: int | None,
+        root_pair: tuple[int, int] | None,
+    ):
+        super().__init__()
+        self.n_keypoints = n_keypoints
+        self.root_index = root_index
+        self.root_pair = root_pair
+
+        if bones:
+            bone_tensor = torch.tensor(bones, dtype=torch.long)
+            self.register_buffer("bone_start", bone_tensor[:, 0], persistent=False)
+            self.register_buffer("bone_end", bone_tensor[:, 1], persistent=False)
+        else:
+            self.register_buffer("bone_start", torch.zeros(0, dtype=torch.long), persistent=False)
+            self.register_buffer("bone_end", torch.zeros(0, dtype=torch.long), persistent=False)
+
+        feature_dim = (n_keypoints * 2) + (len(bones) * 2) + (n_keypoints * 2) + n_keypoints + 2
+        self.frame_proj = nn.Sequential(
+            nn.Linear(feature_dim, output_dim),
+            nn.LayerNorm(output_dim),
+            nn.GELU(),
+        )
+
+        pad1 = (kernel_size - 1) // 2
+        pad2 = 2 * (kernel_size - 1) // 2
+        self.temporal = nn.Sequential(
+            nn.Conv1d(output_dim, output_dim, kernel_size, padding=pad1),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Conv1d(output_dim, output_dim, kernel_size, padding=pad2, dilation=2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.out_norm = nn.LayerNorm(output_dim)
+
+    def forward(self, kp: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Encode pose features before person pooling.
+
+        Args:
+            kp: [B, T, N, K, 3]
+        Returns:
+            encoded: [B, T, N, D]
+            person_conf: [B, T, N]
+        """
+        xy = kp[..., :2]                                                 # [B, T, N, K, 2]
+        conf = kp[..., 2]                                                # [B, T, N, K]
+
+        root_xy = self._compute_root(xy, conf)                           # [B, T, N, 2]
+        rel_xy = (xy - root_xy.unsqueeze(-2)) * conf.unsqueeze(-1)       # [B, T, N, K, 2]
+
+        rel_vel = torch.zeros_like(rel_xy)
+        if rel_xy.shape[1] > 1:
+            rel_vel[:, 1:] = rel_xy[:, 1:] - rel_xy[:, :-1]
+
+        root_vel = torch.zeros_like(root_xy)
+        if root_xy.shape[1] > 1:
+            root_vel[:, 1:] = root_xy[:, 1:] - root_xy[:, :-1]
+
+        bone_vec = self._compute_bones(rel_xy)                           # [B, T, N, B, 2]
+        person_conf = self._mean_visible_conf(conf)                      # [B, T, N]
+
+        features = torch.cat(
+            [
+                rel_xy.flatten(start_dim=3),
+                bone_vec.flatten(start_dim=3),
+                rel_vel.flatten(start_dim=3),
+                conf,
+                root_vel,
+            ],
+            dim=-1,
+        )                                                                # [B, T, N, F]
+        encoded = self.frame_proj(features)                              # [B, T, N, D]
+
+        bsz, seq_len, n_persons, feat_dim = encoded.shape
+        encoded_bt = encoded.permute(0, 2, 3, 1).reshape(bsz * n_persons, feat_dim, seq_len)
+        encoded_bt = encoded_bt + self.temporal(encoded_bt)
+        encoded = encoded_bt.reshape(bsz, n_persons, feat_dim, seq_len).permute(0, 3, 1, 2)
+        encoded = self.out_norm(encoded)
+        return encoded, person_conf
+
+    def _compute_root(self, xy: torch.Tensor, conf: torch.Tensor) -> torch.Tensor:
+        """Infer a stable per-person root point using pelvis or hip midpoint."""
+        root_xy = None
+        root_conf = None
+
+        if self.root_index is not None and self.root_index < self.n_keypoints:
+            root_xy = xy[..., self.root_index, :]
+            root_conf = conf[..., self.root_index]
+
+        if self.root_pair is not None and max(self.root_pair) < self.n_keypoints:
+            pair_xy = 0.5 * (xy[..., self.root_pair[0], :] + xy[..., self.root_pair[1], :])
+            pair_conf = 0.5 * (conf[..., self.root_pair[0]] + conf[..., self.root_pair[1]])
+            if root_xy is None:
+                root_xy = pair_xy
+                root_conf = pair_conf
+            else:
+                use_pair = root_conf <= 1e-6
+                root_xy = torch.where(use_pair.unsqueeze(-1), pair_xy, root_xy)
+                root_conf = torch.where(use_pair, pair_conf, root_conf)
+
+        if root_xy is None:
+            weights = conf.clamp_min(1e-6).unsqueeze(-1)
+            return (xy * weights).sum(dim=3) / weights.sum(dim=3).clamp_min(1e-6)
+
+        if root_conf is not None:
+            missing_root = root_conf <= 1e-6
+            if missing_root.any():
+                weights = conf.clamp_min(1e-6).unsqueeze(-1)
+                fallback = (xy * weights).sum(dim=3) / weights.sum(dim=3).clamp_min(1e-6)
+                root_xy = torch.where(missing_root.unsqueeze(-1), fallback, root_xy)
+        return root_xy
+
+    def _compute_bones(self, rel_xy: torch.Tensor) -> torch.Tensor:
+        if self.bone_start.numel() == 0:
+            shape = rel_xy.shape[:3] + (0, 2)
+            return rel_xy.new_zeros(shape)
+        bone_start = rel_xy.index_select(3, self.bone_start)
+        bone_end = rel_xy.index_select(3, self.bone_end)
+        return bone_end - bone_start
+
+    @staticmethod
+    def _mean_visible_conf(conf: torch.Tensor) -> torch.Tensor:
+        visible = conf > 0
+        denom = visible.sum(dim=-1).clamp_min(1)
+        return conf.sum(dim=-1) / denom
+
+
+class DifferenceMagnitudeEncoder(nn.Module):
+    """Encode beholder-to-performer keypoint difference magnitudes."""
+
+    def __init__(
+        self,
+        n_beholder_keypoints: int,
+        n_partners: int,
+        n_keypoints: int,
+        output_dim: int,
+        kernel_size: int,
+        dropout: float,
+        pair_dim: int = 8,
+    ):
+        super().__init__()
+        self.n_beholder_keypoints = n_beholder_keypoints
+        self.n_partners = n_partners
+        self.n_keypoints = n_keypoints
+        self.output_dim = output_dim
+        self.pair_dim = pair_dim
+
+        feature_count = n_beholder_keypoints * n_partners * n_keypoints
+        self.pair_proj = nn.Sequential(
+            nn.Linear(2, pair_dim),
+            nn.LayerNorm(pair_dim),
+            nn.GELU(),
+        )
+        self.frame_proj = nn.Sequential(
+            nn.Linear(feature_count * pair_dim, output_dim),
+            nn.LayerNorm(output_dim),
+            nn.GELU(),
+        )
+
+        pad1 = (kernel_size - 1) // 2
+        pad2 = 2 * (kernel_size - 1) // 2
+        self.temporal = nn.Sequential(
+            nn.Conv1d(output_dim, output_dim, kernel_size, padding=pad1),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Conv1d(output_dim, output_dim, kernel_size, padding=pad2, dilation=2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.out_norm = nn.LayerNorm(output_dim)
+
+    def forward(self, partner_kp: torch.Tensor, beholder_kp: torch.Tensor) -> torch.Tensor:
+        """Encode per-frame difference features.
+
+        Args:
+            partner_kp: [B, T, Np, Kp, 3]
+            beholder_kp: [B, T, Nb, Kb, 3]
+        Returns: [B, T, D]
+        """
+        bsz, seq_len = partner_kp.shape[:2]
+        if beholder_kp.shape[2] == 0:
+            return partner_kp.new_zeros((bsz, seq_len, self.output_dim))
+
+        partner_xy = partner_kp[..., :2]                              # [B, T, Np, Kp, 2]
+        partner_conf = partner_kp[..., 2]                             # [B, T, Np, Kp]
+        beholder_xy = beholder_kp[..., :2]                            # [B, T, Nb, Kb, 2]
+        beholder_conf = beholder_kp[..., 2]                           # [B, T, Nb, Kb]
+
+        collapsed_beh_xy, collapsed_beh_conf = self._collapse_beholders(
+            beholder_xy,
+            beholder_conf,
+        )                                                             # [B, T, Kb, 2], [B, T, Kb]
+
+        diff = (
+            partner_xy.unsqueeze(2)
+            - collapsed_beh_xy.unsqueeze(3).unsqueeze(4)
+        )                                                             # [B, T, Kb, Np, Kp, 2]
+        conf_prod = (
+            collapsed_beh_conf.unsqueeze(3).unsqueeze(4).unsqueeze(-1)
+            * partner_conf.unsqueeze(2).unsqueeze(-1)
+        )                                                             # [B, T, Kb, Np, Kp, 1]
+        valid_mask = (conf_prod > 0).to(diff.dtype)
+        diff_mag = torch.linalg.vector_norm(diff, dim=-1, keepdim=True) * valid_mask
+
+        pair_features = torch.cat([diff_mag, conf_prod], dim=-1)      # [B, T, Kb, Np, Kp, 2]
+        pair_encoded = self.pair_proj(pair_features)                   # [B, T, Kb, Np, Kp, pair_dim]
+        frame_features = pair_encoded.reshape(bsz, seq_len, -1)       # [B, T, Kb*Np*Kp*pair_dim]
+        encoded = self.frame_proj(frame_features)                      # [B, T, D]
+
+        encoded_bt = encoded.transpose(1, 2)                           # [B, D, T]
+        encoded_bt = encoded_bt + self.temporal(encoded_bt)
+        return self.out_norm(encoded_bt.transpose(1, 2))               # [B, T, D]
+
+    @staticmethod
+    def _collapse_beholders(
+        beholder_xy: torch.Tensor,
+        beholder_conf: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Collapse multiple beholders down to one per frame/keypoint."""
+        if beholder_xy.shape[2] == 1:
+            return beholder_xy.squeeze(2), beholder_conf.squeeze(2)
+
+        weights = beholder_conf.clamp_min(0.0)
+        denom = weights.sum(dim=2, keepdim=False).clamp_min(1e-6)
+        xy = (beholder_xy * weights.unsqueeze(-1)).sum(dim=2) / denom.unsqueeze(-1)
+        conf = weights.max(dim=2).values
+        return xy, conf
 
 
 class TCNBlock(nn.Module):
@@ -187,6 +477,8 @@ class FunscriptTCN(nn.Module):
         use_ddl: bool = False,
         kin_dim: int = 64,
         use_gated_fusion: bool = False,
+        use_difference_pathway: bool = False,
+        difference_dim: int = 64,
     ):
         super().__init__()
         self.d_model = d_model
@@ -198,6 +490,8 @@ class FunscriptTCN(nn.Module):
         self.use_ddl = use_ddl
         self.kin_dim = kin_dim
         self.use_gated_fusion = use_gated_fusion
+        self.use_difference_pathway = use_difference_pathway and self.multiclass
+        self.difference_dim = difference_dim
         self._kernel_size = kernel_size
         self._dropout = dropout
 
@@ -211,13 +505,17 @@ class FunscriptTCN(nn.Module):
         else:
             self.n_persons = n_persons
 
-        kp_feat_dim = n_keypoints * 3  # 63
+        pose_bones, pose_root_index, pose_root_pair = self._performer_topology(n_keypoints)
 
         # -- Per-person feature encoders (partners in multiclass, all in single) --
-        self.pose_encoder = nn.Sequential(
-            nn.Linear(kp_feat_dim, 128),
-            nn.LayerNorm(128),
-            nn.GELU(),
+        self.pose_encoder = StructuredPoseEncoder(
+            n_keypoints=n_keypoints,
+            output_dim=128,
+            kernel_size=kernel_size,
+            dropout=dropout,
+            bones=pose_bones,
+            root_index=pose_root_index,
+            root_pair=pose_root_pair,
         )
         self.pose_attn = PersonAttention(128)
 
@@ -246,11 +544,15 @@ class FunscriptTCN(nn.Module):
 
         # -- Beholder encoders (multiclass only) --
         if self.multiclass:
-            beh_kp_dim = n_beholder_keypoints * 3  # 21
-            self.beholder_pose_encoder = nn.Sequential(
-                nn.Linear(beh_kp_dim, beholder_pose_dim),
-                nn.LayerNorm(beholder_pose_dim),
-                nn.GELU(),
+            beh_bones, beh_root_index, beh_root_pair = self._beholder_topology(n_beholder_keypoints)
+            self.beholder_pose_encoder = StructuredPoseEncoder(
+                n_keypoints=n_beholder_keypoints,
+                output_dim=beholder_pose_dim,
+                kernel_size=kernel_size,
+                dropout=dropout,
+                bones=beh_bones,
+                root_index=beh_root_index,
+                root_pair=beh_root_pair,
             )
             self.beholder_emb_encoder = nn.Sequential(
                 nn.Linear(embed_dim, beholder_emb_dim),
@@ -258,6 +560,16 @@ class FunscriptTCN(nn.Module):
                 nn.GELU(),
             )
             stream_dims = [128, 128, 64, beholder_pose_dim, beholder_emb_dim]
+            if self.use_difference_pathway:
+                self.difference_encoder = DifferenceMagnitudeEncoder(
+                    n_beholder_keypoints=n_beholder_keypoints,
+                    n_partners=n_partners,
+                    n_keypoints=n_keypoints,
+                    output_dim=difference_dim,
+                    kernel_size=kernel_size,
+                    dropout=dropout,
+                )
+                stream_dims.append(difference_dim)
             if self.use_kinematics:
                 stream_dims.append(kin_dim)
             fusion_in = sum(stream_dims)
@@ -323,9 +635,7 @@ class FunscriptTCN(nn.Module):
             ]                                                          # [B, T, Nb, E]
 
             # -- Partner pose (existing path) --
-            kp_flat = partner_kp.reshape(B, T, self.n_partners, -1)    # [B, T, Np, K*3]
-            kp_conf = partner_kp[:, :, :, :, 2].mean(dim=-1)          # [B, T, Np]
-            pose_feat = self.pose_encoder(kp_flat)                     # [B, T, Np, 128]
+            pose_feat, kp_conf = self.pose_encoder(partner_kp)         # [B, T, Np, 128], [B, T, Np]
             pose_out = self.pose_attn(pose_feat, kp_conf)              # [B, T, 128]
 
             # -- Partner embeddings (existing path) --
@@ -333,13 +643,16 @@ class FunscriptTCN(nn.Module):
             emb_out = self.emb_attn(emb_feat, kp_conf)                # [B, T, 128]
 
             # -- Beholder pose --
-            beh_kp_flat = beholder_kp.reshape(B, T, self.n_beholders, -1)  # [B, T, Nb, Kb*3]
-            beh_pose_feat = self.beholder_pose_encoder(beh_kp_flat)    # [B, T, Nb, beh_pose_dim]
+            beh_pose_feat, beh_conf = self.beholder_pose_encoder(beholder_kp)  # [B, T, Nb, Db]
             beh_pose_out = beh_pose_feat.mean(dim=2)                   # [B, T, beh_pose_dim]
 
             # -- Beholder embeddings --
             beh_emb_feat = self.beholder_emb_encoder(beholder_emb)     # [B, T, Nb, beh_emb_dim]
             beh_emb_out = beh_emb_feat.mean(dim=2)                     # [B, T, beh_emb_dim]
+
+            # -- Beholder/performer keypoint difference pathway --
+            if self.use_difference_pathway:
+                diff_out = self.difference_encoder(partner_kp, beholder_kp)  # [B, T, difference_dim]
 
             # -- Flow --
             flow_out = self.flow_encoder(flow)                         # [B, T, 64]
@@ -352,13 +665,13 @@ class FunscriptTCN(nn.Module):
 
             # -- Fusion (augmented with beholder + optional kinematics) --
             fusion_parts = [pose_out, emb_out, flow_out, beh_pose_out, beh_emb_out]
+            if self.use_difference_pathway:
+                fusion_parts.append(diff_out)
             if self.use_kinematics:
                 fusion_parts.append(kin_out)
         else:
             # -- Original single-class path --
-            kp_flat = keypoints.reshape(B, T, self.n_persons, -1)      # [B, T, N, K*3]
-            kp_conf = keypoints[:, :, :, :, 2].mean(dim=-1)           # [B, T, N]
-            pose_feat = self.pose_encoder(kp_flat)                     # [B, T, N, 128]
+            pose_feat, kp_conf = self.pose_encoder(keypoints)          # [B, T, N, 128], [B, T, N]
             pose_out = self.pose_attn(pose_feat, kp_conf)              # [B, T, 128]
 
             emb_feat = self.emb_encoder(embeddings)                    # [B, T, N, 128]
@@ -415,6 +728,22 @@ class FunscriptTCN(nn.Module):
         kin = kin.reshape(B, T, n_persons, -1)               # [B, T, N, K*4]
         kin_feat = self.kin_encoder(kin)                      # [B, T, N, kin_dim]
         return self.kin_attn(kin_feat, kp_conf)               # [B, T, kin_dim]
+
+    @staticmethod
+    def _performer_topology(n_keypoints: int) -> tuple[list[tuple[int, int]], int | None, tuple[int, int] | None]:
+        if n_keypoints >= 21:
+            return PERFORMER_21_BONES, 17, (11, 12)
+        if n_keypoints >= 17:
+            return COCO_17_BONES, None, (11, 12)
+        return [], None, None
+
+    @staticmethod
+    def _beholder_topology(n_keypoints: int) -> tuple[list[tuple[int, int]], int | None, tuple[int, int] | None]:
+        if n_keypoints >= 7:
+            return BEHOLDER_7_BONES, 4, (0, 1)
+        if n_keypoints >= 2:
+            return [], None, (0, 1)
+        return [], None, None
 
     def count_parameters(self) -> dict[str, int]:
         total = sum(p.numel() for p in self.parameters())

@@ -121,9 +121,9 @@ def compute_flow_raft_batched(
             use_amp = (str(device).startswith("cuda") or device == "cuda")
             with torch.amp.autocast("cuda", enabled=use_amp):
                 flow_preds = model(t1, t2)
-            flows = flow_preds[-1].float().cpu().numpy()  # [B, 2, H, W]
+            flows = flow_preds[-1].cpu().float().numpy()  # [B, 2, H, W]
 
-            del t1, t2
+            del t1, t2, flow_preds
 
             for j in range(b):
                 flow_hwc = flows[j].transpose(1, 2, 0)  # [H, W, 2]

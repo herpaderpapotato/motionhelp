@@ -27,7 +27,8 @@ from torch.utils.tensorboard import SummaryWriter
 
 # Resolve imports from project root
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from src.models.tcn import FunscriptTCN
+from src.models.tcn import FunscriptTCN, extract_model_config
+from src.training.funscript_metrics import compute_regression_metrics
 
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
@@ -238,10 +239,10 @@ class MotionDataset(Dataset):
         flow = torch.from_numpy(flow).float()               # [T, F]
         labels = torch.from_numpy(labels).float()            # [T]
 
-        if self.augment:
-            keypoints, embeddings, flow, labels = self._augment(
-                keypoints, embeddings, flow, labels
-            )
+        # if self.augment:
+        #     keypoints, embeddings, flow, labels = self._augment(
+        #         keypoints, embeddings, flow, labels
+        #     )
 
         return {
             "keypoints": keypoints,
@@ -326,31 +327,6 @@ def _compute_augment_scale(val_loss: float, train_loss: float) -> float:
     if ratio >= end_threshold:
         return 1.0
     return (ratio - start_threshold) / (end_threshold - start_threshold)
-
-
-def _highfreq_loss(pred: torch.Tensor, target: torch.Tensor, kernel_size: int) -> torch.Tensor:
-    """Compute MSE on high-frequency components (original - moving-average smoothed).
-
-    This forces the model to learn subtle motion details that are drowned out
-    by the macro-movement MSE.  The low-pass filter is a uniform 1-D moving
-    average applied per-sample.
-    """
-    # pred, target: [B, T]
-    pad = kernel_size // 2
-    weight = torch.ones(1, 1, kernel_size, device=pred.device, dtype=pred.dtype) / kernel_size
-    # Smooth via 1-D convolution (replicate-pad to preserve length)
-    pred_3d = pred.unsqueeze(1)    # [B, 1, T]
-    tgt_3d = target.unsqueeze(1)   # [B, 1, T]
-    pred_smooth = nn.functional.conv1d(
-        nn.functional.pad(pred_3d, (pad, pad), mode="replicate"), weight
-    ).squeeze(1)                    # [B, T]
-    tgt_smooth = nn.functional.conv1d(
-        nn.functional.pad(tgt_3d, (pad, pad), mode="replicate"), weight
-    ).squeeze(1)                    # [B, T]
-    # High-frequency residual
-    pred_hf = pred - pred_smooth
-    tgt_hf = target - tgt_smooth
-    return nn.functional.mse_loss(pred_hf, tgt_hf)
 
 
 # ---------------------------------------------------------------------------
@@ -559,12 +535,24 @@ def train() -> None:
                         help="Kinematic feature dimension")
     parser.add_argument("--use-gated-fusion", action="store_true",
                         help="Use context-aware gated multimodal fusion instead of concat+linear")
+    parser.add_argument("--no-difference-pathway", action="store_true", default=False,
+                        help="Disable the multiclass beholder-performer difference branch")
+    parser.add_argument("--difference-dim", type=int, default=64,
+                        help="Feature dimension for the beholder-performer difference branch")
     parser.add_argument("--velocity-weight", type=float, default=0.0,
                         help="Weight for velocity-matching loss (first derivative)")
     parser.add_argument("--spectral-weight", type=float, default=0.0,
                         help="Weight for high-frequency detail loss (multi-scale spectral)")
     parser.add_argument("--spectral-kernel", type=int, default=15,
                         help="Moving-average kernel size for spectral loss low-pass filter")
+    parser.add_argument("--event-weight", type=float, default=0.25,
+                        help="Blend factor between plain MSE and event-aware weighted MSE")
+    parser.add_argument("--event-activity-gain", type=float, default=3.0,
+                        help="Gain applied to derivative-based event weighting")
+    parser.add_argument("--event-activity-power", type=float, default=1.0,
+                        help="Power applied to derivative-based event weighting")
+    parser.add_argument("--active-quantile", type=float, default=0.8,
+                        help="Quantile threshold used when reporting active-frame metrics")
     parser.add_argument("--phase", type=int, default=None,
                         help="Training phase (1-6) for multi-phase training")
     parser.add_argument("--fill-with-noise", action="store_true", default=False,
@@ -576,6 +564,11 @@ def train() -> None:
     parser.add_argument("--load-best-val-loss", action="store_true", default=False,
                         help="When resuming, load the best_val_loss from the checkpoint to continue early stopping correctly")
     args = parser.parse_args()
+
+    if not 0.0 <= args.event_weight <= 1.0:
+        parser.error("--event-weight must be between 0 and 1")
+    if not 0.0 < args.active_quantile <= 1.0:
+        parser.error("--active-quantile must be in (0, 1]")
 
     logging.basicConfig(
         level=logging.INFO,
@@ -647,6 +640,9 @@ def train() -> None:
         model_kwargs["use_ddl"] = True
     if args.use_gated_fusion:
         model_kwargs["use_gated_fusion"] = True
+    if args.multiclass and not args.no_difference_pathway:
+        model_kwargs["use_difference_pathway"] = True
+        model_kwargs["difference_dim"] = args.difference_dim
 
     model = FunscriptTCN(**model_kwargs).to(device)
 
@@ -741,7 +737,7 @@ def train() -> None:
     checkpoint_dir = Path("data/models/checkpoints_tcn")
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    model_config = {
+    model_config = extract_model_config({
         "d_model": args.d_model,
         "n_blocks": args.n_blocks,
         "kernel_size": 3,
@@ -749,17 +745,7 @@ def train() -> None:
         "n_keypoints": 21,
         "embed_dim": 512,
         "flow_dim": 64,
-        "seq_len": args.seq_len,
-    }
-    
-    if train_ds.using_stats:
-        stats = np.load(train_ds.stats_path)
-        if hasattr(stats, "emb_mean") and hasattr(stats, "emb_std"):
-            model_config["emb_mean"] = stats["emb_mean"].tolist()
-            model_config["emb_std"] = stats["emb_std"].tolist()
-        if hasattr(stats, "flow_mean") and hasattr(stats, "flow_std"):
-            model_config["flow_mean"] = stats["flow_mean"].tolist()
-            model_config["flow_std"] = stats["flow_std"].tolist()
+    })
     if args.multiclass:
         model_config.update({
             "n_partners": args.n_partners,
@@ -775,6 +761,25 @@ def train() -> None:
         model_config["use_ddl"] = True
     if args.use_gated_fusion:
         model_config["use_gated_fusion"] = True
+    if args.multiclass and not args.no_difference_pathway:
+        model_config["use_difference_pathway"] = True
+        model_config["difference_dim"] = args.difference_dim
+
+    data_config = {
+        "seq_len": args.seq_len,
+        "stride": args.stride,
+        "stats_path": str(train_ds.stats_path) if train_ds.stats_path is not None else None,
+    }
+    metric_config = {
+        "event_weight": args.event_weight,
+        "event_activity_gain": args.event_activity_gain,
+        "event_activity_power": args.event_activity_power,
+        "active_quantile": args.active_quantile,
+        "temporal_weight": args.temporal_weight,
+        "velocity_weight": args.velocity_weight,
+        "spectral_weight": args.spectral_weight,
+        "spectral_kernel": args.spectral_kernel,
+    }
 
     log.info("Run dir: %s", run_dir)
     log.info("Checkpoint dir: %s", checkpoint_dir)
@@ -789,7 +794,16 @@ def train() -> None:
         # --- Train ---
         model.train()
         train_losses = []
-        train_pos_losses = []
+        train_metric_history = {
+            "pos_mse": [],
+            "event_mse": [],
+            "active_mse": [],
+            "vel_mse": [],
+            "vel_mae": [],
+            "acc_mse": [],
+            "acc_mae": [],
+            "spec_mse": [],
+        }
 
         for batch in train_loader:
             kp = batch["keypoints"].to(device, non_blocking=True)
@@ -801,29 +815,19 @@ def train() -> None:
 
             with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
                 pred = model(kp, emb, fl)  # [B, T]
-
-                pos_loss = nn.functional.mse_loss(pred, lbl)
-
-                if args.temporal_weight > 0 and pred.shape[1] > 2:
-                    pred_acc = pred[:, 2:] - 2 * pred[:, 1:-1] + pred[:, :-2]
-                    tgt_acc = lbl[:, 2:] - 2 * lbl[:, 1:-1] + lbl[:, :-2]
-                    temp_loss = nn.functional.mse_loss(pred_acc, tgt_acc)
-                else:
-                    temp_loss = torch.tensor(0.0, device=device)
-
-                # Velocity-matching loss (first derivative)
-                if args.velocity_weight > 0 and pred.shape[1] > 1:
-                    pred_vel = pred[:, 1:] - pred[:, :-1]
-                    tgt_vel = lbl[:, 1:] - lbl[:, :-1]
-                    vel_loss = nn.functional.mse_loss(pred_vel, tgt_vel)
-                else:
-                    vel_loss = torch.tensor(0.0, device=device)
-
-                # High-frequency spectral loss
-                if args.spectral_weight > 0:
-                    spec_loss = _highfreq_loss(pred, lbl, args.spectral_kernel)
-                else:
-                    spec_loss = torch.tensor(0.0, device=device)
+                metric_batch = compute_regression_metrics(
+                    pred,
+                    lbl,
+                    spectral_kernel=args.spectral_kernel,
+                    activity_gain=args.event_activity_gain,
+                    activity_power=args.event_activity_power,
+                    active_quantile=args.active_quantile,
+                )
+                pos_loss = ((1.0 - args.event_weight) * metric_batch["pos_mse"]
+                            + args.event_weight * metric_batch["event_mse"])
+                temp_loss = metric_batch["acc_mse"]
+                vel_loss = metric_batch["vel_mse"]
+                spec_loss = metric_batch["spec_mse"]
 
                 loss = (pos_loss
                         + args.temporal_weight * temp_loss
@@ -835,18 +839,22 @@ def train() -> None:
             grad_norm = nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             scaler.step(optimizer)
             scaler.update()
-            if args.scheduler == "ReduceLROnPlateau":
-                scheduler.step(loss)
-            else:
+            if args.scheduler != "ReduceLROnPlateau":
                 scheduler.step()
 
             train_losses.append(loss.item())
-            train_pos_losses.append(pos_loss.item())
+            for key in train_metric_history:
+                train_metric_history[key].append(metric_batch[key].item())
             global_step += 1
 
             if global_step % 50 == 0:
                 writer.add_scalar("train/loss", loss.item(), global_step)
                 writer.add_scalar("train/pos_loss", pos_loss.item(), global_step)
+                writer.add_scalar("train/pos_mse", metric_batch["pos_mse"].item(), global_step)
+                writer.add_scalar("train/event_mse", metric_batch["event_mse"].item(), global_step)
+                writer.add_scalar("train/active_mse", metric_batch["active_mse"].item(), global_step)
+                writer.add_scalar("train/vel_mae", metric_batch["vel_mae"].item(), global_step)
+                writer.add_scalar("train/acc_mae", metric_batch["acc_mae"].item(), global_step)
                 writer.add_scalar("train/temp_loss", temp_loss.item(), global_step)
                 writer.add_scalar("train/vel_loss", vel_loss.item(), global_step)
                 writer.add_scalar("train/spec_loss", spec_loss.item(), global_step)
@@ -856,14 +864,23 @@ def train() -> None:
                 writer.add_scalar("lr", optimizer.param_groups[0]["lr"], global_step)
 
         avg_train = np.mean(train_losses)
-        avg_train_pos = np.mean(train_pos_losses)
+        avg_train_metrics = {key: float(np.mean(values)) for key, values in train_metric_history.items()}
 
         # --- Validate ---
         model.eval()
         val_losses = []
-        val_pos_losses = []
         val_pred_means = []
         val_pred_stds = []
+        val_metric_history = {
+            "pos_mse": [],
+            "event_mse": [],
+            "active_mse": [],
+            "vel_mse": [],
+            "vel_mae": [],
+            "acc_mse": [],
+            "acc_mae": [],
+            "spec_mse": [],
+        }
 
         with torch.no_grad():
             for batch in val_loader:
@@ -874,56 +891,68 @@ def train() -> None:
 
                 with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
                     pred = model(kp, emb, fl)
-                    pos_loss = nn.functional.mse_loss(pred, lbl)
-
-                    if pred.shape[1] > 2:
-                        pred_acc = pred[:, 2:] - 2 * pred[:, 1:-1] + pred[:, :-2]
-                        tgt_acc = lbl[:, 2:] - 2 * lbl[:, 1:-1] + lbl[:, :-2]
-                        temp_loss = nn.functional.mse_loss(pred_acc, tgt_acc)
-                    else:
-                        temp_loss = torch.tensor(0.0, device=device)
-
-                    if args.spectral_weight > 0:
-                        spec_loss = _highfreq_loss(pred, lbl, args.spectral_kernel)
-                    else:
-                        spec_loss = torch.tensor(0.0, device=device)
+                    metric_batch = compute_regression_metrics(
+                        pred,
+                        lbl,
+                        spectral_kernel=args.spectral_kernel,
+                        activity_gain=args.event_activity_gain,
+                        activity_power=args.event_activity_power,
+                        active_quantile=args.active_quantile,
+                    )
+                    pos_loss = ((1.0 - args.event_weight) * metric_batch["pos_mse"]
+                                + args.event_weight * metric_batch["event_mse"])
+                    temp_loss = metric_batch["acc_mse"]
+                    vel_loss = metric_batch["vel_mse"]
+                    spec_loss = metric_batch["spec_mse"]
 
                     loss = (pos_loss
                             + args.temporal_weight * temp_loss
+                            + args.velocity_weight * vel_loss
                             + args.spectral_weight * spec_loss)
 
                 val_losses.append(loss.item())
-                val_pos_losses.append(pos_loss.item())
+                for key in val_metric_history:
+                    val_metric_history[key].append(metric_batch[key].item())
                 val_pred_means.append(pred.mean().item())
                 val_pred_stds.append(pred.std().item())
 
         avg_val = np.mean(val_losses)
-        avg_val_pos = np.mean(val_pos_losses)
+        avg_val_metrics = {key: float(np.mean(values)) for key, values in val_metric_history.items()}
         avg_pred_mean = np.mean(val_pred_means)
         avg_pred_std = np.mean(val_pred_stds)
 
         epoch_time = time.time() - epoch_start
 
         log.info(
-            "Epoch %3d/%d | train=%.6f val=%.6f pos=%.6f | "
+            "Epoch %3d/%d | train=%.6f val=%.6f pos=%.6f event=%.6f active=%.6f vel_mae=%.6f | "
             "pred_μ=%.3f pred_σ=%.3f | lr=%.2e | %.1fs",
-            epoch, args.epochs, avg_train, avg_val, avg_val_pos,
+            epoch, args.epochs, avg_train, avg_val, avg_val_metrics["pos_mse"],
+            avg_val_metrics["event_mse"], avg_val_metrics["active_mse"], avg_val_metrics["vel_mae"],
             avg_pred_mean, avg_pred_std,
             optimizer.param_groups[0]["lr"], epoch_time,
         )
 
         writer.add_scalar("val/loss", avg_val, epoch)
-        writer.add_scalar("val/pos_loss", avg_val_pos, epoch)
+        writer.add_scalar("val/pos_loss", avg_val_metrics["pos_mse"], epoch)
+        writer.add_scalar("val/event_mse", avg_val_metrics["event_mse"], epoch)
+        writer.add_scalar("val/active_mse", avg_val_metrics["active_mse"], epoch)
+        writer.add_scalar("val/vel_mae", avg_val_metrics["vel_mae"], epoch)
+        writer.add_scalar("val/acc_mae", avg_val_metrics["acc_mae"], epoch)
         writer.add_scalar("val/pred_mean", avg_pred_mean, epoch)
         writer.add_scalar("val/pred_std", avg_pred_std, epoch)
         writer.add_scalar("train/loss_epoch", avg_train, epoch)
-        writer.add_scalar("train/pos_loss_epoch", avg_train_pos, epoch)
+        writer.add_scalar("train/pos_loss_epoch", avg_train_metrics["pos_mse"], epoch)
+        writer.add_scalar("train/event_mse_epoch", avg_train_metrics["event_mse"], epoch)
+        writer.add_scalar("train/active_mse_epoch", avg_train_metrics["active_mse"], epoch)
 
         # Update augmentation scale based on val/train loss ratio
         augment_scale = _compute_augment_scale(avg_val, avg_train)
         train_ds.augment_scale = augment_scale
         writer.add_scalar("train/augment_scale", augment_scale, epoch)
         log.info("  Augment scale: %.3f (val/train ratio=%.3f)", augment_scale, avg_val / max(avg_train, 1e-9))
+
+        if args.scheduler == "ReduceLROnPlateau":
+            scheduler.step(avg_val)
 
         # --- Prediction overlay plots every 10 epochs (like old train.py) ---
         if epoch % 2 == 0 or epoch == 1:
@@ -969,6 +998,8 @@ def train() -> None:
                 "val_loss": avg_val,
                 "global_step": global_step,
                 "model_config": model_config,
+                "data_config": data_config,
+                "metric_config": metric_config,
             }, checkpoint_dir / "best_tcn.pt")
             log.info("  → New best val loss: %.6f", avg_val)
         else:
@@ -1004,9 +1035,9 @@ def train() -> None:
                 "model_state_dict": model.state_dict(),
                 "val_loss": avg_val,
                 "model_config": model_config,
-                "val_loss": avg_val,
                 "global_step": global_step,
-                "model_config": model_config,
+                "data_config": data_config,
+                "metric_config": metric_config,
             }, checkpoint_dir / f"tcn_epoch{epoch}.pt")
 
     writer.close()

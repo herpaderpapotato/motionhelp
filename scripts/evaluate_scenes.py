@@ -23,6 +23,8 @@ import numpy as np
 import torch
 
 from src.data.curation import discover_scenes, read_review, write_review
+from src.models.tcn import FunscriptTCN, extract_model_config
+from src.training.funscript_metrics import compute_regression_metrics
 
 logging.basicConfig(
     level=logging.INFO,
@@ -40,11 +42,9 @@ FLOW_FILE = "flow/raft_f64_s0.5.npy"
 
 def load_model(checkpoint_path: Path, device: torch.device):
     """Load TCN model from checkpoint. Returns (model, model_config)."""
-    from src.models.tcn import FunscriptTCN
-
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     cfg = ckpt["model_config"]
-    model = FunscriptTCN(**cfg)
+    model = FunscriptTCN(**extract_model_config(cfg))
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
     model.to(device)
@@ -52,7 +52,7 @@ def load_model(checkpoint_path: Path, device: torch.device):
     log.info("Loaded checkpoint: epoch %s, val_loss=%.6f [%s]",
              ckpt.get("epoch", "?"), ckpt.get("val_loss", 0),
              "multiclass" if is_mc else "single-class")
-    return model, cfg
+    return model, cfg, ckpt.get("metric_config", {})
 
 
 def load_stats(data_dir: Path, n_persons: int = 10, embed_dim: int = 512, flow_dim: int = 64):
@@ -135,6 +135,7 @@ def evaluate_scene(
     scene_dir: Path,
     model,
     model_cfg: dict,
+    metric_cfg: dict,
     device: torch.device,
     emb_mean: np.ndarray | None,
     emb_std: np.ndarray | None,
@@ -143,8 +144,8 @@ def evaluate_scene(
     is_multiclass: bool,
     seq_len: int = 120,
     stride: int = 60,
-) -> float | None:
-    """Run TCN prediction on a scene and return MSE vs labels. None on error."""
+) -> dict[str, float] | None:
+    """Run TCN prediction on a scene and return regression metrics. None on error."""
     scene_id = scene_dir.name
 
     # Select feature files
@@ -183,8 +184,24 @@ def evaluate_scene(
     predictions = sliding_window_predict(model, keypoints, embeddings, flow,
                                          device, seq_len, stride)
 
-    mse = float(np.mean((predictions - labels) ** 2))
-    return mse
+    pred_tensor = torch.from_numpy(predictions).float().unsqueeze(0)
+    label_tensor = torch.from_numpy(labels).float().unsqueeze(0)
+    metrics = compute_regression_metrics(
+        pred_tensor,
+        label_tensor,
+        spectral_kernel=int(metric_cfg.get("spectral_kernel", 15)),
+        activity_gain=float(metric_cfg.get("event_activity_gain", 3.0)),
+        activity_power=float(metric_cfg.get("event_activity_power", 1.0)),
+        active_quantile=float(metric_cfg.get("active_quantile", 0.8)),
+    )
+    return {
+        "mse": float(metrics["pos_mse"].item()),
+        "event_mse": float(metrics["event_mse"].item()),
+        "active_mse": float(metrics["active_mse"].item()),
+        "vel_mae": float(metrics["vel_mae"].item()),
+        "acc_mae": float(metrics["acc_mae"].item()),
+        "spec_mse": float(metrics["spec_mse"].item()),
+    }
 
 
 def main() -> None:
@@ -212,7 +229,7 @@ def main() -> None:
     log.info("Device: %s", device)
 
     # Load model
-    model, model_cfg = load_model(args.checkpoint, device)
+    model, model_cfg, metric_cfg = load_model(args.checkpoint, device)
     is_multiclass = model_cfg.get("n_partners") is not None
     n_total = (
         (model_cfg.get("n_partners", 5) + model_cfg.get("n_beholders", 1))
@@ -251,17 +268,26 @@ def main() -> None:
         for i, sid in enumerate(pending):
             scene_dir = processed_dir / sid
             try:
-                mse = evaluate_scene(
-                    scene_dir, model, model_cfg, device,
+                metrics = evaluate_scene(
+                    scene_dir, model, model_cfg, metric_cfg, device,
                     emb_mean, emb_std, flow_mean, flow_std,
                     is_multiclass, args.seq_len, args.stride,
                 )
-                if mse is not None:
-                    # Update review.json with MSE
+                if metrics is not None:
+                    # Update review.json with scene-level regression metrics.
                     review = read_review(scene_dir)
-                    review["mse"] = f"{mse:.4f}"
+                    for key, value in metrics.items():
+                        review[key] = f"{value:.6f}"
                     write_review(scene_dir, review)
-                    log.info("[%d/%d] %s  MSE=%.4f", i + 1, len(pending), sid, mse)
+                    log.info(
+                        "[%d/%d] %s  MSE=%.4f active=%.4f vel_mae=%.4f",
+                        i + 1,
+                        len(pending),
+                        sid,
+                        metrics["mse"],
+                        metrics["active_mse"],
+                        metrics["vel_mae"],
+                    )
                     ok += 1
                 else:
                     failed += 1
