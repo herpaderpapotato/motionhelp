@@ -101,6 +101,7 @@ def load_stats(data_dir: Path, n_persons: int = 10, embed_dim: int = 512, flow_d
     if "flow_mean" in stats and stats["flow_mean"].shape[0] == flow_dim:
         flow_mean = stats["flow_mean"]
         flow_std = stats["flow_std"]
+    print(f"Loaded feature stats from {stats_path}:")
     return emb_mean, emb_std, flow_mean, flow_std
 
 

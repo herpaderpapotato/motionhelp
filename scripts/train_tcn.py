@@ -63,6 +63,7 @@ class MotionDataset(Dataset):
         flow_dim: int = 64,
         augment: bool = False,
         multiclass: bool = False,
+        phase: int = -1,
     ):
         self.data_dir = Path(data_dir)
         self.seq_len = seq_len
@@ -72,8 +73,10 @@ class MotionDataset(Dataset):
         self.flow_dim = flow_dim
         self.augment = augment
         self.multiclass = multiclass
+        self.phase = phase
         self.using_stats = False
         self.stats_path = None
+        self.last_epoch = False
 
         if multiclass:
             self.KP_FILE = "keypoints/vrlens-finetunes-multiclass-v2-yolo11m-pose.npy"
@@ -239,10 +242,10 @@ class MotionDataset(Dataset):
         flow = torch.from_numpy(flow).float()               # [T, F]
         labels = torch.from_numpy(labels).float()            # [T]
 
-        # if self.augment:
-        #     keypoints, embeddings, flow, labels = self._augment(
-        #         keypoints, embeddings, flow, labels
-        #     )
+        if self.augment or self.phase > 1:
+            keypoints, embeddings, flow, labels = self._augment(
+                keypoints, embeddings, flow, labels
+            )
 
         return {
             "keypoints": keypoints,
@@ -259,49 +262,66 @@ class MotionDataset(Dataset):
         labels: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # All augmentations are independent (not elif) so multiple can apply
-        s = self.augment_scale  # [0, 1] — 0=min values, 1=max values
 
-        dropout_prob = 0.1 + s * (0.9 - 0.1)
-        if torch.rand(1).item() < dropout_prob:
-            choice = torch.randint(3, (1,)).item()
-            if choice == 0:
-                kp = torch.zeros_like(kp)
-            elif choice == 1:
+        if not self.last_epoch:
+            if self.phase == 2:
+                # null out all inputs except pose keypoints to focus on learning from pose
                 emb = torch.zeros_like(emb)
-            else:
                 flow = torch.zeros_like(flow)
-
-        emb_noise_prob = 0.2 + s * (0.9 - 0.2)    
-        emb_noise_mag  = 0.02 + s * (0.15 - 0.02)
-        if torch.rand(1).item() < emb_noise_prob:
-            emb = emb + torch.randn_like(emb) * emb_noise_mag
-
-        flow_noise_prob = 0.2 + s * (0.9 - 0.2) 
-        flow_noise_mag  = 0.02 + s * (0.2 - 0.02)
-        if torch.rand(1).item() < flow_noise_prob:
-            # flow = flow + torch.randn_like(flow) * flow_noise_mag # makes B x Seq x FlowDim noise which may be too random
-            # Alternate: use same noise for all flow frames in a sequence to generalize better to different flow magnitudes
-            noise = torch.randn(flow.shape[1], device=flow.device) * flow_noise_mag
-            flow = flow + noise
+            elif self.phase == 3:
+                # null out all inputs except embeddings to focus on learning from embeddings
+                kp = torch.zeros_like(kp)
+                flow = torch.zeros_like(flow)
+            elif self.phase == 4:
+                # null out all inputs except flow to focus on learning from flow
+                kp = torch.zeros_like(kp)
+                emb = torch.zeros_like(emb)
 
 
-        kp_noise_prob = 0.2 + s * (0.3 - 0.2)
-        kp_noise_mag = 0.01 + s * (0.04 - 0.01) # 5% max jitter
-        if torch.rand(1).item() < kp_noise_prob:
-            kp = kp + torch.randn_like(kp) * kp_noise_mag
-            kp = torch.clamp(kp, 0.0, 1.0)
-            # decay all kp confidences by half
-            kp[..., 2] = kp[..., 2] * 0.5
 
-        kp_intermittent_drop_prob = 0.2 + s * (0.7 - 0.2)
-        if torch.rand(1).item() < kp_intermittent_drop_prob:
-            # Randomly zero out all keypoints for random contiguous segments (simulate occlusion)
-            T = kp.shape[0]
-            n_segments = max(1, int(T * 0.01))  # number of segments scales with sequence length
-            for _ in range(n_segments):
-                seg_len = torch.randint(5, 20, (1,)).item()  # segment length between 5 and 20 frames
-                start = torch.randint(0, T - seg_len, (1,)).item()
-                kp[start:start + seg_len] = 0.0
+        # s = self.augment_scale  # [0, 1] — 0=min values, 1=max values
+
+        # dropout_prob = 0.1 + s * (0.9 - 0.1)
+        # if torch.rand(1).item() < dropout_prob:
+        #     choice = torch.randint(3, (1,)).item()
+        #     if choice == 0:
+        #         kp = torch.zeros_like(kp)
+        #     elif choice == 1:
+        #         emb = torch.zeros_like(emb)
+        #     else:
+        #         flow = torch.zeros_like(flow)
+
+        # emb_noise_prob = 0.2 + s * (0.9 - 0.2)    
+        # emb_noise_mag  = 0.02 + s * (0.15 - 0.02)
+        # if torch.rand(1).item() < emb_noise_prob:
+        #     emb = emb + torch.randn_like(emb) * emb_noise_mag
+
+        # flow_noise_prob = 0.2 + s * (0.9 - 0.2) 
+        # flow_noise_mag  = 0.02 + s * (0.2 - 0.02)
+        # if torch.rand(1).item() < flow_noise_prob:
+        #     # flow = flow + torch.randn_like(flow) * flow_noise_mag # makes B x Seq x FlowDim noise which may be too random
+        #     # Alternate: use same noise for all flow frames in a sequence to generalize better to different flow magnitudes
+        #     noise = torch.randn(flow.shape[1], device=flow.device) * flow_noise_mag
+        #     flow = flow + noise
+
+
+        # kp_noise_prob = 0.2 + s * (0.3 - 0.2)
+        # kp_noise_mag = 0.01 + s * (0.04 - 0.01) # 5% max jitter
+        # if torch.rand(1).item() < kp_noise_prob:
+        #     kp = kp + torch.randn_like(kp) * kp_noise_mag
+        #     kp = torch.clamp(kp, 0.0, 1.0)
+        #     # decay all kp confidences by half
+        #     kp[..., 2] = kp[..., 2] * 0.5
+
+        # kp_intermittent_drop_prob = 0.2 + s * (0.7 - 0.2)
+        # if torch.rand(1).item() < kp_intermittent_drop_prob:
+        #     # Randomly zero out all keypoints for random contiguous segments (simulate occlusion)
+        #     T = kp.shape[0]
+        #     n_segments = max(1, int(T * 0.01))  # number of segments scales with sequence length
+        #     for _ in range(n_segments):
+        #         seg_len = torch.randint(5, 20, (1,)).item()  # segment length between 5 and 20 frames
+        #         start = torch.randint(0, T - seg_len, (1,)).item()
+        #         kp[start:start + seg_len] = 0.0
 
 
 
@@ -593,11 +613,11 @@ def train() -> None:
 
     train_ds = MotionDataset(
         args.data_dir, "train", args.seq_len, args.stride,
-        n_persons=n_total, augment=True, multiclass=args.multiclass,
+        n_persons=n_total, augment=True, multiclass=args.multiclass, phase=args.phase
     )
     val_ds = MotionDataset(
         args.data_dir, "val", args.seq_len, args.stride,
-        n_persons=n_total, augment=False, multiclass=args.multiclass,
+        n_persons=n_total, augment=False, multiclass=args.multiclass
     )
 
     train_loader = DataLoader(
@@ -716,18 +736,85 @@ def train() -> None:
 
     best_val_loss = float("inf")
     if args.resume is not None:
-        if "optimizer_state_dict" in ckpt and "scheduler_state_dict" in ckpt:
-            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-            log.info("Loaded optimizer and scheduler state from checkpoint")
-        else:
-            log.warning("No optimizer/scheduler state found in checkpoint — starting with fresh optimizer/scheduler")
+        # if "optimizer_state_dict" in ckpt and "scheduler_state_dict" in ckpt:
+        #     optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        #     #scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        #     log.info("Loaded optimizer and scheduler state from checkpoint")
+        #     if args.lr is not None:
+        #         # If resuming but a new lr is specified, override the loaded scheduler state to use the new lr
+        #         for param_group in optimizer.param_groups:
+        #             param_group["lr"] = args.lr
+        #         log.info("Overriding loaded learning rate with new value: %s", args.lr)
+        # else:
+        #     log.warning("No optimizer/scheduler state found in checkpoint — starting with fresh optimizer/scheduler")
         if "val_loss" in ckpt and args.load_best_val_loss:
             best_val_loss = ckpt["val_loss"]
             log.info("Resuming with best_val_loss = %.6f", best_val_loss)
-    
+        else:
+            # run an initial validation loop to get the current val loss for early stopping
+            log.info("No val_loss found in checkpoint — running initial validation to get baseline val loss for early stopping")
+            # --- Validate ---
+            model.eval()
+            val_losses = []
+            val_pred_means = []
+            val_pred_stds = []
+            val_metric_history = {
+                "pos_mse": [],
+                "event_mse": [],
+                "active_mse": [],
+                "vel_mse": [],
+                "vel_mae": [],
+                "acc_mse": [],
+                "acc_mae": [],
+                "spec_mse": [],
+            }
+
+            with torch.no_grad():
+                for batch in val_loader:
+                    kp = batch["keypoints"].to(device, non_blocking=True)
+                    emb = batch["embeddings"].to(device, non_blocking=True)
+                    fl = batch["flow"].to(device, non_blocking=True)
+                    lbl = batch["labels"].to(device, non_blocking=True)
+
+                    with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
+                        pred = model(kp, emb, fl)
+                        metric_batch = compute_regression_metrics(
+                            pred,
+                            lbl,
+                            spectral_kernel=args.spectral_kernel,
+                            activity_gain=args.event_activity_gain,
+                            activity_power=args.event_activity_power,
+                            active_quantile=args.active_quantile,
+                        )
+                        pos_loss = ((1.0 - args.event_weight) * metric_batch["pos_mse"]
+                                    + args.event_weight * metric_batch["event_mse"])
+                        temp_loss = metric_batch["acc_mse"]
+                        vel_loss = metric_batch["vel_mse"]
+                        spec_loss = metric_batch["spec_mse"]
+
+                        loss = (pos_loss
+                                + args.temporal_weight * temp_loss
+                                + args.velocity_weight * vel_loss
+                                + args.spectral_weight * spec_loss)
+
+                    val_losses.append(loss.item())
+                    for key in val_metric_history:
+                        val_metric_history[key].append(metric_batch[key].item())
+                    val_pred_means.append(pred.mean().item())
+                    val_pred_stds.append(pred.std().item())
+
+            avg_val = np.mean(val_losses)
+            avg_val_metrics = {key: float(np.mean(values)) for key, values in val_metric_history.items()}
+            avg_pred_mean = np.mean(val_pred_means)
+            avg_pred_std = np.mean(val_pred_stds)
+            log.info("Initial validation loss: %.6f", avg_val)
+            log.info("Initial validation metrics: %s", ", ".join(f"{k}={v:.6f}" for k, v in avg_val_metrics.items()))
+            log.info("Initial validation prediction mean: %.6f, std: %.6f", avg_pred_mean, avg_pred_std)
+            best_val_loss = avg_val
 
 
+    for param_group in optimizer.param_groups:
+        param_group["lr"] = args.lr
     # ── Logging / Checkpoints ─────────────────────────────────────────────
     run_name = f"tcn_{int(time.time())}"
     run_dir = Path("runs") / run_name
@@ -881,6 +968,20 @@ def train() -> None:
             "acc_mae": [],
             "spec_mse": [],
         }
+        # check if it's the last epoch to set the flag for dataset to disable augmentations if needed
+        if epoch == args.epochs:
+            # reinit val loader with last_epoch=True to disable augmentations if dataset is designed that way
+            val_ds.last_epoch = True
+            del val_loader
+            val_loader = DataLoader(
+                val_ds,
+                batch_size=args.batch_size,
+                shuffle=False,
+                num_workers=args.num_workers,
+                pin_memory=(device.type == "cuda" or device.type == "cuda:0"),  # allow pinned memory for CUDA even if using a specific GPU
+                persistent_workers=args.num_workers > 0,
+            )
+            
 
         with torch.no_grad():
             for batch in val_loader:
