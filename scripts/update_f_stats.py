@@ -61,5 +61,5 @@ stats = {
     'flow_std': flow_std.astype(np.float32),
     'n_frames': int(n_frames),
 }
-np.savez('data/feature_stats.npz', **stats)
+np.savez('data/featurestats/feature_stats.npz', **stats)
 print('Saved data/feature_stats.npz')

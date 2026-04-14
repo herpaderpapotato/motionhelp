@@ -71,6 +71,8 @@ class MotionDataset(Dataset):
         self.flow_dim = flow_dim
         self.augment = augment
         self.multiclass = multiclass
+        self.using_stats = False
+        self.stats_path = None
 
         if multiclass:
             self.KP_FILE = "keypoints/vrlens-finetunes-multiclass-v2-yolo11m-pose.npy"
@@ -750,8 +752,8 @@ def train() -> None:
         "seq_len": args.seq_len,
     }
     
-    if MotionDataset.using_stats:
-        stats = np.load(MotionDataset.stats_path)
+    if train_ds.using_stats:
+        stats = np.load(train_ds.stats_path)
         if hasattr(stats, "emb_mean") and hasattr(stats, "emb_std"):
             model_config["emb_mean"] = stats["emb_mean"].tolist()
             model_config["emb_std"] = stats["emb_std"].tolist()
