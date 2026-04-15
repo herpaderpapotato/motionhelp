@@ -82,7 +82,13 @@ def load_model(checkpoint_path: Path, device: torch.device) -> tuple[FunscriptTC
     return model, cfg
 
 
-def load_stats(data_dir: Path, n_persons: int = 10, embed_dim: int = 512, flow_dim: int = 64):
+def load_stats(
+    data_dir: Path,
+    n_persons: int = 10,
+    embed_dim: int = 512,
+    flow_dim: int = 64,
+    flow_mode: str = "summary",
+):
     stats_path = data_dir / "feature_stats.npz"
     if not stats_path.exists():
         alt = data_dir / "featurestats" / "feature_stats.npz"
@@ -99,9 +105,14 @@ def load_stats(data_dir: Path, n_persons: int = 10, embed_dim: int = 512, flow_d
         emb_mean = stats["emb_mean"].reshape(n_persons, embed_dim)
         emb_std = stats["emb_std"].reshape(n_persons, embed_dim)
     flow_mean = flow_std = None
-    if "flow_mean" in stats and stats["flow_mean"].shape[0] == flow_dim:
-        flow_mean = stats["flow_mean"]
-        flow_std = stats["flow_std"]
+    if flow_mode == "dense":
+        if "flow_dense_mean" in stats and "flow_dense_std" in stats:
+            flow_mean = stats["flow_dense_mean"]
+            flow_std = stats["flow_dense_std"]
+    else:
+        if "flow_mean" in stats and stats["flow_mean"].shape[0] == flow_dim:
+            flow_mean = stats["flow_mean"]
+            flow_std = stats["flow_std"]
     print(f"Loaded feature stats from {stats_path}:")
     return emb_mean, emb_std, flow_mean, flow_std
 
@@ -486,7 +497,11 @@ def sliding_window_predict(
         pad = seq_len - n_frames
         kp = torch.nn.functional.pad(kp, (0, 0, 0, 0, 0, 0, 0, pad))
         emb = torch.nn.functional.pad(emb, (0, 0, 0, 0, 0, pad))
-        fl = torch.nn.functional.pad(fl, (0, 0, 0, pad))
+        # Dense flow is [B,T,2,H,W], summary flow is [B,T,F]
+        if fl.ndim == 5:
+            fl = torch.nn.functional.pad(fl, (0, 0, 0, 0, 0, 0, 0, pad))
+        else:
+            fl = torch.nn.functional.pad(fl, (0, 0, 0, pad))
         with torch.no_grad():
             with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
                 out = model(kp, emb, fl)
@@ -536,6 +551,8 @@ def live_playback_with_prediction(
     multiclass: bool = False,
     max_partners: int = 5,
     max_beholders: int = 1,
+    flow_mode: str = "summary",
+    flow_dense_size: int = 32,
 ) -> np.ndarray:
     """Live video playback with simultaneous feature extraction and TCN prediction.
 
@@ -678,19 +695,26 @@ def live_playback_with_prediction(
                 all_emb.append(emb)
                 del pose_frames
 
-                # RAFT optical flow
-                if prev_flow_frame is not None:
-                    fi = np.stack([prev_flow_frame] + flow_frames)
-                    fc = compute_flow_raft_batched(
-                        fi, output_features=64, device=str(device), batch_size=64,
+                    # RAFT optical flow
+                fi = np.stack([prev_flow_frame] + flow_frames) if prev_flow_frame is not None else np.stack(flow_frames)
+                if flow_mode == "dense":
+                    raw_dense = compute_flow_raft_dense_batched(
+                        fi, device=str(device), batch_size=64,
                     )
-                    all_flow.append(fc[1:])
+                    norm_dense = normalize_flow_components(raw_dense)
+                    ds_dense = downsample_dense_flow(norm_dense, flow_dense_size)
+                    if prev_flow_frame is not None:
+                        all_flow.append(ds_dense[1:])
+                    else:
+                        all_flow.append(ds_dense)
                 else:
-                    fi = np.stack(flow_frames)
                     fc = compute_flow_raft_batched(
                         fi, output_features=64, device=str(device), batch_size=64,
                     )
-                    all_flow.append(fc)
+                    if prev_flow_frame is not None:
+                        all_flow.append(fc[1:])
+                    else:
+                        all_flow.append(fc)
                 prev_flow_frame = flow_frames[-1]
                 del flow_frames
 
@@ -811,9 +835,9 @@ def live_playback_with_prediction(
     _tick     = [0]                  # display update counter
 
     # Buffer thresholds
-    BUF_START_THRESHOLD = MAX_FRAME_BUF - 200       # must fill completely before initial play
+    BUF_START_THRESHOLD = 640       # must fill completely before initial play
     BUF_RESUME_THRESHOLD = MAX_FRAME_BUF//2
-    BUF_LOW_THRESHOLD    = 120                 # pause playback when buffer drops below this
+    BUF_LOW_THRESHOLD    = 30                 # pause playback when buffer drops below this
 
     frame_delay_ms = max(16, int(round(1000.0 / target_fps)))
 
@@ -1346,15 +1370,18 @@ def main() -> None:
     labels = None
     source_name = ""
 
+    # Load model early so flow_mode is available in playback mode
+    model, model_cfg = load_model(args.checkpoint, device)
+    is_multiclass = model_cfg.get("n_partners") is not None
+    n_total = (model_cfg.get("n_partners", 5) + model_cfg.get("n_beholders", 1)) if is_multiclass else model_cfg.get("n_persons", 10)
+    flow_mode = model_cfg.get("flow_mode", "summary")
+    flow_dense_size = model_cfg.get("flow_dense_size", 32)
+
     # ── Live playback path (--playback --video) ───────────────────────────
     if args.playback and args.video is not None:
         if not args.video.exists():
             print(f"Error: video file not found: {args.video}")
             sys.exit(1)
-
-        model, model_cfg = load_model(args.checkpoint, device)
-        is_multiclass = model_cfg.get("n_partners") is not None
-        n_total = (model_cfg.get("n_partners", 5) + model_cfg.get("n_beholders", 1)) if is_multiclass else model_cfg.get("n_persons", 10)
 
         # Auto-select pose model for multiclass
         pose_model_path = args.pose_model
@@ -1362,7 +1389,9 @@ def main() -> None:
             pose_model_path = Path("data/models/pose/vrlens-finetunes-multiclass-v2-yolo11m-pose.pt")
             print(f"  Auto-selected multiclass pose model: {pose_model_path}")
 
-        emb_mean, emb_std, flow_mean, flow_std = load_stats(args.data_dir, n_persons=n_total)
+        emb_mean, emb_std, flow_mean, flow_std = load_stats(
+            args.data_dir, n_persons=n_total, flow_mode=flow_mode,
+        )
         source_name = args.video.stem
 
         print(f"Starting live playback + prediction for {args.video}...")
@@ -1377,6 +1406,8 @@ def main() -> None:
             multiclass=is_multiclass,
             max_partners=model_cfg.get("n_partners", 5),
             max_beholders=model_cfg.get("n_beholders", 1),
+            flow_mode=flow_mode,
+            flow_dense_size=flow_dense_size,
         )
 
         if len(predictions) == 0:
@@ -1401,13 +1432,6 @@ def main() -> None:
         return
 
     # ── Batch path (no --playback) ───────────────────────────────────────
-    # Load model first to determine multiclass mode
-    model, model_cfg = load_model(args.checkpoint, device)
-    is_multiclass = model_cfg.get("n_partners") is not None
-    n_total = (model_cfg.get("n_partners", 5) + model_cfg.get("n_beholders", 1)) if is_multiclass else model_cfg.get("n_persons", 10)
-    flow_mode = model_cfg.get("flow_mode", "summary")
-    flow_dense_size = model_cfg.get("flow_dense_size", 32)
-
     if args.scene:
         # Load pre-extracted features from scene directory
         scene_dir = args.data_dir / "processed" / args.scene
@@ -1479,21 +1503,17 @@ def main() -> None:
     print(f"  frames:     {n_frames} ({n_frames / args.fps:.1f}s @ {args.fps}fps)")
 
     # Normalize features
-    emb_mean, emb_std, flow_mean, flow_std = load_stats(args.data_dir, n_persons=n_total)
+    emb_mean, emb_std, flow_mean, flow_std = load_stats(
+        args.data_dir, n_persons=n_total, flow_mode=flow_mode,
+    )
     if emb_mean is not None:
         embeddings = (embeddings - emb_mean) / (emb_std + 1e-8)
         print("  Embeddings normalized (z-score)")
-    if flow_mode == "dense":
-        # Load dense flow stats
-        stats_path = args.data_dir / "featurestats" / "feature_stats.npz"
-        if stats_path.exists():
-            stats = np.load(stats_path)
-            if "flow_dense_mean" in stats:
-                flow = (flow - stats["flow_dense_mean"]) / (stats["flow_dense_std"] + 1e-8)
-                print("  Dense flow normalized (z-score)")
-    else:
-        if flow_mean is not None:
-            flow = (flow - flow_mean) / (flow_std + 1e-8)
+    if flow_mean is not None:
+        flow = (flow - flow_mean) / (flow_std + 1e-8)
+        if flow_mode == "dense":
+            print("  Dense flow normalized (z-score)")
+        else:
             print("  Flow normalized (z-score)")
 
     # Model already loaded above

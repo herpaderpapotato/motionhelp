@@ -440,6 +440,10 @@ def _apply_phase_freezing(model: FunscriptTCN, phase: int, fill_with_noise: bool
         print("Unfreezing flow encoder only")
         for p in model.flow_encoder.parameters():
             p.requires_grad = True
+
+
+
+
     elif phase == 5:
         # Unfreeze flow encoder, fusion + output head + TCN backbone
         print("Unfreezing flow encoder, fusion + output head + TCN backbone")
@@ -916,6 +920,8 @@ def train() -> None:
     # ── Training loop ─────────────────────────────────────────────────────
     global_step = 0
     _early_stop_counter = 0
+    original_best_val_loss = best_val_loss
+    improved = False
 
     for epoch in range(1, args.epochs + 1):
         epoch_start = time.time()
@@ -1182,6 +1188,11 @@ def train() -> None:
                 "data_config": data_config,
                 "metric_config": metric_config,
             }, checkpoint_dir / f"tcn_epoch{epoch}.pt")
+
+        if best_val_loss < original_best_val_loss:
+            improved = True
+        # if epoch == 5 and not improved:
+        #     break
 
     writer.close()
     log.info("Training complete. Best val loss: %.6f", best_val_loss)

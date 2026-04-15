@@ -100,8 +100,6 @@ def sliding_window_predict(
     pred_sum = np.zeros(n_frames, dtype=np.float32)
     pred_count = np.zeros(n_frames, dtype=np.float32)
 
-    is_dense = flow.ndim == 4  # [T, 2, H, W]
-
     if n_frames < seq_len:
         kp = torch.from_numpy(keypoints).float().unsqueeze(0).to(device)
         emb = torch.from_numpy(embeddings).float().unsqueeze(0).to(device)
@@ -109,7 +107,8 @@ def sliding_window_predict(
         pad = seq_len - n_frames
         kp = torch.nn.functional.pad(kp, (0, 0, 0, 0, 0, 0, 0, pad))
         emb = torch.nn.functional.pad(emb, (0, 0, 0, 0, 0, pad))
-        if is_dense:
+        # Dense flow is [B,T,2,H,W], summary flow is [B,T,F]
+        if fl.ndim == 5:
             fl = torch.nn.functional.pad(fl, (0, 0, 0, 0, 0, 0, 0, pad))
         else:
             fl = torch.nn.functional.pad(fl, (0, 0, 0, pad))
