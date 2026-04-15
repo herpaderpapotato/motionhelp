@@ -37,7 +37,7 @@ from src.models.tcn import FunscriptTCN, extract_model_config
 from src.data.pose import load_pose_model
 from src.data.extraction import SinglePassExtractor, extract_single_pass_batched
 from src.data.decode import stream_video_gpu
-from src.data.flow import compute_flow_raft_batched
+from src.data.flow import compute_flow_raft_batched, compute_flow_raft_dense_batched, normalize_flow_components, downsample_dense_flow, summarize_dense_flow
 
 import os
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
@@ -47,6 +47,7 @@ EMB_FILE = "embeddings/pose-vrlens-finetunes-large.npy"
 KP_FILE_MULTICLASS = "keypoints/vrlens-finetunes-multiclass-v2-yolo11m-pose.npy"
 EMB_FILE_MULTICLASS = "embeddings/vrlens-finetunes-multiclass-v2-yolo11m-pose.npy"
 FLOW_FILE = "flow/raft_f64_s0.5.npy"
+DENSE_FLOW_FILE = "flow/raft_dense_32x32_s0.5.npy"
 
 
 def _extract_pose_batched(
@@ -272,6 +273,8 @@ def extract_features_from_video(
     multiclass: bool = False,
     max_partners: int = 5,
     max_beholders: int = 1,
+    flow_mode: str = "summary",
+    flow_dense_size: int = 32,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Extract keypoints, embeddings, and flow features from a raw video.
 
@@ -375,18 +378,30 @@ def extract_features_from_video(
 
         # ── RAFT flow (with cross-chunk continuity) ──────────────────────
         t0 = time.perf_counter()
+        use_dense = flow_mode == "dense"
         if prev_flow_frame is not None:
             flow_input = np.stack([prev_flow_frame] + flow_frames)
-            flow_chunk = compute_flow_raft_batched(
-                flow_input, output_features=64, device=str(device), batch_size=64,
-            )
-            all_flow.append(flow_chunk[1:])
         else:
             flow_input = np.stack(flow_frames)
+
+        if use_dense:
+            raw_dense = compute_flow_raft_dense_batched(
+                flow_input, device=str(device), batch_size=64,
+            )
+            norm_dense = normalize_flow_components(raw_dense)
+            ds_dense = downsample_dense_flow(norm_dense, flow_dense_size)
+            if prev_flow_frame is not None:
+                all_flow.append(ds_dense[1:])
+            else:
+                all_flow.append(ds_dense)
+        else:
             flow_chunk = compute_flow_raft_batched(
                 flow_input, output_features=64, device=str(device), batch_size=64,
             )
-            all_flow.append(flow_chunk)
+            if prev_flow_frame is not None:
+                all_flow.append(flow_chunk[1:])
+            else:
+                all_flow.append(flow_chunk)
         prev_flow_frame = flow_frames[-1]
         del flow_frames
         timings["raft_flow"] += time.perf_counter() - t0
@@ -796,7 +811,7 @@ def live_playback_with_prediction(
     _tick     = [0]                  # display update counter
 
     # Buffer thresholds
-    BUF_START_THRESHOLD = MAX_FRAME_BUF//2       # must fill completely before initial play
+    BUF_START_THRESHOLD = MAX_FRAME_BUF - 200       # must fill completely before initial play
     BUF_RESUME_THRESHOLD = MAX_FRAME_BUF//2
     BUF_LOW_THRESHOLD    = 120                 # pause playback when buffer drops below this
 
@@ -1390,6 +1405,8 @@ def main() -> None:
     model, model_cfg = load_model(args.checkpoint, device)
     is_multiclass = model_cfg.get("n_partners") is not None
     n_total = (model_cfg.get("n_partners", 5) + model_cfg.get("n_beholders", 1)) if is_multiclass else model_cfg.get("n_persons", 10)
+    flow_mode = model_cfg.get("flow_mode", "summary")
+    flow_dense_size = model_cfg.get("flow_dense_size", 32)
 
     if args.scene:
         # Load pre-extracted features from scene directory
@@ -1400,9 +1417,10 @@ def main() -> None:
 
         kp_file = KP_FILE_MULTICLASS if is_multiclass else KP_FILE
         emb_file = EMB_FILE_MULTICLASS if is_multiclass else EMB_FILE
+        flow_file = DENSE_FLOW_FILE if flow_mode == "dense" else FLOW_FILE
 
         missing = []
-        for fname in [kp_file, emb_file, FLOW_FILE]:
+        for fname in [kp_file, emb_file, flow_file]:
             if not (scene_dir / fname).exists():
                 missing.append(fname)
         if missing:
@@ -1414,7 +1432,9 @@ def main() -> None:
         print(f"Loading features from {scene_dir}...")
         keypoints  = np.load(str(scene_dir / kp_file))
         embeddings = np.load(str(scene_dir / emb_file))
-        flow       = np.load(str(scene_dir / FLOW_FILE))
+        flow       = np.load(str(scene_dir / flow_file))
+        if flow_mode == "dense":
+            flow = flow.astype(np.float32)
 
         labels_path = scene_dir / "labels.npy"
         if labels_path.exists():
@@ -1446,6 +1466,8 @@ def main() -> None:
             multiclass=is_multiclass,
             max_partners=model_cfg.get("n_partners", 5),
             max_beholders=model_cfg.get("n_beholders", 1),
+            flow_mode=flow_mode,
+            flow_dense_size=flow_dense_size,
         )
 
         source_name = args.video.stem
@@ -1461,9 +1483,18 @@ def main() -> None:
     if emb_mean is not None:
         embeddings = (embeddings - emb_mean) / (emb_std + 1e-8)
         print("  Embeddings normalized (z-score)")
-    if flow_mean is not None:
-        flow = (flow - flow_mean) / (flow_std + 1e-8)
-        print("  Flow normalized (z-score)")
+    if flow_mode == "dense":
+        # Load dense flow stats
+        stats_path = args.data_dir / "featurestats" / "feature_stats.npz"
+        if stats_path.exists():
+            stats = np.load(stats_path)
+            if "flow_dense_mean" in stats:
+                flow = (flow - stats["flow_dense_mean"]) / (stats["flow_dense_std"] + 1e-8)
+                print("  Dense flow normalized (z-score)")
+    else:
+        if flow_mean is not None:
+            flow = (flow - flow_mean) / (flow_std + 1e-8)
+            print("  Flow normalized (z-score)")
 
     # Model already loaded above
 

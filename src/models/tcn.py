@@ -55,6 +55,8 @@ MODEL_CONFIG_KEYS = {
     "n_keypoints",
     "embed_dim",
     "flow_dim",
+    "flow_mode",
+    "flow_dense_size",
     "n_partners",
     "n_beholders",
     "n_beholder_keypoints",
@@ -407,6 +409,47 @@ class GatedFusion(nn.Module):
         return self.proj(torch.cat(gated, dim=-1))       # [B, T, d_model]
 
 
+class FlowSpatialEncoder(nn.Module):
+    """Per-frame spatial encoder for dense optical flow maps.
+
+    Takes [B, T, 2, H, W] dense flow and produces [B, T, out_dim] tokens
+    using a small 2D CNN that preserves spatial structure.
+    """
+
+    def __init__(self, out_dim: int = 64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(2, 16, kernel_size=3, stride=2, padding=1),
+            nn.GroupNorm(4, 16),
+            nn.GELU(),
+            nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1),
+            nn.GroupNorm(8, 32),
+            nn.GELU(),
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+            nn.GroupNorm(8, 64),
+            nn.GELU(),
+            nn.AdaptiveAvgPool2d(1),
+        )
+        self.proj = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(64, out_dim),
+            nn.LayerNorm(out_dim),
+            nn.GELU(),
+        )
+
+    def forward(self, flow: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            flow: [B, T, 2, H, W] dense flow maps.
+        Returns: [B, T, out_dim]
+        """
+        b, t, c, h, w = flow.shape
+        x = flow.reshape(b * t, c, h, w)          # [B*T, 2, H, W]
+        x = self.net(x)                            # [B*T, 64, 1, 1]
+        x = self.proj(x)                           # [B*T, out_dim]
+        return x.view(b, t, -1)                    # [B, T, out_dim]
+
+
 class DualDilatedBlock(nn.Module):
     """Dual Dilated Layer inspired by MS-TCN++.
 
@@ -466,6 +509,8 @@ class FunscriptTCN(nn.Module):
         n_keypoints: int = 21,
         embed_dim: int = 512,
         flow_dim: int = 64,
+        flow_mode: str = "summary",
+        flow_dense_size: int = 32,
         # Multiclass extensions
         n_partners: int | None = None,
         n_beholders: int = 1,
@@ -485,6 +530,8 @@ class FunscriptTCN(nn.Module):
         self.n_keypoints = n_keypoints
         self.embed_dim = embed_dim
         self.flow_dim = flow_dim
+        self.flow_mode = flow_mode
+        self.flow_dense_size = flow_dense_size
         self.multiclass = n_partners is not None
         self.use_kinematics = use_kinematics
         self.use_ddl = use_ddl
@@ -526,11 +573,15 @@ class FunscriptTCN(nn.Module):
         )
         self.emb_attn = PersonAttention(128)
 
-        self.flow_encoder = nn.Sequential(
-            nn.Linear(flow_dim, 64),
-            nn.LayerNorm(64),
-            nn.GELU(),
-        )
+        flow_out_dim = 64
+        if self.flow_mode == "dense":
+            self.flow_encoder = FlowSpatialEncoder(out_dim=flow_out_dim)
+        else:
+            self.flow_encoder = nn.Sequential(
+                nn.Linear(flow_dim, flow_out_dim),
+                nn.LayerNorm(flow_out_dim),
+                nn.GELU(),
+            )
 
         # -- Kinematic derivative encoder (velocity + acceleration) --
         if self.use_kinematics:
@@ -615,7 +666,7 @@ class FunscriptTCN(nn.Module):
             keypoints:  [B, T, N, K, 3]  — N = n_partners + n_beholders (multiclass)
                                             or n_persons (single-class)
             embeddings: [B, T, N, E]
-            flow:       [B, T, F]
+            flow:       [B, T, F] (summary mode) or [B, T, 2, H, W] (dense mode)
         Returns: [B, T] positions in [0, 1]
         """
         B, T = keypoints.shape[:2]

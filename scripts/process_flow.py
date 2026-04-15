@@ -21,8 +21,8 @@ import numpy as np
 
 from src.config import Config
 from src.data.curation import (
-    discover_scenes, flow_path,
-    resolve_keypoints_path, resolve_flow_path,
+    discover_scenes, flow_path, dense_flow_path,
+    resolve_keypoints_path, resolve_flow_path, resolve_dense_flow_path,
 )
 from src.data.flow import compute_flow_for_video
 from src.data.video import VideoReader
@@ -52,26 +52,58 @@ def process_scene(
                          cfg.flow.output_features, cfg.flow.scale)
     existing = resolve_flow_path(scene_dir, cfg.flow.method,
                                  cfg.flow.output_features, cfg.flow.scale)
-    if existing is not None and not overwrite:
-        log.info("SKIP %s — flow already exists at %s", scene_id, existing)
+
+    # Check dense flow existence
+    need_dense = cfg.flow.save_dense and cfg.flow.method == "raft"
+    dense_out = None
+    if need_dense:
+        dense_out = dense_flow_path(scene_dir, cfg.flow.method,
+                                    cfg.flow.dense_size, cfg.flow.scale)
+        existing_dense = resolve_dense_flow_path(scene_dir, cfg.flow.method,
+                                                 cfg.flow.dense_size, cfg.flow.scale)
+    else:
+        existing_dense = None
+
+    summary_done = existing is not None and not overwrite
+    dense_done = (not need_dense) or (existing_dense is not None and not overwrite)
+
+    if summary_done and dense_done:
+        log.info("SKIP %s — flow already exists", scene_id)
         return True
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     flow_size = max(64, int(cfg.flow.scale * cfg.video.frame_size))
 
-    log.info("Extracting flow: %s  method=%s  device=%s  size=%d",
-             scene_id, cfg.flow.method, device, flow_size)
+    log.info("Extracting flow: %s  method=%s  device=%s  size=%d  dense=%s",
+             scene_id, cfg.flow.method, device, flow_size, need_dense)
+
     with VideoReader(video_path, vr_mode=False, target_size=flow_size) as reader:
-        flow_data = compute_flow_for_video(
+        result = compute_flow_for_video(
             reader,
             output_features=cfg.flow.output_features,
             batch_size=60,
             method=cfg.flow.method,
             device=device,
+            dense=need_dense,
+            dense_size=cfg.flow.dense_size if need_dense else 32,
         )
 
-    np.save(out_path, flow_data)
-    log.info("Saved flow: %s  shape=%s", out_path, flow_data.shape)
+    if need_dense:
+        summary_data, dense_data = result
+    else:
+        summary_data = result
+
+    if not summary_done:
+        np.save(out_path, summary_data)
+        log.info("Saved summary flow: %s  shape=%s", out_path, summary_data.shape)
+
+    if need_dense and not dense_done:
+        # Save as float16 to reduce disk usage
+        dense_save = dense_data.astype(np.float16)
+        np.save(dense_out, dense_save)
+        log.info("Saved dense flow: %s  shape=%s  dtype=%s",
+                 dense_out, dense_save.shape, dense_save.dtype)
+
     return True
 
 
@@ -118,8 +150,12 @@ def main() -> None:
             if resolve_keypoints_path(sd, cfg.pose.model_name) is None:
                 continue
             if not args.overwrite:
-                if resolve_flow_path(sd, cfg.flow.method,
-                                     cfg.flow.output_features, cfg.flow.scale) is not None:
+                summary_exists = resolve_flow_path(sd, cfg.flow.method,
+                                                   cfg.flow.output_features, cfg.flow.scale) is not None
+                need_dense = cfg.flow.save_dense and cfg.flow.method == "raft"
+                dense_exists = (not need_dense) or (resolve_dense_flow_path(
+                    sd, cfg.flow.method, cfg.flow.dense_size, cfg.flow.scale) is not None)
+                if summary_exists and dense_exists:
                     continue
             pending.append(sid)
 

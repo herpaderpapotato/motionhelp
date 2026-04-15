@@ -1,0 +1,9 @@
+flow:
+  method: raft
+  output_features: 64
+  scale: 0.5
+  save_summary: true
+  save_dense: true
+  dense_size: 32
+  dense_dtype: float16
+  normalize_dense: true

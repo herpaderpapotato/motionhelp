@@ -38,6 +38,7 @@ EMB_FILE = "embeddings/pose-vrlens-finetunes-large.npy"
 KP_FILE_MULTICLASS = "keypoints/vrlens-finetunes-multiclass-v2-yolo11m-pose.npy"
 EMB_FILE_MULTICLASS = "embeddings/vrlens-finetunes-multiclass-v2-yolo11m-pose.npy"
 FLOW_FILE = "flow/raft_f64_s0.5.npy"
+DENSE_FLOW_FILE = "flow/raft_dense_32x32_s0.5.npy"
 
 
 def load_model(checkpoint_path: Path, device: torch.device):
@@ -55,7 +56,7 @@ def load_model(checkpoint_path: Path, device: torch.device):
     return model, cfg, ckpt.get("metric_config", {})
 
 
-def load_stats(data_dir: Path, n_persons: int = 10, embed_dim: int = 512, flow_dim: int = 64):
+def load_stats(data_dir: Path, n_persons: int = 10, embed_dim: int = 512, flow_dim: int = 64, flow_mode: str = "summary"):
     """Load feature normalization stats."""
     stats_path = data_dir / "feature_stats.npz"
     if not stats_path.exists():
@@ -74,9 +75,14 @@ def load_stats(data_dir: Path, n_persons: int = 10, embed_dim: int = 512, flow_d
         emb_mean = stats["emb_mean"].reshape(n_persons, embed_dim)
         emb_std = stats["emb_std"].reshape(n_persons, embed_dim)
     flow_mean = flow_std = None
-    if "flow_mean" in stats and stats["flow_mean"].shape[0] == flow_dim:
-        flow_mean = stats["flow_mean"]
-        flow_std = stats["flow_std"]
+    if flow_mode == "dense":
+        if "flow_dense_mean" in stats:
+            flow_mean = stats["flow_dense_mean"]  # [2, 1, 1]
+            flow_std = stats["flow_dense_std"]
+    else:
+        if "flow_mean" in stats and stats["flow_mean"].shape[0] == flow_dim:
+            flow_mean = stats["flow_mean"]
+            flow_std = stats["flow_std"]
     return emb_mean, emb_std, flow_mean, flow_std
 
 
@@ -94,6 +100,8 @@ def sliding_window_predict(
     pred_sum = np.zeros(n_frames, dtype=np.float32)
     pred_count = np.zeros(n_frames, dtype=np.float32)
 
+    is_dense = flow.ndim == 4  # [T, 2, H, W]
+
     if n_frames < seq_len:
         kp = torch.from_numpy(keypoints).float().unsqueeze(0).to(device)
         emb = torch.from_numpy(embeddings).float().unsqueeze(0).to(device)
@@ -101,7 +109,10 @@ def sliding_window_predict(
         pad = seq_len - n_frames
         kp = torch.nn.functional.pad(kp, (0, 0, 0, 0, 0, 0, 0, pad))
         emb = torch.nn.functional.pad(emb, (0, 0, 0, 0, 0, pad))
-        fl = torch.nn.functional.pad(fl, (0, 0, 0, pad))
+        if is_dense:
+            fl = torch.nn.functional.pad(fl, (0, 0, 0, 0, 0, 0, 0, pad))
+        else:
+            fl = torch.nn.functional.pad(fl, (0, 0, 0, pad))
         with torch.no_grad():
             with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
                 out = model(kp, emb, fl)
@@ -142,6 +153,7 @@ def evaluate_scene(
     flow_mean: np.ndarray | None,
     flow_std: np.ndarray | None,
     is_multiclass: bool,
+    flow_mode: str = "summary",
     seq_len: int = 120,
     stride: int = 60,
 ) -> dict[str, float] | None:
@@ -151,10 +163,11 @@ def evaluate_scene(
     # Select feature files
     kp_file = KP_FILE_MULTICLASS if is_multiclass else KP_FILE
     emb_file = EMB_FILE_MULTICLASS if is_multiclass else EMB_FILE
+    flow_file = DENSE_FLOW_FILE if flow_mode == "dense" else FLOW_FILE
 
     kp_path = scene_dir / kp_file
     emb_path = scene_dir / emb_file
-    flow_path = scene_dir / FLOW_FILE
+    flow_path = scene_dir / flow_file
     labels_path = scene_dir / "labels.npy"
 
     for p, name in [(kp_path, "keypoints"), (emb_path, "embeddings"),
@@ -165,7 +178,7 @@ def evaluate_scene(
 
     keypoints = np.load(str(kp_path))
     embeddings = np.load(str(emb_path))
-    flow = np.load(str(flow_path))
+    flow = np.load(str(flow_path)).astype(np.float32)
     labels = np.load(str(labels_path))
 
     # Align lengths
@@ -235,8 +248,10 @@ def main() -> None:
         (model_cfg.get("n_partners", 5) + model_cfg.get("n_beholders", 1))
         if is_multiclass else model_cfg.get("n_persons", 10)
     )
+    flow_mode = model_cfg.get("flow_mode", "summary")
+    log.info("Flow mode: %s", flow_mode)
 
-    emb_mean, emb_std, flow_mean, flow_std = load_stats(args.data_dir, n_persons=n_total)
+    emb_mean, emb_std, flow_mean, flow_std = load_stats(args.data_dir, n_persons=n_total, flow_mode=flow_mode)
 
     processed_dir = args.data_dir / "processed"
 
@@ -252,7 +267,8 @@ def main() -> None:
             # Check if scene has the required feature files
             kp_file = KP_FILE_MULTICLASS if is_multiclass else KP_FILE
             emb_file = EMB_FILE_MULTICLASS if is_multiclass else EMB_FILE
-            if not all((scene_dir / f).exists() for f in [kp_file, emb_file, FLOW_FILE]):
+            flow_file = DENSE_FLOW_FILE if flow_mode == "dense" else FLOW_FILE
+            if not all((scene_dir / f).exists() for f in [kp_file, emb_file, flow_file]):
                 continue
 
             # Check if already evaluated
@@ -271,7 +287,7 @@ def main() -> None:
                 metrics = evaluate_scene(
                     scene_dir, model, model_cfg, metric_cfg, device,
                     emb_mean, emb_std, flow_mean, flow_std,
-                    is_multiclass, args.seq_len, args.stride,
+                    is_multiclass, flow_mode, args.seq_len, args.stride,
                 )
                 if metrics is not None:
                     # Update review.json with scene-level regression metrics.

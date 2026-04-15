@@ -50,6 +50,7 @@ class MotionDataset(Dataset):
     """
 
     FLOW_FILE = "flow/raft_f64_s0.5.npy"
+    DENSE_FLOW_FILE = "flow/raft_dense_32x32_s0.5.npy"
 
     def __init__(
         self,
@@ -64,6 +65,8 @@ class MotionDataset(Dataset):
         augment: bool = False,
         multiclass: bool = False,
         phase: int = -1,
+        flow_mode: str = "summary",
+        flow_dense_size: int = 32,
     ):
         self.data_dir = Path(data_dir)
         self.seq_len = seq_len
@@ -74,6 +77,8 @@ class MotionDataset(Dataset):
         self.augment = augment
         self.multiclass = multiclass
         self.phase = phase
+        self.flow_mode = flow_mode
+        self.flow_dense_size = flow_dense_size
         self.using_stats = False
         self.stats_path = None
         self.last_epoch = False
@@ -115,7 +120,12 @@ class MotionDataset(Dataset):
             flow_path = vid_dir / self.FLOW_FILE
             label_path = vid_dir / "labels.npy"
 
-            if not all(p.exists() for p in [kp_path, emb_path, emb_meta_path, flow_path, label_path]):
+            if self.flow_mode == "dense":
+                dense_flow_p = vid_dir / self.DENSE_FLOW_FILE
+                required = [kp_path, emb_path, emb_meta_path, dense_flow_p, label_path]
+            else:
+                required = [kp_path, emb_path, emb_meta_path, flow_path, label_path]
+            if not all(p.exists() for p in required):
                 skipped += 1
                 continue
             
@@ -218,6 +228,20 @@ class MotionDataset(Dataset):
             self.using_stats = False
             log.warning("Flow stats not found or shape mismatch — not normalizing flow")
 
+        # Dense flow stats
+        self.flow_dense_mean = None
+        self.flow_dense_std = None
+        if self.flow_mode == "dense":
+            flow_dense_mean = stats.get("flow_dense_mean")
+            flow_dense_std = stats.get("flow_dense_std")
+            if flow_dense_mean is not None:
+                self.flow_dense_mean = flow_dense_mean  # [2, 1, 1]
+                self.flow_dense_std = flow_dense_std
+                log.info("Loaded dense flow normalization stats: shape=%s from %s",
+                         flow_dense_mean.shape, stats_path)
+            else:
+                log.warning("Dense flow stats not found — dense flow will NOT be normalized")
+
     def __len__(self) -> int:
         return len(self.sequences)
 
@@ -229,13 +253,20 @@ class MotionDataset(Dataset):
         labels = np.load(str(vid_dir / "labels.npy"), mmap_mode="r")[start:end].copy()
         keypoints = np.load(str(vid_dir / self.KP_FILE), mmap_mode="r")[start:end].copy()
         embeddings = np.load(str(vid_dir / self.EMB_FILE), mmap_mode="r")[start:end].copy()
-        flow = np.load(str(vid_dir / self.FLOW_FILE), mmap_mode="r")[start:end].copy()
 
-        # Normalize
+        # Normalize embeddings
         if self.emb_mean is not None:
             embeddings = (embeddings - self.emb_mean) / (self.emb_std + 1e-8)
-        if self.flow_mean is not None:
-            flow = (flow - self.flow_mean) / (self.flow_std + 1e-8)
+
+        if self.flow_mode == "dense":
+            flow = np.load(str(vid_dir / self.DENSE_FLOW_FILE), mmap_mode="r")[start:end].copy().astype(np.float32)
+            # Normalize dense flow: [T, 2, H, W] with stats [2, 1, 1]
+            if self.flow_dense_mean is not None:
+                flow = (flow - self.flow_dense_mean) / (self.flow_dense_std + 1e-8)
+        else:
+            flow = np.load(str(vid_dir / self.FLOW_FILE), mmap_mode="r")[start:end].copy()
+            if self.flow_mean is not None:
+                flow = (flow - self.flow_mean) / (self.flow_std + 1e-8)
 
         keypoints = torch.from_numpy(keypoints).float()    # [T, N, K, 3]
         embeddings = torch.from_numpy(embeddings).float()   # [T, N, E]
@@ -583,6 +614,11 @@ def train() -> None:
                         help="Stop training if val loss has not improved for this many epochs (0 = disabled)")
     parser.add_argument("--load-best-val-loss", action="store_true", default=False,
                         help="When resuming, load the best_val_loss from the checkpoint to continue early stopping correctly")
+    parser.add_argument("--flow-mode", type=str, default="summary",
+                        choices=["summary", "dense"],
+                        help="Flow representation: 'summary' (flat 64-d) or 'dense' (2×32×32 spatial)")
+    parser.add_argument("--flow-dense-size", type=int, default=32,
+                        help="Spatial resolution for dense flow maps (default: 32)")
     args = parser.parse_args()
 
     if not 0.0 <= args.event_weight <= 1.0:
@@ -613,11 +649,13 @@ def train() -> None:
 
     train_ds = MotionDataset(
         args.data_dir, "train", args.seq_len, args.stride,
-        n_persons=n_total, augment=True, multiclass=args.multiclass, phase=args.phase
+        n_persons=n_total, augment=True, multiclass=args.multiclass, phase=args.phase,
+        flow_mode=args.flow_mode, flow_dense_size=args.flow_dense_size,
     )
     val_ds = MotionDataset(
         args.data_dir, "val", args.seq_len, args.stride,
-        n_persons=n_total, augment=False, multiclass=args.multiclass
+        n_persons=n_total, augment=False, multiclass=args.multiclass,
+        flow_mode=args.flow_mode, flow_dense_size=args.flow_dense_size,
     )
 
     train_loader = DataLoader(
@@ -646,6 +684,8 @@ def train() -> None:
         "d_model": args.d_model,
         "n_blocks": args.n_blocks,
         "dropout": args.dropout,
+        "flow_mode": args.flow_mode,
+        "flow_dense_size": args.flow_dense_size,
     }
     if args.multiclass:
         model_kwargs.update({
@@ -832,6 +872,8 @@ def train() -> None:
         "n_keypoints": 21,
         "embed_dim": 512,
         "flow_dim": 64,
+        "flow_mode": args.flow_mode,
+        "flow_dense_size": args.flow_dense_size,
     })
     if args.multiclass:
         model_config.update({

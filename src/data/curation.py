@@ -50,6 +50,12 @@ def flow_path(scene_dir: Path, method: str, output_features: int, scale: float) 
     return scene_dir / "flow" / f"{_flow_stem(method, output_features, scale)}.npy"
 
 
+def dense_flow_path(scene_dir: Path, method: str, size: int, scale: float) -> Path:
+    """New path: flow/<method>_dense_<size>x<size>_s<scale>.npy"""
+    scale_s = f"{scale:.3f}".rstrip("0").rstrip(".")
+    return scene_dir / "flow" / f"{method}_dense_{size}x{size}_s{scale_s}.npy"
+
+
 # ── Backward-compat resolved paths ────────────────────────────────────────────
 
 def resolve_keypoints_path(scene_dir: Path, model_name: str) -> Path | None:
@@ -100,6 +106,12 @@ def resolve_flow_path(scene_dir: Path, method: str, output_features: int, scale:
         return p
     legacy = scene_dir / "optical_flow.npy"
     return legacy if legacy.exists() else None
+
+
+def resolve_dense_flow_path(scene_dir: Path, method: str, size: int, scale: float) -> Path | None:
+    """Return existing dense flow path, or None if not present."""
+    p = dense_flow_path(scene_dir, method, size, scale)
+    return p if p.exists() else None
 
 
 # ── Review state ──────────────────────────────────────────────────────────────

@@ -79,6 +79,115 @@ def compute_flow_raft(
     return features
 
 
+def compute_flow_raft_dense_batched(
+    frames: np.ndarray,
+    device: str = "cuda",
+    batch_size: int = 64,
+) -> np.ndarray:
+    """Compute dense optical flow using RAFT with batched frame pairs.
+
+    Args:
+        frames: [N, H, W, C] uint8 RGB array.
+        device: CUDA device string.
+        batch_size: Number of frame pairs to process simultaneously.
+
+    Returns:
+        np.ndarray of shape [N, 2, H, W] float32 dense flow fields.
+    """
+    n_frames = len(frames)
+    h, w = frames.shape[1], frames.shape[2]
+    if n_frames < 2:
+        return np.zeros((n_frames, 2, h, w), dtype=np.float32)
+
+    model = _load_raft(device)
+    all_flows = np.zeros((n_frames, 2, h, w), dtype=np.float32)
+
+    with torch.no_grad():
+        for batch_start in range(1, n_frames, batch_size):
+            batch_end = min(batch_start + batch_size, n_frames)
+            b = batch_end - batch_start
+
+            imgs1 = np.stack([frames[i - 1] for i in range(batch_start, batch_end)])
+            imgs2 = np.stack([frames[i] for i in range(batch_start, batch_end)])
+
+            t1 = torch.from_numpy(imgs1).permute(0, 3, 1, 2).float().to(device)  # [B, 3, H, W]
+            t2 = torch.from_numpy(imgs2).permute(0, 3, 1, 2).float().to(device)
+
+            use_amp = (str(device).startswith("cuda") or device == "cuda")
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                flow_preds = model(t1, t2)
+            flows = flow_preds[-1].cpu().float().numpy()  # [B, 2, H, W]
+
+            del t1, t2, flow_preds
+
+            all_flows[batch_start:batch_end] = flows
+
+    if n_frames > 1:
+        all_flows[0] = all_flows[1]
+
+    return all_flows
+
+
+def normalize_flow_components(flows: np.ndarray) -> np.ndarray:
+    """Normalize flow by spatial dimensions to make values resolution-independent.
+
+    Args:
+        flows: [N, 2, H, W] float32 dense flow.
+
+    Returns:
+        [N, 2, H, W] float32 with flow_x / W and flow_y / H.
+    """
+    h, w = flows.shape[2], flows.shape[3]
+    out = flows.copy()
+    out[:, 0] /= w   # flow_x normalized by width
+    out[:, 1] /= h   # flow_y normalized by height
+    return out
+
+
+def downsample_dense_flow(flows: np.ndarray, out_size: int) -> np.ndarray:
+    """Downsample dense flow fields to a fixed spatial resolution.
+
+    Uses area interpolation (averaging) to reduce spatial dimensions.
+    Does NOT rescale magnitudes — the values remain in the same displacement unit.
+
+    Args:
+        flows: [N, 2, H, W] float32 dense flow.
+        out_size: Target spatial dimension (out_size x out_size).
+
+    Returns:
+        [N, 2, out_size, out_size] float32.
+    """
+    n, c, h, w = flows.shape
+    if h == out_size and w == out_size:
+        return flows
+    result = np.zeros((n, c, out_size, out_size), dtype=np.float32)
+    for i in range(n):
+        for ch in range(c):
+            result[i, ch] = cv2.resize(
+                flows[i, ch], (out_size, out_size),
+                interpolation=cv2.INTER_AREA,
+            )
+    return result
+
+
+def summarize_dense_flow(flows: np.ndarray, output_features: int) -> np.ndarray:
+    """Summarize dense flow fields into compact per-frame feature vectors.
+
+    Args:
+        flows: [N, 2, H, W] float32 dense flow.
+        output_features: Number of summary features per frame.
+
+    Returns:
+        [N, output_features] float32.
+    """
+    n = flows.shape[0]
+    features = np.zeros((n, output_features), dtype=np.float32)
+    for i in range(n):
+        flow_hwc = flows[i].transpose(1, 2, 0)  # [H, W, 2]
+        features[i] = _summarize_flow(flow_hwc, output_features)
+    return features
+
+
 def compute_flow_raft_batched(
     frames: np.ndarray,
     output_features: int = 64,
@@ -99,40 +208,8 @@ def compute_flow_raft_batched(
     Returns:
         np.ndarray of shape [N, output_features] float32.
     """
-    n_frames = len(frames)
-    if n_frames < 2:
-        return np.zeros((n_frames, output_features), dtype=np.float32)
-
-    model = _load_raft(device)
-    features = np.zeros((n_frames, output_features), dtype=np.float32)
-
-    with torch.no_grad():
-        for batch_start in range(1, n_frames, batch_size):
-            batch_end = min(batch_start + batch_size, n_frames)
-            b = batch_end - batch_start
-
-            # Stack consecutive frame pairs  # [B, H, W, C]
-            imgs1 = np.stack([frames[i - 1] for i in range(batch_start, batch_end)])
-            imgs2 = np.stack([frames[i] for i in range(batch_start, batch_end)])
-
-            t1 = torch.from_numpy(imgs1).permute(0, 3, 1, 2).float().to(device)  # [B, 3, H, W]
-            t2 = torch.from_numpy(imgs2).permute(0, 3, 1, 2).float().to(device)
-
-            use_amp = (str(device).startswith("cuda") or device == "cuda")
-            with torch.amp.autocast("cuda", enabled=use_amp):
-                flow_preds = model(t1, t2)
-            flows = flow_preds[-1].cpu().float().numpy()  # [B, 2, H, W]
-
-            del t1, t2, flow_preds
-
-            for j in range(b):
-                flow_hwc = flows[j].transpose(1, 2, 0)  # [H, W, 2]
-                features[batch_start + j] = _summarize_flow(flow_hwc, output_features)
-
-    if n_frames > 1:
-        features[0] = features[1]
-
-    return features
+    dense = compute_flow_raft_dense_batched(frames, device, batch_size)
+    return summarize_dense_flow(dense, output_features)
 
 
 def compute_flow_farneback(
@@ -240,7 +317,9 @@ def compute_flow_for_video(
     batch_size: int = 120,
     method: Literal["farneback", "raft"] = "raft",
     device: str = "cuda",
-) -> np.ndarray:
+    dense: bool = False,
+    dense_size: int = 32,
+) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
     """Compute optical flow features for a full video via batched processing.
 
     Args:
@@ -249,16 +328,23 @@ def compute_flow_for_video(
         batch_size: Number of frames to process at once.
         method: "raft" (GPU, recommended) or "farneback" (CPU, legacy).
         device: CUDA device for RAFT.
+        dense: If True and method is "raft", also return dense flow maps.
+        dense_size: Spatial resolution for dense flow maps.
 
     Returns:
-        np.ndarray of shape [N_frames, output_features].
+        If dense=False: np.ndarray of shape [N_frames, output_features].
+        If dense=True: tuple of (summary [N, output_features], dense [N, 2, dense_size, dense_size]).
     """
-    compute_fn = (
-        lambda frames: compute_flow_raft(frames, output_features, device)
-        if method == "raft"
-        else lambda frames: compute_flow_farneback(frames, output_features)
-    )
-    all_features = []
+    use_dense = dense and method == "raft"
+
+    if not use_dense:
+        compute_fn = (
+            lambda frames: compute_flow_raft(frames, output_features, device)
+            if method == "raft"
+            else lambda frames: compute_flow_farneback(frames, output_features)
+        )
+    all_summary = []
+    all_dense = [] if use_dense else None
     batch = []
     prev_last_frame = None
     total_processed = 0
@@ -267,14 +353,28 @@ def compute_flow_for_video(
         batch.append(frame)
 
         if len(batch) >= batch_size:
-            # Include previous last frame for continuity
             if prev_last_frame is not None:
-                compute_batch = [prev_last_frame] + batch
-                feats = compute_fn(np.stack(compute_batch))
-                all_features.append(feats[1:])  # Drop the duplicate first frame
+                compute_batch = np.stack([prev_last_frame] + batch)
             else:
-                feats = compute_fn(np.stack(batch))
-                all_features.append(feats)
+                compute_batch = np.stack(batch)
+
+            if use_dense:
+                raw_dense = compute_flow_raft_dense_batched(compute_batch, device, batch_size=64)
+                norm_dense = normalize_flow_components(raw_dense)
+                summary = summarize_dense_flow(raw_dense, output_features)
+                ds_dense = downsample_dense_flow(norm_dense, dense_size)
+                if prev_last_frame is not None:
+                    all_summary.append(summary[1:])
+                    all_dense.append(ds_dense[1:])
+                else:
+                    all_summary.append(summary)
+                    all_dense.append(ds_dense)
+            else:
+                feats = compute_fn(compute_batch)
+                if prev_last_frame is not None:
+                    all_summary.append(feats[1:])
+                else:
+                    all_summary.append(feats)
 
             total_processed += len(batch)
             if total_processed % (batch_size * 10) == 0:
@@ -286,14 +386,36 @@ def compute_flow_for_video(
     # Process remaining
     if batch:
         if prev_last_frame is not None:
-            compute_batch = [prev_last_frame] + batch
-            feats = compute_fn(np.stack(compute_batch))
-            all_features.append(feats[1:])
+            compute_batch = np.stack([prev_last_frame] + batch)
         else:
-            feats = compute_fn(np.stack(batch))
-            all_features.append(feats)
+            compute_batch = np.stack(batch)
 
-    if not all_features:
-        return np.empty((0, output_features), dtype=np.float32)
+        if use_dense:
+            raw_dense = compute_flow_raft_dense_batched(compute_batch, device, batch_size=64)
+            norm_dense = normalize_flow_components(raw_dense)
+            summary = summarize_dense_flow(raw_dense, output_features)
+            ds_dense = downsample_dense_flow(norm_dense, dense_size)
+            if prev_last_frame is not None:
+                all_summary.append(summary[1:])
+                all_dense.append(ds_dense[1:])
+            else:
+                all_summary.append(summary)
+                all_dense.append(ds_dense)
+        else:
+            feats = compute_fn(compute_batch) if not use_dense else None
+            if prev_last_frame is not None:
+                all_summary.append(feats[1:])
+            else:
+                all_summary.append(feats)
 
-    return np.concatenate(all_features, axis=0)
+    if not all_summary:
+        empty_summary = np.empty((0, output_features), dtype=np.float32)
+        if use_dense:
+            return empty_summary, np.empty((0, 2, dense_size, dense_size), dtype=np.float32)
+        return empty_summary
+
+    summary_out = np.concatenate(all_summary, axis=0)
+    if use_dense:
+        dense_out = np.concatenate(all_dense, axis=0)
+        return summary_out, dense_out
+    return summary_out

@@ -46,6 +46,11 @@ class FlowConfig:
     method: str = "raft"  # "raft" (GPU, recommended) or "farneback" (CPU, legacy)
     output_features: int = 64
     scale: float = 0.5  # resize factor for flow computation
+    save_summary: bool = True
+    save_dense: bool = False
+    dense_size: int = 32
+    dense_dtype: str = "float16"
+    normalize_dense: bool = True
 
 
 @dataclass
