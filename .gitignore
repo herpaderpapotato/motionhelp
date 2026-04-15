@@ -10,6 +10,8 @@ __pycache__/
 AGENTS.md
 /tmp/*
 
+*.mp4
+
 # Distribution / packaging
 .Python
 build/

@@ -800,7 +800,7 @@ def live_playback_with_prediction(
     BUF_RESUME_THRESHOLD = MAX_FRAME_BUF//2
     BUF_LOW_THRESHOLD    = 120                 # pause playback when buffer drops below this
 
-    frame_delay_ms = max(16, int(1000.0 / target_fps))
+    frame_delay_ms = max(16, int(round(1000.0 / target_fps)))
 
     # ── Layout ────────────────────────────────────────────────────────────
     # Row 1: video canvas  +  stats panel
