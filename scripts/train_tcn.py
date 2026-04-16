@@ -309,6 +309,7 @@ class MotionDataset(Dataset):
                 emb = torch.zeros_like(emb)
 
 
+    
 
         # s = self.augment_scale  # [0, 1] — 0=min values, 1=max values
 
@@ -775,88 +776,146 @@ def train() -> None:
 
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
 
-    # if checkpoint.exists():
-    #     optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-    #     scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-    #     log.info("Loaded optimizer and scheduler state from checkpoint")
+    def merge_model(
+        model: FunscriptTCN,
+        flow_encoder_path: Path | str,
+        pose_encoder_path: Path | str,
+        emb_encoder_path: Path | str,
+    ) -> None:
+        """Merge pretrained encoder weights into the current model."""
+        flow_model = FunscriptTCN(**model_kwargs).to(device)
+        pose_model = FunscriptTCN(**model_kwargs).to(device)
+        emb_model = FunscriptTCN(**model_kwargs).to(device)
+
+        flow_ckpt = torch.load(flow_encoder_path, map_location=device, weights_only=False)
+        pose_ckpt = torch.load(pose_encoder_path, map_location=device, weights_only=False)
+        emb_ckpt = torch.load(emb_encoder_path, map_location=device, weights_only=False)
+        flow_model.load_state_dict(flow_ckpt["model_state_dict"])
+        pose_model.load_state_dict(pose_ckpt["model_state_dict"])
+        emb_model.load_state_dict(emb_ckpt["model_state_dict"])
+
+        # Copy flow encoder weights
+        model.flow_encoder.load_state_dict(flow_model.flow_encoder.state_dict()) 
+        # Copy pose encoder weights
+        model.pose_encoder.load_state_dict(pose_model.pose_encoder.state_dict())
+        # Copy embedding encoder weights
+        model.emb_encoder.load_state_dict(emb_model.emb_encoder.state_dict())
+
+        # def merge_weights(flow_model, pose_model, emb_model, target_model):
+        #     target_state = target_model.state_dict()
+        #     for name, param in target_state.items():
+        #         if name.startswith("flow_encoder.") or name.startswith("pose_encoder.") or name.startswith("emb_encoder."):
+        #             continue
+        #         averaged_param = torch.zeros_like(param).to(device)
+        #         count = 0
+        #         if name in flow_model.state_dict():
+        #             averaged_param += flow_model.state_dict()[name]
+        #             count += 1
+        #         if name in pose_model.state_dict():
+        #             averaged_param += pose_model.state_dict()[name]
+        #             count += 1
+        #         if name in emb_model.state_dict():
+        #             averaged_param += emb_model.state_dict()[name]
+        #             count += 1
+        #         if count > 0:
+        #             # handle TCN which is a long and so can't be cast to float16 without overflow issues, so keep it in float32
+        #             # result type Float can't be cast to the desired output type Long
+        #             if averaged_param.dtype == torch.float32 and param.dtype == torch.float16:
+        #                 averaged_param = averaged_param.half()
+        #                 averaged_param = averaged_param / count
+        #                 averaged_param = averaged_param.float()
+        #             else:
+        #                 averaged_param = averaged_param / count
+                        
+        #             target_state[name] = averaged_param
+
+
+        #     target_model.load_state_dict(target_state)
+
+
+        #     return target_model
+            
+        # # Merge weights
+        # model = merge_weights(flow_model.to(device), pose_model.to(device), emb_model.to(device), model)
+
+
+        
+        # freeze encoders after merging
+        for p in model.flow_encoder.parameters():
+            p.requires_grad = False
+        for p in model.pose_encoder.parameters():
+            p.requires_grad = False
+        for p in model.emb_encoder.parameters():
+            p.requires_grad = False
+
+        return model
+
+    flow_encoder_model = "data\\models\\checkpoints_tcn\\phase5_flow_best_tcn.pt"
+    pose_encoder_model = "data\\models\\checkpoints_tcn\\phase6_emb_best_tcn.pt"
+    emb_encoder_model = "data\\models\\checkpoints_tcn\\phase7_pose_best_tcn.pt"
+    model = merge_model(model, flow_encoder_model, pose_encoder_model, emb_encoder_model)
+
+    model.eval()
+    val_losses = []
+    val_pred_means = []
+    val_pred_stds = []
+    val_metric_history = {
+        "pos_mse": [],
+        "event_mse": [],
+        "active_mse": [],
+        "vel_mse": [],
+        "vel_mae": [],
+        "acc_mse": [],
+        "acc_mae": [],
+        "spec_mse": [],
+    }
+
+    with torch.no_grad():
+        for batch in val_loader:
+            kp = batch["keypoints"].to(device, non_blocking=True)
+            emb = batch["embeddings"].to(device, non_blocking=True)
+            fl = batch["flow"].to(device, non_blocking=True)
+            lbl = batch["labels"].to(device, non_blocking=True)
+
+            with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
+                pred = model(kp, emb, fl)
+                metric_batch = compute_regression_metrics(
+                    pred,
+                    lbl,
+                    spectral_kernel=args.spectral_kernel,
+                    activity_gain=args.event_activity_gain,
+                    activity_power=args.event_activity_power,
+                    active_quantile=args.active_quantile,
+                )
+                pos_loss = ((1.0 - args.event_weight) * metric_batch["pos_mse"]
+                            + args.event_weight * metric_batch["event_mse"])
+                temp_loss = metric_batch["acc_mse"]
+                vel_loss = metric_batch["vel_mse"]
+                spec_loss = metric_batch["spec_mse"]
+
+                loss = (pos_loss
+                        + args.temporal_weight * temp_loss
+                        + args.velocity_weight * vel_loss
+                        + args.spectral_weight * spec_loss)
+
+            val_losses.append(loss.item())
+            for key in val_metric_history:
+                val_metric_history[key].append(metric_batch[key].item())
+            val_pred_means.append(pred.mean().item())
+            val_pred_stds.append(pred.std().item())
+
+    avg_val = np.mean(val_losses)
+    avg_val_metrics = {key: float(np.mean(values)) for key, values in val_metric_history.items()}
+    avg_pred_mean = np.mean(val_pred_means)
+    avg_pred_std = np.mean(val_pred_stds)
+    log.info("Initial validation loss: %.6f", avg_val)
+    log.info("Initial validation metrics: %s", ", ".join(f"{k}={v:.6f}" for k, v in avg_val_metrics.items()))
+    log.info("Initial validation prediction mean: %.6f, std: %.6f", avg_pred_mean, avg_pred_std)
+
+
 
     best_val_loss = float("inf")
-    # if args.resume is not None:
-    #     # if "optimizer_state_dict" in ckpt and "scheduler_state_dict" in ckpt:
-    #     #     optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-    #     #     #scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-    #     #     log.info("Loaded optimizer and scheduler state from checkpoint")
-    #     #     if args.lr is not None:
-    #     #         # If resuming but a new lr is specified, override the loaded scheduler state to use the new lr
-    #     #         for param_group in optimizer.param_groups:
-    #     #             param_group["lr"] = args.lr
-    #     #         log.info("Overriding loaded learning rate with new value: %s", args.lr)
-    #     # else:
-    #     #     log.warning("No optimizer/scheduler state found in checkpoint — starting with fresh optimizer/scheduler")
-    #     if "val_loss" in ckpt and args.load_best_val_loss:
-    #         best_val_loss = ckpt["val_loss"]
-    #         log.info("Resuming with best_val_loss = %.6f", best_val_loss)
-    #     else:
-    #         # run an initial validation loop to get the current val loss for early stopping
-    #         log.info("No val_loss found in checkpoint — running initial validation to get baseline val loss for early stopping")
-    #         # --- Validate ---
-    #         model.eval()
-    #         val_losses = []
-    #         val_pred_means = []
-    #         val_pred_stds = []
-    #         val_metric_history = {
-    #             "pos_mse": [],
-    #             "event_mse": [],
-    #             "active_mse": [],
-    #             "vel_mse": [],
-    #             "vel_mae": [],
-    #             "acc_mse": [],
-    #             "acc_mae": [],
-    #             "spec_mse": [],
-    #         }
-
-    #         with torch.no_grad():
-    #             for batch in val_loader:
-    #                 kp = batch["keypoints"].to(device, non_blocking=True)
-    #                 emb = batch["embeddings"].to(device, non_blocking=True)
-    #                 fl = batch["flow"].to(device, non_blocking=True)
-    #                 lbl = batch["labels"].to(device, non_blocking=True)
-
-    #                 with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
-    #                     pred = model(kp, emb, fl)
-    #                     metric_batch = compute_regression_metrics(
-    #                         pred,
-    #                         lbl,
-    #                         spectral_kernel=args.spectral_kernel,
-    #                         activity_gain=args.event_activity_gain,
-    #                         activity_power=args.event_activity_power,
-    #                         active_quantile=args.active_quantile,
-    #                     )
-    #                     pos_loss = ((1.0 - args.event_weight) * metric_batch["pos_mse"]
-    #                                 + args.event_weight * metric_batch["event_mse"])
-    #                     temp_loss = metric_batch["acc_mse"]
-    #                     vel_loss = metric_batch["vel_mse"]
-    #                     spec_loss = metric_batch["spec_mse"]
-
-    #                     loss = (pos_loss
-    #                             + args.temporal_weight * temp_loss
-    #                             + args.velocity_weight * vel_loss
-    #                             + args.spectral_weight * spec_loss)
-
-    #                 val_losses.append(loss.item())
-    #                 for key in val_metric_history:
-    #                     val_metric_history[key].append(metric_batch[key].item())
-    #                 val_pred_means.append(pred.mean().item())
-    #                 val_pred_stds.append(pred.std().item())
-
-    #         avg_val = np.mean(val_losses)
-    #         avg_val_metrics = {key: float(np.mean(values)) for key, values in val_metric_history.items()}
-    #         avg_pred_mean = np.mean(val_pred_means)
-    #         avg_pred_std = np.mean(val_pred_stds)
-    #         log.info("Initial validation loss: %.6f", avg_val)
-    #         log.info("Initial validation metrics: %s", ", ".join(f"{k}={v:.6f}" for k, v in avg_val_metrics.items()))
-    #         log.info("Initial validation prediction mean: %.6f, std: %.6f", avg_pred_mean, avg_pred_std)
-    #         best_val_loss = avg_val
+    
 
 
     for param_group in optimizer.param_groups:
