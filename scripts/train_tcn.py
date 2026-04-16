@@ -9,7 +9,6 @@ and trains a temporal convolutional network for per-frame position prediction.
 """
 
 import argparse
-from dataclasses import dataclass, replace
 import json
 import logging
 import os
@@ -34,125 +33,6 @@ from src.training.funscript_metrics import compute_regression_metrics
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 log = logging.getLogger(__name__)
-
-
-REGRESSION_METRIC_KEYS = (
-    "pos_mse",
-    "event_mse",
-    "active_mse",
-    "vel_mse",
-    "vel_mae",
-    "acc_mse",
-    "acc_mae",
-    "spec_mse",
-)
-
-MODALITY_NAMES = ("pose", "embedding", "flow")
-
-
-@dataclass(frozen=True)
-class LossConfig:
-    event_weight: float
-    event_activity_gain: float
-    event_activity_power: float
-    active_quantile: float
-    temporal_weight: float
-    velocity_weight: float
-    spectral_weight: float
-    spectral_kernel: int
-
-
-@dataclass(frozen=True)
-class ModalityMask:
-    drop_pose: bool = False
-    drop_embedding: bool = False
-    drop_flow: bool = False
-
-
-@dataclass(frozen=True)
-class ModalityDropoutConfig:
-    pose_prob: float = 0.0
-    embedding_prob: float = 0.0
-    flow_prob: float = 0.0
-    scale_with_augment: bool = False
-    keep_at_least_one: bool = True
-
-    def is_enabled(self) -> bool:
-        return any(prob > 0.0 for prob in (self.pose_prob, self.embedding_prob, self.flow_prob))
-
-    def scaled(self, augment_scale: float) -> "ModalityDropoutConfig":
-        if not self.scale_with_augment:
-            return self
-        scale = 1.0 + max(0.0, augment_scale)
-        return ModalityDropoutConfig(
-            pose_prob=min(1.0, self.pose_prob * scale),
-            embedding_prob=min(1.0, self.embedding_prob * scale),
-            flow_prob=min(1.0, self.flow_prob * scale),
-            scale_with_augment=self.scale_with_augment,
-            keep_at_least_one=self.keep_at_least_one,
-        )
-
-
-@dataclass(frozen=True)
-class DominanceControlConfig:
-    response: str = "none"
-    dominance_threshold: float = 0.55
-    min_reliance_delta: float = 1e-4
-    gradient_weight: float = 0.3
-    lr_decay: float = 0.8
-    min_lr_scale: float = 0.1
-    dropout_increase: float = 0.05
-    max_dropout_prob: float = 0.5
-
-    def enabled(self) -> bool:
-        return self.response != "none"
-
-
-def _apply_modality_mask(
-    keypoints: torch.Tensor,
-    embeddings: torch.Tensor,
-    flow: torch.Tensor,
-    mask: ModalityMask,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    if mask.drop_pose:
-        keypoints = torch.zeros_like(keypoints)
-    if mask.drop_embedding:
-        embeddings = torch.zeros_like(embeddings)
-    if mask.drop_flow:
-        flow = torch.zeros_like(flow)
-    return keypoints, embeddings, flow
-
-
-def _sample_modality_mask(
-    dropout_config: ModalityDropoutConfig,
-    augment_scale: float,
-) -> ModalityMask:
-    if not dropout_config.is_enabled():
-        return ModalityMask()
-
-    scaled_config = dropout_config.scaled(augment_scale)
-    drop_pose = torch.rand(()).item() < scaled_config.pose_prob
-    drop_embedding = torch.rand(()).item() < scaled_config.embedding_prob
-    drop_flow = torch.rand(()).item() < scaled_config.flow_prob
-
-    if scaled_config.keep_at_least_one and drop_pose and drop_embedding and drop_flow:
-        keep_idx = int(torch.randint(0, 3, (1,)).item())
-        if keep_idx == 0:
-            drop_pose = False
-        elif keep_idx == 1:
-            drop_embedding = False
-        else:
-            drop_flow = False
-
-    return ModalityMask(
-        drop_pose=drop_pose,
-        drop_embedding=drop_embedding,
-        drop_flow=drop_flow,
-    )
-
-
-def _init_metric_history() -> dict[str, list[float]]:
-    return {key: [] for key in REGRESSION_METRIC_KEYS}
 
 
 # ---------------------------------------------------------------------------
@@ -184,7 +64,7 @@ class MotionDataset(Dataset):
         flow_dim: int = 64,
         augment: bool = False,
         multiclass: bool = False,
-        modality_dropout: ModalityDropoutConfig | None = None,
+        phase: int = -1,
         flow_mode: str = "summary",
         flow_dense_size: int = 32,
     ):
@@ -196,12 +76,12 @@ class MotionDataset(Dataset):
         self.flow_dim = flow_dim
         self.augment = augment
         self.multiclass = multiclass
-        self.modality_dropout = modality_dropout or ModalityDropoutConfig()
+        self.phase = phase
         self.flow_mode = flow_mode
         self.flow_dense_size = flow_dense_size
         self.using_stats = False
         self.stats_path = None
-        self.runs = 0
+        self.last_epoch = False
 
         if multiclass:
             self.KP_FILE = "keypoints/vrlens-finetunes-multiclass-v2-yolo11m-pose.npy"
@@ -218,7 +98,7 @@ class MotionDataset(Dataset):
         self.embed_dim = embed_dim
         self.flow_dim = flow_dim
         self.augment = augment
-        self.augment_scale: float = 0.0  # 0=min regularization, 1=max regularization
+        self.augment_scale: float = 0.0  # 0=min augmentation, 1=max augmentation
 
         # Load split
         with open(self.data_dir / "splits" / f"{split}.json") as f:
@@ -393,8 +273,10 @@ class MotionDataset(Dataset):
         flow = torch.from_numpy(flow).float()               # [T, F]
         labels = torch.from_numpy(labels).float()            # [T]
 
-        if self.augment:
-            keypoints, embeddings, flow = self._augment(keypoints, embeddings, flow)
+        if self.augment or self.phase > 1:
+            keypoints, embeddings, flow, labels = self._augment(
+                keypoints, embeddings, flow, labels
+            )
 
         return {
             "keypoints": keypoints,
@@ -408,10 +290,73 @@ class MotionDataset(Dataset):
         kp: torch.Tensor,
         emb: torch.Tensor,
         flow: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # Randomly blank whole modalities to prevent the network from overusing one path.
-        mask = _sample_modality_mask(self.modality_dropout, self.augment_scale)
-        return _apply_modality_mask(kp, emb, flow, mask)
+        labels: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # All augmentations are independent (not elif) so multiple can apply
+
+        if not self.last_epoch:
+            if self.phase == 2:
+                # null out all inputs except pose keypoints to focus on learning from pose
+                emb = torch.zeros_like(emb)
+                flow = torch.zeros_like(flow)
+            elif self.phase == 3:
+                # null out all inputs except embeddings to focus on learning from embeddings
+                kp = torch.zeros_like(kp)
+                flow = torch.zeros_like(flow)
+            elif self.phase == 4:
+                # null out all inputs except flow to focus on learning from flow
+                kp = torch.zeros_like(kp)
+                emb = torch.zeros_like(emb)
+
+
+
+        # s = self.augment_scale  # [0, 1] — 0=min values, 1=max values
+
+        # dropout_prob = 0.1 + s * (0.9 - 0.1)
+        # if torch.rand(1).item() < dropout_prob:
+        #     choice = torch.randint(3, (1,)).item()
+        #     if choice == 0:
+        #         kp = torch.zeros_like(kp)
+        #     elif choice == 1:
+        #         emb = torch.zeros_like(emb)
+        #     else:
+        #         flow = torch.zeros_like(flow)
+
+        # emb_noise_prob = 0.2 + s * (0.9 - 0.2)    
+        # emb_noise_mag  = 0.02 + s * (0.15 - 0.02)
+        # if torch.rand(1).item() < emb_noise_prob:
+        #     emb = emb + torch.randn_like(emb) * emb_noise_mag
+
+        # flow_noise_prob = 0.2 + s * (0.9 - 0.2) 
+        # flow_noise_mag  = 0.02 + s * (0.2 - 0.02)
+        # if torch.rand(1).item() < flow_noise_prob:
+        #     # flow = flow + torch.randn_like(flow) * flow_noise_mag # makes B x Seq x FlowDim noise which may be too random
+        #     # Alternate: use same noise for all flow frames in a sequence to generalize better to different flow magnitudes
+        #     noise = torch.randn(flow.shape[1], device=flow.device) * flow_noise_mag
+        #     flow = flow + noise
+
+
+        # kp_noise_prob = 0.2 + s * (0.3 - 0.2)
+        # kp_noise_mag = 0.01 + s * (0.04 - 0.01) # 5% max jitter
+        # if torch.rand(1).item() < kp_noise_prob:
+        #     kp = kp + torch.randn_like(kp) * kp_noise_mag
+        #     kp = torch.clamp(kp, 0.0, 1.0)
+        #     # decay all kp confidences by half
+        #     kp[..., 2] = kp[..., 2] * 0.5
+
+        # kp_intermittent_drop_prob = 0.2 + s * (0.7 - 0.2)
+        # if torch.rand(1).item() < kp_intermittent_drop_prob:
+        #     # Randomly zero out all keypoints for random contiguous segments (simulate occlusion)
+        #     T = kp.shape[0]
+        #     n_segments = max(1, int(T * 0.01))  # number of segments scales with sequence length
+        #     for _ in range(n_segments):
+        #         seg_len = torch.randint(5, 20, (1,)).item()  # segment length between 5 and 20 frames
+        #         start = torch.randint(0, T - seg_len, (1,)).item()
+        #         kp[start:start + seg_len] = 0.0
+
+
+
+        return kp, emb, flow, labels
 
 
 # ---------------------------------------------------------------------------
@@ -419,7 +364,7 @@ class MotionDataset(Dataset):
 # ---------------------------------------------------------------------------
 
 def _compute_augment_scale(val_loss: float, train_loss: float) -> float:
-    """Map val/train loss ratio to regularization scale [0, 1].
+    """Map val/train loss ratio to augmentation scale [0, 1].
 
     Linear interpolation in between.
     """
@@ -436,355 +381,176 @@ def _compute_augment_scale(val_loss: float, train_loss: float) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Training helpers
+# Phase-specific freezing for multi-phase training
 # ---------------------------------------------------------------------------
 
-def _resolve_probability(override: float | None, base: float) -> float:
-    return base if override is None else override
+def _apply_phase_freezing(model: FunscriptTCN, phase: int, fill_with_noise: bool = False) -> None:
+    """Freeze/unfreeze model parameters based on training phase.
+    """
+    # First, freeze everything
+    if phase > 1:
+        for p in model.parameters():
+            p.requires_grad = False
+    if phase == 1:
+        pass  # all trainable
+    elif phase == 2:
+        if fill_with_noise:
+            print("Filling pose encoder with noise for phase 2")
+            for p in model.pose_encoder.parameters():
+                p.data = torch.randn_like(p.data) * 0.01
+            for p in model.pose_attn.parameters():
+                p.data = torch.randn_like(p.data) * 0.01
+            if model.multiclass:
+                for p in model.beholder_pose_encoder.parameters():
+                    p.data = torch.randn_like(p.data) * 0.01
+        # Unfreeze pose encoders only
+        print("Unfreezing pose encoders only")
+        for p in model.pose_encoder.parameters():
+            p.requires_grad = True
+        for p in model.pose_attn.parameters():
+            p.requires_grad = True
+        if model.multiclass:
+            for p in model.beholder_pose_encoder.parameters():
+                p.requires_grad = True
+    elif phase == 3:
+        if fill_with_noise:
+            print("Filling embedding encoders with noise for phase 3")
+            for p in model.emb_encoder.parameters():
+                p.data = torch.randn_like(p.data) * 0.01
+            for p in model.emb_attn.parameters():
+                p.data = torch.randn_like(p.data) * 0.01
+            if model.multiclass:
+                for p in model.beholder_emb_encoder.parameters():
+                    p.data = torch.randn_like(p.data) * 0.01
+        # Unfreeze embedding encoders only
+        print("Unfreezing embedding encoders only")
+        for p in model.emb_encoder.parameters():
+            p.requires_grad = True
+        for p in model.emb_attn.parameters():
+            p.requires_grad = True
+        if model.multiclass:
+            for p in model.beholder_emb_encoder.parameters():
+                p.requires_grad = True
+    elif phase == 4:
+        if fill_with_noise:
+            print("Filling flow encoder with noise for phase 4")
+            for p in model.flow_encoder.parameters():
+                p.data = torch.randn_like(p.data) * 0.01
+        # Unfreeze flow encoder only
+        print("Unfreezing flow encoder only")
+        for p in model.flow_encoder.parameters():
+            p.requires_grad = True
 
 
-def _dropout_field_name(modality: str) -> str:
-    if modality == "pose":
-        return "pose_prob"
-    if modality == "embedding":
-        return "embedding_prob"
-    if modality == "flow":
-        return "flow_prob"
-    raise ValueError(f"Unsupported modality: {modality}")
 
 
-def _compute_batch_loss(
-    model: FunscriptTCN,
-    keypoints: torch.Tensor,
-    embeddings: torch.Tensor,
-    flow: torch.Tensor,
-    labels: torch.Tensor,
-    loss_config: LossConfig,
-) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor], dict[str, torch.Tensor]]:
-    pred = model(keypoints, embeddings, flow)
-    metric_batch = compute_regression_metrics(
-        pred,
-        labels,
-        spectral_kernel=loss_config.spectral_kernel,
-        activity_gain=loss_config.event_activity_gain,
-        activity_power=loss_config.event_activity_power,
-        active_quantile=loss_config.active_quantile,
-    )
-    pos_loss = ((1.0 - loss_config.event_weight) * metric_batch["pos_mse"]
-                + loss_config.event_weight * metric_batch["event_mse"])
-    temporal_loss = metric_batch["acc_mse"]
-    velocity_loss = metric_batch["vel_mse"]
-    spectral_loss = metric_batch["spec_mse"]
-    loss = (pos_loss
-            + loss_config.temporal_weight * temporal_loss
-            + loss_config.velocity_weight * velocity_loss
-            + loss_config.spectral_weight * spectral_loss)
-    return pred, loss, metric_batch, {
-        "pos_loss": pos_loss,
-        "temp_loss": temporal_loss,
-        "vel_loss": velocity_loss,
-        "spec_loss": spectral_loss,
-    }
+    elif phase == 5:
+        # Unfreeze flow encoder, fusion + output head + TCN backbone
+        print("Unfreezing flow encoder, fusion + output head + TCN backbone")
+        for p in model.flow_encoder.parameters():
+            p.requires_grad = True 
+        for p in model.fusion.parameters():
+            p.requires_grad = True
+        for p in model.output_head.parameters():
+            p.requires_grad = True
+        for p in model.tcn_blocks.parameters():
+            p.requires_grad = True
+    elif phase == 6:
+        # Unfreeze embedding encoders
+        print("Unfreezing embedding encoders only")
+        for p in model.emb_encoder.parameters():
+            p.requires_grad = True
+        for p in model.emb_attn.parameters():
+            p.requires_grad = True
+        if model.multiclass:
+            for p in model.beholder_emb_encoder.parameters():
+                p.requires_grad = True
+        for p in model.fusion.parameters():
+            p.requires_grad = True
+        for p in model.output_head.parameters():
+            p.requires_grad = True
+        for p in model.tcn_blocks.parameters():
+            p.requires_grad = True
+    elif phase == 7:
+        # Unfreeze pose encoders
+        print("Unfreezing pose encoders only")
+        for p in model.pose_encoder.parameters():
+            p.requires_grad = True
+        for p in model.pose_attn.parameters():
+            p.requires_grad = True
+        if model.multiclass:
+            for p in model.beholder_pose_encoder.parameters():
+                p.requires_grad = True
+        for p in model.flow_encoder.parameters():
+            p.requires_grad = True 
+        for p in model.fusion.parameters():
+            p.requires_grad = True
+        for p in model.output_head.parameters():
+            p.requires_grad = True
+        for p in model.tcn_blocks.parameters():
+            p.requires_grad = True
+    elif phase == 8:
+        # Unfreeze flow encoder, embedding encoders, fusion + output head + TCN backbone
+        print("Unfreezing flow encoder, embedding encoders, fusion + output head + TCN backbone")
+        for p in model.emb_encoder.parameters():
+            p.requires_grad = True
+        for p in model.emb_attn.parameters():
+            p.requires_grad = True
+        if model.multiclass:
+            for p in model.beholder_emb_encoder.parameters():
+                p.requires_grad = True
+        for p in model.flow_encoder.parameters():
+            p.requires_grad = True 
+        for p in model.fusion.parameters():
+            p.requires_grad = True
+        for p in model.output_head.parameters():
+            p.requires_grad = True
+        for p in model.tcn_blocks.parameters():
+            p.requires_grad = True
+    elif phase == 9:
+        if fill_with_noise:
+            print("Filling fusion + output head + TCN backbone with noise for phase 9")
+            for p in model.fusion.parameters():
+                p.data = torch.randn_like(p.data) * 0.01
+            for p in model.output_head.parameters():
+                p.data = torch.randn_like(p.data) * 0.01
+            for p in model.tcn_blocks.parameters():
+                p.data = torch.randn_like(p.data) * 0.01
 
+        # Unfreeze fusion + output head + TCN backbone
+        print("Unfreezing fusion + output head + TCN backbone")
+        for p in model.fusion.parameters():
+            p.requires_grad = True
+        for p in model.output_head.parameters():
+            p.requires_grad = True
+        for p in model.tcn_blocks.parameters():
+            p.requires_grad = True
+    elif phase == 10:
+        # Unfreeze pose encoders only
+        print("Unfreezing pose encoders only")
+        for p in model.pose_encoder.parameters():
+            p.requires_grad = True
+        for p in model.pose_attn.parameters():
+            p.requires_grad = True
+        if model.multiclass:
+            for p in model.beholder_pose_encoder.parameters():
+                p.requires_grad = True
+    elif phase == 11:
+        # Unfreeze fusion + output head + TCN backbone
+        print("Unfreezing fusion + output head + TCN backbone")
+        for p in model.fusion.parameters():
+            p.requires_grad = True
+        for p in model.output_head.parameters():
+            p.requires_grad = True
+        for p in model.tcn_blocks.parameters():
+            p.requires_grad = True
+    elif phase == 12:
+        print("Phase 12: all trainable (but do it at a low lr)")
+        pass  # all trainable
+    else:
+        raise ValueError(f"Invalid phase: {phase}. Must be 1-12.")
 
-def _build_optimizer_param_groups(
-    model: FunscriptTCN,
-    base_lr: float,
-    weight_decay: float,
-    pose_lr_scale: float,
-    embedding_lr_scale: float,
-    flow_lr_scale: float,
-    aux_lr_scale: float,
-    shared_lr_scale: float,
-) -> list[dict[str, object]]:
-    param_groups: list[dict[str, object]] = []
-    assigned_param_ids: set[int] = set()
-
-    def add_group(name: str, modules: list[nn.Module | None], lr_scale: float) -> None:
-        params: list[nn.Parameter] = []
-        for module in modules:
-            if module is None:
-                continue
-            for param in module.parameters():
-                if not param.requires_grad or id(param) in assigned_param_ids:
-                    continue
-                params.append(param)
-                assigned_param_ids.add(id(param))
-        if params:
-            param_groups.append({
-                "name": name,
-                "params": params,
-                "lr": base_lr * lr_scale,
-                "weight_decay": weight_decay,
-            })
-
-    pose_modules: list[nn.Module | None] = [model.pose_encoder, model.pose_attn]
-    if model.multiclass:
-        pose_modules.append(model.beholder_pose_encoder)
-    add_group("pose", pose_modules, pose_lr_scale)
-
-    embedding_modules: list[nn.Module | None] = [model.emb_encoder, model.emb_attn]
-    if model.multiclass:
-        embedding_modules.append(model.beholder_emb_encoder)
-    add_group("embedding", embedding_modules, embedding_lr_scale)
-
-    add_group("flow", [model.flow_encoder], flow_lr_scale)
-
-    aux_modules: list[nn.Module | None] = []
-    if getattr(model, "use_kinematics", False):
-        aux_modules.extend([getattr(model, "kin_encoder", None), getattr(model, "kin_attn", None)])
-    if getattr(model, "use_difference_pathway", False):
-        aux_modules.append(getattr(model, "difference_encoder", None))
-    add_group("aux", aux_modules, aux_lr_scale)
-
-    add_group("shared", [model.fusion, model.tcn_blocks, model.output_head], shared_lr_scale)
-
-    remaining_params = [
-        param for param in model.parameters()
-        if param.requires_grad and id(param) not in assigned_param_ids
-    ]
-    if remaining_params:
-        log.warning("Assigning %d ungrouped parameters to optimizer fallback group", len(remaining_params))
-        param_groups.append({
-            "name": "remaining",
-            "params": remaining_params,
-            "lr": base_lr * shared_lr_scale,
-            "weight_decay": weight_decay,
-        })
-
-    return param_groups
-
-
-def _normalize_modality_shares(shares: dict[str, float]) -> dict[str, float]:
-    raw = {name: max(float(shares.get(name, 0.0)), 0.0) for name in MODALITY_NAMES}
-    total = sum(raw.values())
-    if total <= 0.0:
-        return {name: 0.0 for name in MODALITY_NAMES}
-    return {name: value / total for name, value in raw.items()}
-
-
-def _apply_live_lr_scales(
-    optimizer: torch.optim.Optimizer,
-    scheduler: torch.optim.lr_scheduler.LRScheduler | torch.optim.lr_scheduler.ReduceLROnPlateau,
-    base_lr: float,
-    live_lr_scales: dict[str, float],
-) -> None:
-    for group_index, param_group in enumerate(optimizer.param_groups):
-        group_name = str(param_group.get("name", "group"))
-        if group_name not in live_lr_scales:
-            continue
-
-        new_lr = base_lr * live_lr_scales[group_name]
-        param_group["lr"] = new_lr
-        param_group["initial_lr"] = new_lr
-
-        if hasattr(scheduler, "base_lrs") and group_index < len(scheduler.base_lrs):
-            scheduler.base_lrs[group_index] = new_lr
-        if hasattr(scheduler, "max_lrs") and group_index < len(scheduler.max_lrs):
-            scheduler.max_lrs[group_index] = max(new_lr, 1e-12)
-
-
-def _refresh_optimization_config(
-    optimization_config: dict[str, object],
-    live_lr_scales: dict[str, float],
-    modality_dropout: ModalityDropoutConfig,
-    last_action: dict[str, object] | None,
-) -> None:
-    optimization_config["current_lr_scales"] = dict(live_lr_scales)
-    optimization_config["modality_dropout"] = {
-        "pose_prob": modality_dropout.pose_prob,
-        "embedding_prob": modality_dropout.embedding_prob,
-        "flow_prob": modality_dropout.flow_prob,
-        "scale_with_augment": modality_dropout.scale_with_augment,
-    }
-    optimization_config["last_dominance_action"] = last_action
-
-
-def _collect_gradient_group_stats(
-    optimizer: torch.optim.Optimizer,
-) -> tuple[dict[str, float], dict[str, float]]:
-    grad_sq_sums: dict[str, float] = {}
-    total_sq = 0.0
-
-    for group in optimizer.param_groups:
-        group_name = str(group.get("name", "group"))
-        group_sq = 0.0
-        for param in group["params"]:
-            if param.grad is None:
-                continue
-            grad = param.grad.detach()
-            group_sq += float(torch.sum(grad * grad).item())
-        grad_sq_sums[group_name] = group_sq
-        total_sq += group_sq
-
-    grad_norms = {name: value ** 0.5 for name, value in grad_sq_sums.items()}
-    grad_shares = {
-        name: (value / total_sq if total_sq > 0.0 else 0.0)
-        for name, value in grad_sq_sums.items()
-    }
-    return grad_norms, grad_shares
-
-
-def _run_validation_epoch(
-    model: FunscriptTCN,
-    data_loader: DataLoader,
-    device: torch.device,
-    loss_config: LossConfig,
-    modality_mask: ModalityMask | None = None,
-    max_batches: int | None = None,
-) -> tuple[float, dict[str, float], float, float]:
-    model.eval()
-    losses: list[float] = []
-    pred_means: list[float] = []
-    pred_stds: list[float] = []
-    metric_history = _init_metric_history()
-
-    with torch.no_grad():
-        for batch_index, batch in enumerate(data_loader):
-            if max_batches is not None and batch_index >= max_batches:
-                break
-
-            kp = batch["keypoints"].to(device, non_blocking=True)
-            emb = batch["embeddings"].to(device, non_blocking=True)
-            fl = batch["flow"].to(device, non_blocking=True)
-            lbl = batch["labels"].to(device, non_blocking=True)
-
-            if modality_mask is not None:
-                kp, emb, fl = _apply_modality_mask(kp, emb, fl, modality_mask)
-
-            with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
-                pred, loss, metric_batch, _ = _compute_batch_loss(
-                    model,
-                    kp,
-                    emb,
-                    fl,
-                    lbl,
-                    loss_config,
-                )
-
-            losses.append(float(loss.item()))
-            for key in metric_history:
-                metric_history[key].append(float(metric_batch[key].item()))
-            pred_means.append(float(pred.mean().item()))
-            pred_stds.append(float(pred.std().item()))
-
-    avg_loss = float(np.mean(losses)) if losses else float("inf")
-    avg_metrics = {
-        key: (float(np.mean(values)) if values else float("nan"))
-        for key, values in metric_history.items()
-    }
-    avg_pred_mean = float(np.mean(pred_means)) if pred_means else float("nan")
-    avg_pred_std = float(np.mean(pred_stds)) if pred_stds else float("nan")
-    return avg_loss, avg_metrics, avg_pred_mean, avg_pred_std
-
-
-def _estimate_modality_reliance(
-    model: FunscriptTCN,
-    data_loader: DataLoader,
-    device: torch.device,
-    loss_config: LossConfig,
-    max_batches: int,
-) -> tuple[float, dict[str, float], dict[str, float], dict[str, float]]:
-    baseline_loss, _, _, _ = _run_validation_epoch(
-        model,
-        data_loader,
-        device,
-        loss_config,
-        max_batches=max_batches,
-    )
-    ablated_losses: dict[str, float] = {}
-    reliance_delta: dict[str, float] = {}
-    modality_masks = {
-        "pose": ModalityMask(drop_pose=True),
-        "embedding": ModalityMask(drop_embedding=True),
-        "flow": ModalityMask(drop_flow=True),
-    }
-    for name, mask in modality_masks.items():
-        ablated_loss, _, _, _ = _run_validation_epoch(
-            model,
-            data_loader,
-            device,
-            loss_config,
-            modality_mask=mask,
-            max_batches=max_batches,
-        )
-        ablated_losses[name] = ablated_loss
-        reliance_delta[name] = ablated_loss - baseline_loss
-
-    positive_delta = {name: max(delta, 0.0) for name, delta in reliance_delta.items()}
-    total_positive = sum(positive_delta.values())
-    reliance_share = {
-        name: (value / total_positive if total_positive > 0.0 else 0.0)
-        for name, value in positive_delta.items()
-    }
-    return baseline_loss, ablated_losses, reliance_delta, reliance_share
-
-
-def _select_dominant_modality(
-    normalized_gradient_share: dict[str, float],
-    reliance_delta: dict[str, float],
-    reliance_share: dict[str, float],
-    control_config: DominanceControlConfig,
-) -> tuple[str | None, dict[str, float], str]:
-    combined_scores = {
-        name: ((1.0 - control_config.gradient_weight) * reliance_share.get(name, 0.0)
-               + control_config.gradient_weight * normalized_gradient_share.get(name, 0.0))
-        for name in MODALITY_NAMES
-    }
-    dominant_modality = max(combined_scores, key=combined_scores.get)
-    dominant_delta = reliance_delta.get(dominant_modality, 0.0)
-    dominant_score = combined_scores[dominant_modality]
-
-    if dominant_delta < control_config.min_reliance_delta:
-        return None, combined_scores, (
-            f"dominant delta {dominant_delta:.6f} is below min_reliance_delta={control_config.min_reliance_delta:.6f}"
-        )
-    if dominant_score < control_config.dominance_threshold:
-        return None, combined_scores, (
-            f"dominant score {dominant_score:.3f} is below dominance_threshold={control_config.dominance_threshold:.3f}"
-        )
-    return dominant_modality, combined_scores, "ok"
-
-
-def _apply_dominance_response(
-    dominant_modality: str,
-    control_config: DominanceControlConfig,
-    train_ds: MotionDataset,
-    optimizer: torch.optim.Optimizer,
-    scheduler: torch.optim.lr_scheduler.LRScheduler | torch.optim.lr_scheduler.ReduceLROnPlateau,
-    base_lr: float,
-    live_lr_scales: dict[str, float],
-) -> dict[str, object]:
-    action: dict[str, object] = {
-        "mode": control_config.response,
-        "dominant_modality": dominant_modality,
-        "lr_scale_change": None,
-        "dropout_change": None,
-    }
-
-    if control_config.response in {"lr", "both"} and dominant_modality in live_lr_scales:
-        old_scale = live_lr_scales[dominant_modality]
-        new_scale = max(control_config.min_lr_scale, old_scale * control_config.lr_decay)
-        if new_scale < old_scale:
-            live_lr_scales[dominant_modality] = new_scale
-            _apply_live_lr_scales(optimizer, scheduler, base_lr, live_lr_scales)
-            action["lr_scale_change"] = {
-                "old": old_scale,
-                "new": new_scale,
-            }
-
-    if control_config.response in {"dropout", "both"}:
-        field_name = _dropout_field_name(dominant_modality)
-        old_prob = float(getattr(train_ds.modality_dropout, field_name))
-        new_prob = min(control_config.max_dropout_prob, old_prob + control_config.dropout_increase)
-        if new_prob > old_prob:
-            train_ds.modality_dropout = replace(train_ds.modality_dropout, **{field_name: new_prob})
-            action["dropout_change"] = {
-                "old": old_prob,
-                "new": new_prob,
-            }
-
-    return action
+    log.info("Phase %d freezing applied", phase)
 
 
 # ---------------------------------------------------------------------------
@@ -799,16 +565,6 @@ def train() -> None:
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=0.01)
-    parser.add_argument("--pose-lr-scale", type=float, default=1.0,
-                        help="Learning-rate multiplier for pose/keypoint branches")
-    parser.add_argument("--embedding-lr-scale", type=float, default=1.0,
-                        help="Learning-rate multiplier for embedding branches")
-    parser.add_argument("--flow-lr-scale", type=float, default=1.0,
-                        help="Learning-rate multiplier for flow branch")
-    parser.add_argument("--aux-lr-scale", type=float, default=1.0,
-                        help="Learning-rate multiplier for auxiliary branches such as kinematics")
-    parser.add_argument("--shared-lr-scale", type=float, default=1.0,
-                        help="Learning-rate multiplier for fusion, TCN blocks, and output head")
     parser.add_argument("--seq-len", type=int, default=120)
     parser.add_argument("--stride", type=int, default=60)
     parser.add_argument("--d-model", type=int, default=256)
@@ -852,41 +608,12 @@ def train() -> None:
                         help="Power applied to derivative-based event weighting")
     parser.add_argument("--active-quantile", type=float, default=0.8,
                         help="Quantile threshold used when reporting active-frame metrics")
-    parser.add_argument("--modality-dropout-prob", type=float, default=0.0,
-                        help="Base independent dropout probability for each modality during training")
-    parser.add_argument("--pose-dropout-prob", type=float, default=None,
-                        help="Override dropout probability for pose/keypoint inputs")
-    parser.add_argument("--embedding-dropout-prob", type=float, default=None,
-                        help="Override dropout probability for embedding inputs")
-    parser.add_argument("--flow-dropout-prob", type=float, default=None,
-                        help="Override dropout probability for flow inputs")
-    parser.add_argument("--scale-modality-dropout-with-augment", action="store_true", default=False,
-                        help="Increase modality dropout when the validation/train loss gap grows")
-    parser.add_argument("--track-modality-dominance", action="store_true", default=False,
-                        help="Log per-branch gradient share and validation ablation deltas")
-    parser.add_argument("--dominance-eval-every", type=int, default=1,
-                        help="Run validation ablations every N epochs when tracking modality dominance")
-    parser.add_argument("--dominance-max-batches", type=int, default=4,
-                        help="Use this many validation batches for each dominance-ablation pass")
-    parser.add_argument("--dominance-response", type=str, default="none",
-                        choices=["none", "lr", "dropout", "both"],
-                        help="How to react online when a modality dominates")
-    parser.add_argument("--dominance-threshold", type=float, default=0.55,
-                        help="Minimum combined dominance score required before applying an online response")
-    parser.add_argument("--dominance-min-delta", type=float, default=1e-4,
-                        help="Minimum positive validation ablation delta before a modality can be treated as dominant")
-    parser.add_argument("--dominance-gradient-weight", type=float, default=0.3,
-                        help="Weight given to normalized gradient share when scoring modality dominance")
-    parser.add_argument("--dominance-lr-decay", type=float, default=0.8,
-                        help="Multiply the dominant modality LR scale by this factor when dominance-response includes lr")
-    parser.add_argument("--dominance-min-lr-scale", type=float, default=0.1,
-                        help="Lower bound for live modality LR scale when dominance-response includes lr")
-    parser.add_argument("--dominance-dropout-step", type=float, default=0.05,
-                        help="Increase the dominant modality dropout probability by this amount when dominance-response includes dropout")
-    parser.add_argument("--dominance-max-dropout", type=float, default=0.5,
-                        help="Upper bound for live modality dropout probability when dominance-response includes dropout")
+    parser.add_argument("--phase", type=int, default=None,
+                        help="Training phase (1-6) for multi-phase training")
+    parser.add_argument("--fill-with-noise", action="store_true", default=False,
+                        help="When resuming to a new phase, fill the newly unfrozen parts with noise instead of starting from the previous phase's weights")
     parser.add_argument("--resume", type=Path, default=None,
-                        help="Resume from checkpoint")
+                        help="Resume from checkpoint (for multi-phase training)")
     parser.add_argument("--early-stopping-patience", type=int, default=10,
                         help="Stop training if val loss has not improved for this many epochs (0 = disabled)")
     parser.add_argument("--load-best-val-loss", action="store_true", default=False,
@@ -897,48 +624,13 @@ def train() -> None:
     parser.add_argument("--flow-dense-size", type=int, default=32,
                         help="Spatial resolution for dense flow maps (default: 32)")
     args = parser.parse_args()
-    args.stride = max(1, min(args.stride, args.seq_len//2))  # Ensure stride is at least 1 and at most seq_len
+
     if not 0.0 <= args.event_weight <= 1.0:
         parser.error("--event-weight must be between 0 and 1")
     if not 0.0 < args.active_quantile <= 1.0:
         parser.error("--active-quantile must be in (0, 1]")
-    for arg_name, value in {
-        "--modality-dropout-prob": args.modality_dropout_prob,
-        "--pose-dropout-prob": args.pose_dropout_prob,
-        "--embedding-dropout-prob": args.embedding_dropout_prob,
-        "--flow-dropout-prob": args.flow_dropout_prob,
-    }.items():
-        if value is not None and not 0.0 <= value <= 1.0:
-            parser.error(f"{arg_name} must be between 0 and 1")
-    for arg_name, value in {
-        "--pose-lr-scale": args.pose_lr_scale,
-        "--embedding-lr-scale": args.embedding_lr_scale,
-        "--flow-lr-scale": args.flow_lr_scale,
-        "--aux-lr-scale": args.aux_lr_scale,
-        "--shared-lr-scale": args.shared_lr_scale,
-    }.items():
-        if value <= 0.0:
-            parser.error(f"{arg_name} must be greater than 0")
-    if args.dominance_eval_every <= 0:
-        parser.error("--dominance-eval-every must be greater than 0")
-    if args.dominance_max_batches <= 0:
-        parser.error("--dominance-max-batches must be greater than 0")
-    if not 0.0 <= args.dominance_threshold <= 1.0:
-        parser.error("--dominance-threshold must be between 0 and 1")
-    if args.dominance_min_delta < 0.0:
-        parser.error("--dominance-min-delta must be non-negative")
-    if not 0.0 <= args.dominance_gradient_weight <= 1.0:
-        parser.error("--dominance-gradient-weight must be between 0 and 1")
-    if not 0.0 < args.dominance_lr_decay <= 1.0:
-        parser.error("--dominance-lr-decay must be in (0, 1]")
-    if args.dominance_min_lr_scale <= 0.0:
-        parser.error("--dominance-min-lr-scale must be greater than 0")
-    if args.dominance_max_dropout < 0.0 or args.dominance_max_dropout > 1.0:
-        parser.error("--dominance-max-dropout must be between 0 and 1")
-    if args.dominance_dropout_step < 0.0:
-        parser.error("--dominance-dropout-step must be non-negative")
-    if args.scheduler == "OneCycleLR" and args.dominance_response in {"lr", "both"}:
-        parser.error("--dominance-response lr/both is not supported with OneCycleLR; use dropout/none or change scheduler")
+    if args.early_stopping_patience < 5:
+        args.early_stopping_patience = max(args.early_stopping_patience, 5)
 
     logging.basicConfig(
         level=logging.INFO,
@@ -955,64 +647,15 @@ def train() -> None:
     # Reproducibility
     torch.manual_seed(args.seed)
     if device.type == "cuda":
-        log.info("Setting CUDA seeds for reproducibility (seed=%d)", args.seed)
+        print("Setting CUDA seeds for reproducibility")
         torch.cuda.manual_seed_all(args.seed)
-
-    loss_config = LossConfig(
-        event_weight=args.event_weight,
-        event_activity_gain=args.event_activity_gain,
-        event_activity_power=args.event_activity_power,
-        active_quantile=args.active_quantile,
-        temporal_weight=args.temporal_weight,
-        velocity_weight=args.velocity_weight,
-        spectral_weight=args.spectral_weight,
-        spectral_kernel=args.spectral_kernel,
-    )
-    modality_dropout_config = ModalityDropoutConfig(
-        pose_prob=_resolve_probability(args.pose_dropout_prob, args.modality_dropout_prob),
-        embedding_prob=_resolve_probability(args.embedding_dropout_prob, args.modality_dropout_prob),
-        flow_prob=_resolve_probability(args.flow_dropout_prob, args.modality_dropout_prob),
-        scale_with_augment=args.scale_modality_dropout_with_augment,
-    )
-    dominance_control = DominanceControlConfig(
-        response=args.dominance_response,
-        dominance_threshold=args.dominance_threshold,
-        min_reliance_delta=args.dominance_min_delta,
-        gradient_weight=args.dominance_gradient_weight,
-        lr_decay=args.dominance_lr_decay,
-        min_lr_scale=args.dominance_min_lr_scale,
-        dropout_increase=args.dominance_dropout_step,
-        max_dropout_prob=args.dominance_max_dropout,
-    )
-    track_modality_dominance = args.track_modality_dominance or dominance_control.enabled()
-    if modality_dropout_config.is_enabled():
-        log.info(
-            "Modality dropout enabled: pose=%.3f embedding=%.3f flow=%.3f%s",
-            modality_dropout_config.pose_prob,
-            modality_dropout_config.embedding_prob,
-            modality_dropout_config.flow_prob,
-            " (scaled by val/train gap)" if modality_dropout_config.scale_with_augment else "",
-        )
-    else:
-        log.info("Modality dropout disabled")
-    if dominance_control.enabled():
-        log.info(
-            "Dominance controller enabled: response=%s threshold=%.3f min_delta=%.6f gradient_weight=%.2f",
-            dominance_control.response,
-            dominance_control.dominance_threshold,
-            dominance_control.min_reliance_delta,
-            dominance_control.gradient_weight,
-        )
-    elif track_modality_dominance:
-        log.info("Dominance tracking enabled in observe-only mode")
 
     # ── Datasets ──────────────────────────────────────────────────────────
     n_total = (args.n_partners + args.n_beholders) if args.multiclass else 10
 
     train_ds = MotionDataset(
         args.data_dir, "train", args.seq_len, args.stride,
-        n_persons=n_total, augment=True, multiclass=args.multiclass,
-        modality_dropout=modality_dropout_config,
+        n_persons=n_total, augment=True, multiclass=args.multiclass, phase=args.phase,
         flow_mode=args.flow_mode, flow_dense_size=args.flow_dense_size,
     )
     val_ds = MotionDataset(
@@ -1075,7 +718,7 @@ def train() -> None:
     #     ckpt = torch.load(checkpoint, map_location=device, weights_only=False)
     #     model.load_state_dict(ckpt["model_state_dict"])
 
-    # Resume from checkpoint
+    # Resume from checkpoint (for multi-phase training)
     if args.resume is not None:
         log.info("Resuming from checkpoint: %s", args.resume)
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
@@ -1087,34 +730,21 @@ def train() -> None:
     log.info("Model: %s trainable / %s total parameters",
              f"{params['trainable']:,}", f"{params['total']:,}")
 
+    # ── Phase-specific freezing ───────────────────────────────────────────
+    if args.phase is not None:
+        _apply_phase_freezing(model, args.phase, args.fill_with_noise)
+        params = model.count_parameters()
+        log.info("Phase %d: %s trainable / %s total parameters",
+                 args.phase, f"{params['trainable']:,}", f"{params['total']:,}")
+
     # ── Optimizer / Scheduler ─────────────────────────────────────────────
     optimizer = torch.optim.AdamW(
-        _build_optimizer_param_groups(
-            model,
-            base_lr=args.lr,
-            weight_decay=args.weight_decay,
-            pose_lr_scale=args.pose_lr_scale,
-            embedding_lr_scale=args.embedding_lr_scale,
-            flow_lr_scale=args.flow_lr_scale,
-            aux_lr_scale=args.aux_lr_scale,
-            shared_lr_scale=args.shared_lr_scale,
-        ),
-    )
-    live_lr_scales = {
-        "pose": args.pose_lr_scale,
-        "embedding": args.embedding_lr_scale,
-        "flow": args.flow_lr_scale,
-        "aux": args.aux_lr_scale,
-        "shared": args.shared_lr_scale,
-    }
-    log.info(
-        "Optimizer groups: %s",
-        ", ".join(f"{group['name']}={group['lr']:.2e}" for group in optimizer.param_groups),
+        model.parameters(), lr=args.lr, weight_decay=args.weight_decay,
     )
     if args.scheduler == "OneCycleLR":
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer,
-            max_lr=[group["lr"] for group in optimizer.param_groups],
+            max_lr=args.lr,
             epochs=args.epochs,
             steps_per_epoch=len(train_loader),
             pct_start=0.1,
@@ -1142,8 +772,6 @@ def train() -> None:
     else:
         raise ValueError(f"Unsupported scheduler: {args.scheduler}")
 
-    _apply_live_lr_scales(optimizer, scheduler, args.lr, live_lr_scales)
-
 
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
 
@@ -1151,6 +779,88 @@ def train() -> None:
     #     optimizer.load_state_dict(ckpt["optimizer_state_dict"])
     #     scheduler.load_state_dict(ckpt["scheduler_state_dict"])
     #     log.info("Loaded optimizer and scheduler state from checkpoint")
+
+    best_val_loss = float("inf")
+    # if args.resume is not None:
+    #     # if "optimizer_state_dict" in ckpt and "scheduler_state_dict" in ckpt:
+    #     #     optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+    #     #     #scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+    #     #     log.info("Loaded optimizer and scheduler state from checkpoint")
+    #     #     if args.lr is not None:
+    #     #         # If resuming but a new lr is specified, override the loaded scheduler state to use the new lr
+    #     #         for param_group in optimizer.param_groups:
+    #     #             param_group["lr"] = args.lr
+    #     #         log.info("Overriding loaded learning rate with new value: %s", args.lr)
+    #     # else:
+    #     #     log.warning("No optimizer/scheduler state found in checkpoint — starting with fresh optimizer/scheduler")
+    #     if "val_loss" in ckpt and args.load_best_val_loss:
+    #         best_val_loss = ckpt["val_loss"]
+    #         log.info("Resuming with best_val_loss = %.6f", best_val_loss)
+    #     else:
+    #         # run an initial validation loop to get the current val loss for early stopping
+    #         log.info("No val_loss found in checkpoint — running initial validation to get baseline val loss for early stopping")
+    #         # --- Validate ---
+    #         model.eval()
+    #         val_losses = []
+    #         val_pred_means = []
+    #         val_pred_stds = []
+    #         val_metric_history = {
+    #             "pos_mse": [],
+    #             "event_mse": [],
+    #             "active_mse": [],
+    #             "vel_mse": [],
+    #             "vel_mae": [],
+    #             "acc_mse": [],
+    #             "acc_mae": [],
+    #             "spec_mse": [],
+    #         }
+
+    #         with torch.no_grad():
+    #             for batch in val_loader:
+    #                 kp = batch["keypoints"].to(device, non_blocking=True)
+    #                 emb = batch["embeddings"].to(device, non_blocking=True)
+    #                 fl = batch["flow"].to(device, non_blocking=True)
+    #                 lbl = batch["labels"].to(device, non_blocking=True)
+
+    #                 with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
+    #                     pred = model(kp, emb, fl)
+    #                     metric_batch = compute_regression_metrics(
+    #                         pred,
+    #                         lbl,
+    #                         spectral_kernel=args.spectral_kernel,
+    #                         activity_gain=args.event_activity_gain,
+    #                         activity_power=args.event_activity_power,
+    #                         active_quantile=args.active_quantile,
+    #                     )
+    #                     pos_loss = ((1.0 - args.event_weight) * metric_batch["pos_mse"]
+    #                                 + args.event_weight * metric_batch["event_mse"])
+    #                     temp_loss = metric_batch["acc_mse"]
+    #                     vel_loss = metric_batch["vel_mse"]
+    #                     spec_loss = metric_batch["spec_mse"]
+
+    #                     loss = (pos_loss
+    #                             + args.temporal_weight * temp_loss
+    #                             + args.velocity_weight * vel_loss
+    #                             + args.spectral_weight * spec_loss)
+
+    #                 val_losses.append(loss.item())
+    #                 for key in val_metric_history:
+    #                     val_metric_history[key].append(metric_batch[key].item())
+    #                 val_pred_means.append(pred.mean().item())
+    #                 val_pred_stds.append(pred.std().item())
+
+    #         avg_val = np.mean(val_losses)
+    #         avg_val_metrics = {key: float(np.mean(values)) for key, values in val_metric_history.items()}
+    #         avg_pred_mean = np.mean(val_pred_means)
+    #         avg_pred_std = np.mean(val_pred_stds)
+    #         log.info("Initial validation loss: %.6f", avg_val)
+    #         log.info("Initial validation metrics: %s", ", ".join(f"{k}={v:.6f}" for k, v in avg_val_metrics.items()))
+    #         log.info("Initial validation prediction mean: %.6f, std: %.6f", avg_pred_mean, avg_pred_std)
+    #         best_val_loss = avg_val
+
+
+    for param_group in optimizer.param_groups:
+        param_group["lr"] = args.lr
     # ── Logging / Checkpoints ─────────────────────────────────────────────
     run_name = f"tcn_{int(time.time())}"
     run_dir = Path("runs") / run_name
@@ -1196,44 +906,15 @@ def train() -> None:
         "stats_path": str(train_ds.stats_path) if train_ds.stats_path is not None else None,
     }
     metric_config = {
-        "event_weight": loss_config.event_weight,
-        "event_activity_gain": loss_config.event_activity_gain,
-        "event_activity_power": loss_config.event_activity_power,
-        "active_quantile": loss_config.active_quantile,
-        "temporal_weight": loss_config.temporal_weight,
-        "velocity_weight": loss_config.velocity_weight,
-        "spectral_weight": loss_config.spectral_weight,
-        "spectral_kernel": loss_config.spectral_kernel,
+        "event_weight": args.event_weight,
+        "event_activity_gain": args.event_activity_gain,
+        "event_activity_power": args.event_activity_power,
+        "active_quantile": args.active_quantile,
+        "temporal_weight": args.temporal_weight,
+        "velocity_weight": args.velocity_weight,
+        "spectral_weight": args.spectral_weight,
+        "spectral_kernel": args.spectral_kernel,
     }
-    optimization_config = {
-        "lr": args.lr,
-        "weight_decay": args.weight_decay,
-        "scheduler": args.scheduler,
-        "pose_lr_scale": args.pose_lr_scale,
-        "embedding_lr_scale": args.embedding_lr_scale,
-        "flow_lr_scale": args.flow_lr_scale,
-        "aux_lr_scale": args.aux_lr_scale,
-        "shared_lr_scale": args.shared_lr_scale,
-        "modality_dropout": {
-            "pose_prob": modality_dropout_config.pose_prob,
-            "embedding_prob": modality_dropout_config.embedding_prob,
-            "flow_prob": modality_dropout_config.flow_prob,
-            "scale_with_augment": modality_dropout_config.scale_with_augment,
-        },
-        "track_modality_dominance": track_modality_dominance,
-        "dominance_eval_every": args.dominance_eval_every,
-        "dominance_max_batches": args.dominance_max_batches,
-        "dominance_response": dominance_control.response,
-        "dominance_threshold": dominance_control.dominance_threshold,
-        "dominance_min_delta": dominance_control.min_reliance_delta,
-        "dominance_gradient_weight": dominance_control.gradient_weight,
-        "dominance_lr_decay": dominance_control.lr_decay,
-        "dominance_min_lr_scale": dominance_control.min_lr_scale,
-        "dominance_dropout_step": dominance_control.dropout_increase,
-        "dominance_max_dropout": dominance_control.max_dropout_prob,
-    }
-    last_dominance_action: dict[str, object] | None = None
-    _refresh_optimization_config(optimization_config, live_lr_scales, train_ds.modality_dropout, last_dominance_action)
 
     log.info("Run dir: %s", run_dir)
     log.info("Checkpoint dir: %s", checkpoint_dir)
@@ -1241,51 +922,31 @@ def train() -> None:
     # ── Training loop ─────────────────────────────────────────────────────
     global_step = 0
     _early_stop_counter = 0
-
-
-
-
-    best_val_loss = float("inf")
-    if args.resume is not None:
-        if "val_loss" in ckpt and args.load_best_val_loss:
-            best_val_loss = ckpt["val_loss"]
-            log.info("Resuming with best_val_loss = %.6f", best_val_loss)
-        else:
-            log.info("No val_loss found in checkpoint — running initial validation to get baseline val loss for early stopping")
-            avg_val, avg_val_metrics, avg_pred_mean, avg_pred_std = _run_validation_epoch(
-                model,
-                val_loader,
-                device,
-                loss_config,
-            )
-            log.info("Initial validation loss: %.6f", avg_val)
-            log.info("Initial validation metrics: %s", ", ".join(f"{k}={v:.6f}" for k, v in avg_val_metrics.items()))
-            log.info("Initial validation prediction mean: %.6f, std: %.6f", avg_pred_mean, avg_pred_std)
-            best_val_loss = avg_val
-
-
-
-
-
-
-
-
-
-
-
-
     original_best_val_loss = best_val_loss
     improved = False
 
-    for epoch in range(1, args.epochs + 1):
+    #for epoch in range(1, args.epochs + 1):
+    epoch = 0
+    epochs = args.epochs
+    overtime = False
+
+    while epoch <= epochs:
+        epoch += 1 
         epoch_start = time.time()
 
         # --- Train ---
         model.train()
         train_losses = []
-        train_metric_history = _init_metric_history()
-        grad_share_history = {str(group.get("name", "group")): [] for group in optimizer.param_groups}
-        grad_norm_history = {str(group.get("name", "group")): [] for group in optimizer.param_groups}
+        train_metric_history = {
+            "pos_mse": [],
+            "event_mse": [],
+            "active_mse": [],
+            "vel_mse": [],
+            "vel_mae": [],
+            "acc_mse": [],
+            "acc_mae": [],
+            "spec_mse": [],
+        }
 
         for batch in train_loader:
             kp = batch["keypoints"].to(device, non_blocking=True)
@@ -1296,23 +957,28 @@ def train() -> None:
             optimizer.zero_grad(set_to_none=True)
 
             with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
-                pred, loss, metric_batch, loss_terms = _compute_batch_loss(
-                    model,
-                    kp,
-                    emb,
-                    fl,
+                pred = model(kp, emb, fl)  # [B, T]
+                metric_batch = compute_regression_metrics(
+                    pred,
                     lbl,
-                    loss_config,
+                    spectral_kernel=args.spectral_kernel,
+                    activity_gain=args.event_activity_gain,
+                    activity_power=args.event_activity_power,
+                    active_quantile=args.active_quantile,
                 )
+                pos_loss = ((1.0 - args.event_weight) * metric_batch["pos_mse"]
+                            + args.event_weight * metric_batch["event_mse"])
+                temp_loss = metric_batch["acc_mse"]
+                vel_loss = metric_batch["vel_mse"]
+                spec_loss = metric_batch["spec_mse"]
+
+                loss = (pos_loss
+                        + args.temporal_weight * temp_loss
+                        + args.velocity_weight * vel_loss
+                        + args.spectral_weight * spec_loss)
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            if track_modality_dominance:
-                batch_grad_norms, batch_grad_shares = _collect_gradient_group_stats(optimizer)
-                for name, value in batch_grad_norms.items():
-                    grad_norm_history[name].append(value)
-                for name, value in batch_grad_shares.items():
-                    grad_share_history[name].append(value)
             grad_norm = nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             scaler.step(optimizer)
             scaler.update()
@@ -1326,31 +992,91 @@ def train() -> None:
 
             if global_step % 50 == 0:
                 writer.add_scalar("train/loss", loss.item(), global_step)
-                writer.add_scalar("train/pos_loss", loss_terms["pos_loss"].item(), global_step)
+                writer.add_scalar("train/pos_loss", pos_loss.item(), global_step)
                 writer.add_scalar("train/pos_mse", metric_batch["pos_mse"].item(), global_step)
                 writer.add_scalar("train/event_mse", metric_batch["event_mse"].item(), global_step)
                 writer.add_scalar("train/active_mse", metric_batch["active_mse"].item(), global_step)
                 writer.add_scalar("train/vel_mae", metric_batch["vel_mae"].item(), global_step)
                 writer.add_scalar("train/acc_mae", metric_batch["acc_mae"].item(), global_step)
-                writer.add_scalar("train/temp_loss", loss_terms["temp_loss"].item(), global_step)
-                writer.add_scalar("train/vel_loss", loss_terms["vel_loss"].item(), global_step)
-                writer.add_scalar("train/spec_loss", loss_terms["spec_loss"].item(), global_step)
+                writer.add_scalar("train/temp_loss", temp_loss.item(), global_step)
+                writer.add_scalar("train/vel_loss", vel_loss.item(), global_step)
+                writer.add_scalar("train/spec_loss", spec_loss.item(), global_step)
                 writer.add_scalar("train/pred_mean", pred.mean().item(), global_step)
                 writer.add_scalar("train/pred_std", pred.std().item(), global_step)
                 writer.add_scalar("train/grad_norm", grad_norm.item(), global_step)
-                for param_group in optimizer.param_groups:
-                    writer.add_scalar(f"lr/{param_group['name']}", param_group["lr"], global_step)
+                writer.add_scalar("lr", optimizer.param_groups[0]["lr"], global_step)
 
         avg_train = np.mean(train_losses)
         avg_train_metrics = {key: float(np.mean(values)) for key, values in train_metric_history.items()}
 
         # --- Validate ---
-        avg_val, avg_val_metrics, avg_pred_mean, avg_pred_std = _run_validation_epoch(
-            model,
-            val_loader,
-            device,
-            loss_config,
-        )
+        model.eval()
+        val_losses = []
+        val_pred_means = []
+        val_pred_stds = []
+        val_metric_history = {
+            "pos_mse": [],
+            "event_mse": [],
+            "active_mse": [],
+            "vel_mse": [],
+            "vel_mae": [],
+            "acc_mse": [],
+            "acc_mae": [],
+            "spec_mse": [],
+        }
+        # check if it's the last epoch to set the flag for dataset to disable augmentations if needed
+        if epoch == args.epochs:
+            # reinit val loader with last_epoch=True to disable augmentations if dataset is designed that way
+            val_ds.last_epoch = True
+            del val_loader
+            val_loader = DataLoader(
+                val_ds,
+                batch_size=args.batch_size,
+                shuffle=False,
+                num_workers=args.num_workers,
+                pin_memory=(device.type == "cuda" or device.type == "cuda:0"),  # allow pinned memory for CUDA even if using a specific GPU
+                persistent_workers=args.num_workers > 0,
+            )
+            
+
+        with torch.no_grad():
+            for batch in val_loader:
+                kp = batch["keypoints"].to(device, non_blocking=True)
+                emb = batch["embeddings"].to(device, non_blocking=True)
+                fl = batch["flow"].to(device, non_blocking=True)
+                lbl = batch["labels"].to(device, non_blocking=True)
+
+                with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
+                    pred = model(kp, emb, fl)
+                    metric_batch = compute_regression_metrics(
+                        pred,
+                        lbl,
+                        spectral_kernel=args.spectral_kernel,
+                        activity_gain=args.event_activity_gain,
+                        activity_power=args.event_activity_power,
+                        active_quantile=args.active_quantile,
+                    )
+                    pos_loss = ((1.0 - args.event_weight) * metric_batch["pos_mse"]
+                                + args.event_weight * metric_batch["event_mse"])
+                    temp_loss = metric_batch["acc_mse"]
+                    vel_loss = metric_batch["vel_mse"]
+                    spec_loss = metric_batch["spec_mse"]
+
+                    loss = (pos_loss
+                            + args.temporal_weight * temp_loss
+                            + args.velocity_weight * vel_loss
+                            + args.spectral_weight * spec_loss)
+
+                val_losses.append(loss.item())
+                for key in val_metric_history:
+                    val_metric_history[key].append(metric_batch[key].item())
+                val_pred_means.append(pred.mean().item())
+                val_pred_stds.append(pred.std().item())
+
+        avg_val = np.mean(val_losses)
+        avg_val_metrics = {key: float(np.mean(values)) for key, values in val_metric_history.items()}
+        avg_pred_mean = np.mean(val_pred_means)
+        avg_pred_std = np.mean(val_pred_stds)
 
         epoch_time = time.time() - epoch_start
 
@@ -1376,106 +1102,11 @@ def train() -> None:
         writer.add_scalar("train/event_mse_epoch", avg_train_metrics["event_mse"], epoch)
         writer.add_scalar("train/active_mse_epoch", avg_train_metrics["active_mse"], epoch)
 
-        if modality_dropout_config.scale_with_augment:
-            augment_scale = _compute_augment_scale(avg_val, avg_train)
-            train_ds.augment_scale = augment_scale
-            writer.add_scalar("train/modality_dropout_scale", augment_scale, epoch)
-            log.info("  Modality dropout scale: %.3f (val/train ratio=%.3f)", augment_scale, avg_val / max(avg_train, 1e-9))
-        else:
-            train_ds.augment_scale = 0.0
-
-        if track_modality_dominance:
-            avg_grad_shares = {
-                name: float(np.mean(values)) if values else 0.0
-                for name, values in grad_share_history.items()
-            }
-            avg_grad_norms = {
-                name: float(np.mean(values)) if values else 0.0
-                for name, values in grad_norm_history.items()
-            }
-            for name, value in avg_grad_shares.items():
-                writer.add_scalar(f"train/grad_share/{name}", value, epoch)
-            for name, value in avg_grad_norms.items():
-                writer.add_scalar(f"train/grad_norm_group/{name}", value, epoch)
-            log.info(
-                "  Gradient share: %s",
-                ", ".join(f"{name}={value:.3f}" for name, value in avg_grad_shares.items()),
-            )
-
-            if epoch % args.dominance_eval_every == 0:
-                baseline_loss, ablated_losses, reliance_delta, reliance_share = _estimate_modality_reliance(
-                    model,
-                    val_loader,
-                    device,
-                    loss_config,
-                    max_batches=args.dominance_max_batches,
-                )
-                normalized_grad_shares = _normalize_modality_shares(avg_grad_shares)
-                dominant_modality, combined_scores, selection_reason = _select_dominant_modality(
-                    normalized_grad_shares,
-                    reliance_delta,
-                    reliance_share,
-                    dominance_control,
-                )
-                for name, value in reliance_delta.items():
-                    writer.add_scalar(f"val/modality_reliance_delta/{name}", value, epoch)
-                for name, value in reliance_share.items():
-                    writer.add_scalar(f"val/modality_reliance_share/{name}", value, epoch)
-                for name, value in normalized_grad_shares.items():
-                    writer.add_scalar(f"train/grad_share_modalities/{name}", value, epoch)
-                for name, value in combined_scores.items():
-                    writer.add_scalar(f"val/modality_combined_score/{name}", value, epoch)
-                log.info(
-                    "  Validation reliance: base=%.6f | %s | combined=%s | candidate=%s",
-                    baseline_loss,
-                    ", ".join(
-                        f"{name}=abl{ablated_losses[name]:.6f}/Δ{reliance_delta[name]:.6f}/share{reliance_share[name]:.3f}"
-                        for name in ("pose", "embedding", "flow")
-                    ),
-                    ", ".join(f"{name}={combined_scores[name]:.3f}" for name in MODALITY_NAMES),
-                    dominant_modality if dominant_modality is not None else "none",
-                )
-                if dominance_control.enabled() and dominant_modality is not None:
-                    last_dominance_action = _apply_dominance_response(
-                        dominant_modality,
-                        dominance_control,
-                        train_ds,
-                        optimizer,
-                        scheduler,
-                        args.lr,
-                        live_lr_scales,
-                    )
-                    lr_change = last_dominance_action.get("lr_scale_change")
-                    dropout_change = last_dominance_action.get("dropout_change")
-                    change_parts = []
-                    if lr_change is not None:
-                        change_parts.append(
-                            f"{dominant_modality}_lr_scale {lr_change['old']:.3f}->{lr_change['new']:.3f}"
-                        )
-                    if dropout_change is not None:
-                        change_parts.append(
-                            f"{dominant_modality}_dropout {dropout_change['old']:.3f}->{dropout_change['new']:.3f}"
-                        )
-                    log.info(
-                        "  Dominance response applied: %s",
-                        ", ".join(change_parts) if change_parts else "no-op (already at configured floor/cap)",
-                    )
-                elif dominance_control.enabled():
-                    last_dominance_action = {
-                        "mode": dominance_control.response,
-                        "dominant_modality": None,
-                        "reason": selection_reason,
-                    }
-                    log.info("  Dominance response skipped: %s", selection_reason)
-
-        _refresh_optimization_config(optimization_config, live_lr_scales, train_ds.modality_dropout, last_dominance_action)
-        for modality_name in MODALITY_NAMES:
-            writer.add_scalar(f"control/live_lr_scale/{modality_name}", live_lr_scales[modality_name], epoch)
-            writer.add_scalar(
-                f"control/live_dropout/{modality_name}",
-                getattr(train_ds.modality_dropout, _dropout_field_name(modality_name)),
-                epoch,
-            )
+        # Update augmentation scale based on val/train loss ratio
+        augment_scale = _compute_augment_scale(avg_val, avg_train)
+        train_ds.augment_scale = augment_scale
+        writer.add_scalar("train/augment_scale", augment_scale, epoch)
+        log.info("  Augment scale: %.3f (val/train ratio=%.3f)", augment_scale, avg_val / max(avg_train, 1e-9))
 
         if args.scheduler == "ReduceLROnPlateau":
             scheduler.step(avg_val)
@@ -1526,7 +1157,6 @@ def train() -> None:
                 "model_config": model_config,
                 "data_config": data_config,
                 "metric_config": metric_config,
-                "optimization_config": optimization_config,
             }, checkpoint_dir / "best_tcn.pt")
             log.info("  → New best val loss: %.6f", avg_val)
         else:
@@ -1536,24 +1166,25 @@ def train() -> None:
                     "Early stopping: no improvement for %d epochs (best val=%.6f)",
                     _early_stop_counter, best_val_loss,
                 )
-                _early_stop_counter = 0
+                break
+                #_early_stop_counter = 0
                 # reusing this for model blending with best val model, since we want to continue training after early stopping anyway
-                best_model_path = checkpoint_dir / "best_tcn.pt"
-                best_model = FunscriptTCN(**model_config).to(device)
-                if best_model_path.exists():
-                    log.info("Loading best model from %s for continued training", best_model_path)
-                    ckpt = torch.load(best_model_path, map_location=device, weights_only=False)
-                    best_model.load_state_dict(ckpt["model_state_dict"])
-                    # blend weights onto the current model (simple moving average with blending factor)
-                    blending_factor = 0.5
-                    with torch.no_grad():
-                        for p, best_p in zip(model.parameters(), best_model.parameters()):
-                            p.data = blending_factor * p.data + (1 - blending_factor) * best_p.data
+                # best_model_path = checkpoint_dir / "best_tcn.pt"
+                # best_model = FunscriptTCN(**model_config).to(device)
+                # if best_model_path.exists():
+                #     log.info("Loading best model from %s for continued training", best_model_path)
+                #     ckpt = torch.load(best_model_path, map_location=device, weights_only=False)
+                #     best_model.load_state_dict(ckpt["model_state_dict"])
+                #     # blend weights onto the current model (simple moving average with blending factor)
+                #     blending_factor = 0.5
+                #     with torch.no_grad():
+                #         for p, best_p in zip(model.parameters(), best_model.parameters()):
+                #             p.data = blending_factor * p.data + (1 - blending_factor) * best_p.data
                             
 
-                else:
-                    log.warning("Best model checkpoint not found at %s — cannot load for continued training", best_model_path)
-                    break
+                # else:
+                #     log.warning("Best model checkpoint not found at %s — cannot load for continued training", best_model_path)
+                #     break
                 
 
         if epoch % 10 == 0:
@@ -1565,13 +1196,30 @@ def train() -> None:
                 "global_step": global_step,
                 "data_config": data_config,
                 "metric_config": metric_config,
-                "optimization_config": optimization_config,
             }, checkpoint_dir / f"tcn_epoch{epoch}.pt")
 
         if best_val_loss < original_best_val_loss:
             improved = True
-        # if epoch == 5 and not improved:
-        #     break
+        if epoch == 8 and not improved:
+            break
+        # if it's the last epoch and we have improved in the last 3, switch to ReduceLROnPlateau scheduler until and keep going until early stopping patience exceeds 3
+        if epoch == args.epochs and not isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau) and improved:
+            log.info("Switching to ReduceLROnPlateau scheduler for fine-tuning")
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer,
+                mode="min",
+                factor=0.5,
+                patience=5,
+                min_lr=args.lr * 0.0001,
+            )
+            epochs += 100  # extend training for fine-tuning
+            args.scheduler = "ReduceLROnPlateau"
+            overtime = True
+        if overtime and _early_stop_counter >= 3:
+            log.info("Early stopping during fine-tuning: no improvement for 3 epochs")
+            break
+        
+
 
     writer.close()
     log.info("Training complete. Best val loss: %.6f", best_val_loss)
