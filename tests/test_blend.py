@@ -74,7 +74,7 @@ def test_blend_output_shape():
     flow = torch.rand(B, T, 32)
     with torch.no_grad():
         out = blended(kp, emb, flow)
-    assert out.shape == (B, T), f"expected ({B}, {T}), got {out.shape}"
+    assert out.shape == (B, 4, T), f"expected ({B}, 4, {T}), got {out.shape}"
 
 
 def test_blend_with_ddl():

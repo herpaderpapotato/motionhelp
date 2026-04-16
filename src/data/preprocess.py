@@ -9,6 +9,7 @@ import logging
 import subprocess
 import json
 from pathlib import Path
+import cv2
 
 log = logging.getLogger(__name__)
 
@@ -47,9 +48,16 @@ def probe_video(video_path: Path) -> dict:
     if not video_stream:
         raise RuntimeError(f"No video stream found in {video_path}")
 
-    fps_str = video_stream.get("r_frame_rate", "30/1")
-    fps_parts = fps_str.split("/")
-    fps = float(fps_parts[0]) / float(fps_parts[1]) if len(fps_parts) == 2 else float(fps_parts[0])
+    fps_str = video_stream.get("r_frame_rate", "fail")
+    if fps_str == "fail":
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            raise RuntimeError(f"Failed to open video with OpenCV for FPS probe: {video_path}")
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        cap.release()
+    else:
+        fps_parts = fps_str.split("/")
+        fps = float(fps_parts[0]) / float(fps_parts[1]) if len(fps_parts) == 2 else float(fps_parts[0])
 
     return {
         "width": int(video_stream["width"]),

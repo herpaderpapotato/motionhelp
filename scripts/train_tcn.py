@@ -22,6 +22,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
@@ -308,20 +309,17 @@ class MotionDataset(Dataset):
                 kp = torch.zeros_like(kp)
                 emb = torch.zeros_like(emb)
 
+        s = self.augment_scale  # [0, 1] — 0=min values, 1=max values
 
-    
-
-        # s = self.augment_scale  # [0, 1] — 0=min values, 1=max values
-
-        # dropout_prob = 0.1 + s * (0.9 - 0.1)
-        # if torch.rand(1).item() < dropout_prob:
-        #     choice = torch.randint(3, (1,)).item()
-        #     if choice == 0:
-        #         kp = torch.zeros_like(kp)
-        #     elif choice == 1:
-        #         emb = torch.zeros_like(emb)
-        #     else:
-        #         flow = torch.zeros_like(flow)
+        dropout_prob = 0.1 + s * (0.9 - 0.1)
+        if torch.rand(1).item() < dropout_prob:
+            choice = torch.randint(3, (1,)).item()
+            if choice == 0:
+                kp = torch.zeros_like(kp)
+            elif choice == 1:
+                emb = torch.zeros_like(emb)
+            else:
+                flow = torch.zeros_like(flow)
 
         # emb_noise_prob = 0.2 + s * (0.9 - 0.2)    
         # emb_noise_mag  = 0.02 + s * (0.15 - 0.02)
@@ -379,6 +377,50 @@ def _compute_augment_scale(val_loss: float, train_loss: float) -> float:
     if ratio >= end_threshold:
         return 1.0
     return (ratio - start_threshold) / (end_threshold - start_threshold)
+
+
+def _compute_loss_from_multichannel(
+    pred: torch.Tensor,
+    lbl: torch.Tensor,
+    args: argparse.Namespace,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+    """Compute combined loss from [B, 4, T] model output.
+
+    Returns (total_loss, main_pred [B, T], metric_dict).
+    Channel 0 = fused, 1 = pose-only, 2 = emb-only, 3 = flow-only.
+    """
+    main_pred = pred[:, 0]  # [B, T] — fused prediction
+
+    metric_batch = compute_regression_metrics(
+        main_pred,
+        lbl,
+        spectral_kernel=args.spectral_kernel,
+        activity_gain=args.event_activity_gain,
+        activity_power=args.event_activity_power,
+        active_quantile=args.active_quantile,
+    )
+    pos_loss = ((1.0 - args.event_weight) * metric_batch["pos_mse"]
+                + args.event_weight * metric_batch["event_mse"])
+    temp_loss = metric_batch["acc_mse"]
+    vel_loss = metric_batch["vel_mse"]
+    spec_loss = metric_batch["spec_mse"]
+
+    loss = (pos_loss
+            + args.temporal_weight * temp_loss
+            + args.velocity_weight * vel_loss
+            + args.spectral_weight * spec_loss)
+
+    # Auxiliary branch losses (MSE against same labels)
+    if args.aux_weight > 0:
+        aux_loss = torch.zeros(1, device=pred.device, dtype=pred.dtype)
+        for ch in range(1, 4):
+            aux_pred = pred[:, ch]  # [B, T]
+            aux_loss = aux_loss + F.mse_loss(aux_pred, lbl)
+        aux_loss = aux_loss / 3.0  # average across 3 auxiliary branches
+        loss = loss + args.aux_weight * aux_loss
+        metric_batch["aux_loss"] = aux_loss.detach()
+
+    return loss, main_pred, metric_batch
 
 
 # ---------------------------------------------------------------------------
@@ -624,6 +666,8 @@ def train() -> None:
                         help="Flow representation: 'summary' (flat 64-d) or 'dense' (2×32×32 spatial)")
     parser.add_argument("--flow-dense-size", type=int, default=32,
                         help="Spatial resolution for dense flow maps (default: 32)")
+    parser.add_argument("--aux-weight", type=float, default=0.3,
+                        help="Weight for auxiliary per-modality branch losses (0 = ignore aux branches)")
     args = parser.parse_args()
 
     if not 0.0 <= args.event_weight <= 1.0:
@@ -800,45 +844,6 @@ def train() -> None:
         model.pose_encoder.load_state_dict(pose_model.pose_encoder.state_dict())
         # Copy embedding encoder weights
         model.emb_encoder.load_state_dict(emb_model.emb_encoder.state_dict())
-
-        # def merge_weights(flow_model, pose_model, emb_model, target_model):
-        #     target_state = target_model.state_dict()
-        #     for name, param in target_state.items():
-        #         if name.startswith("flow_encoder.") or name.startswith("pose_encoder.") or name.startswith("emb_encoder."):
-        #             continue
-        #         averaged_param = torch.zeros_like(param).to(device)
-        #         count = 0
-        #         if name in flow_model.state_dict():
-        #             averaged_param += flow_model.state_dict()[name]
-        #             count += 1
-        #         if name in pose_model.state_dict():
-        #             averaged_param += pose_model.state_dict()[name]
-        #             count += 1
-        #         if name in emb_model.state_dict():
-        #             averaged_param += emb_model.state_dict()[name]
-        #             count += 1
-        #         if count > 0:
-        #             # handle TCN which is a long and so can't be cast to float16 without overflow issues, so keep it in float32
-        #             # result type Float can't be cast to the desired output type Long
-        #             if averaged_param.dtype == torch.float32 and param.dtype == torch.float16:
-        #                 averaged_param = averaged_param.half()
-        #                 averaged_param = averaged_param / count
-        #                 averaged_param = averaged_param.float()
-        #             else:
-        #                 averaged_param = averaged_param / count
-                        
-        #             target_state[name] = averaged_param
-
-
-        #     target_model.load_state_dict(target_state)
-
-
-        #     return target_model
-            
-        # # Merge weights
-        # model = merge_weights(flow_model.to(device), pose_model.to(device), emb_model.to(device), model)
-
-
         
         # freeze encoders after merging
         for p in model.flow_encoder.parameters():
@@ -853,7 +858,8 @@ def train() -> None:
     flow_encoder_model = "data\\models\\checkpoints_tcn\\phase5_flow_best_tcn.pt"
     pose_encoder_model = "data\\models\\checkpoints_tcn\\phase6_emb_best_tcn.pt"
     emb_encoder_model = "data\\models\\checkpoints_tcn\\phase7_pose_best_tcn.pt"
-    model = merge_model(model, flow_encoder_model, pose_encoder_model, emb_encoder_model)
+    # test merge currently not used.
+    #model = merge_model(model, flow_encoder_model, pose_encoder_model, emb_encoder_model)
 
     model.eval()
     val_losses = []
@@ -878,31 +884,15 @@ def train() -> None:
             lbl = batch["labels"].to(device, non_blocking=True)
 
             with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
-                pred = model(kp, emb, fl)
-                metric_batch = compute_regression_metrics(
-                    pred,
-                    lbl,
-                    spectral_kernel=args.spectral_kernel,
-                    activity_gain=args.event_activity_gain,
-                    activity_power=args.event_activity_power,
-                    active_quantile=args.active_quantile,
-                )
-                pos_loss = ((1.0 - args.event_weight) * metric_batch["pos_mse"]
-                            + args.event_weight * metric_batch["event_mse"])
-                temp_loss = metric_batch["acc_mse"]
-                vel_loss = metric_batch["vel_mse"]
-                spec_loss = metric_batch["spec_mse"]
-
-                loss = (pos_loss
-                        + args.temporal_weight * temp_loss
-                        + args.velocity_weight * vel_loss
-                        + args.spectral_weight * spec_loss)
+                pred = model(kp, emb, fl)  # [B, 4, T]
+                loss, main_pred, metric_batch = _compute_loss_from_multichannel(pred, lbl, args)
 
             val_losses.append(loss.item())
             for key in val_metric_history:
-                val_metric_history[key].append(metric_batch[key].item())
-            val_pred_means.append(pred.mean().item())
-            val_pred_stds.append(pred.std().item())
+                if key in metric_batch:
+                    val_metric_history[key].append(metric_batch[key].item())
+            val_pred_means.append(main_pred.mean().item())
+            val_pred_stds.append(main_pred.std().item())
 
     avg_val = np.mean(val_losses)
     avg_val_metrics = {key: float(np.mean(values)) for key, values in val_metric_history.items()}
@@ -912,12 +902,8 @@ def train() -> None:
     log.info("Initial validation metrics: %s", ", ".join(f"{k}={v:.6f}" for k, v in avg_val_metrics.items()))
     log.info("Initial validation prediction mean: %.6f, std: %.6f", avg_pred_mean, avg_pred_std)
 
-
-
     best_val_loss = float("inf")
     
-
-
     for param_group in optimizer.param_groups:
         param_group["lr"] = args.lr
     # ── Logging / Checkpoints ─────────────────────────────────────────────
@@ -973,6 +959,7 @@ def train() -> None:
         "velocity_weight": args.velocity_weight,
         "spectral_weight": args.spectral_weight,
         "spectral_kernel": args.spectral_kernel,
+        "aux_weight": args.aux_weight,
     }
 
     log.info("Run dir: %s", run_dir)
@@ -1016,25 +1003,8 @@ def train() -> None:
             optimizer.zero_grad(set_to_none=True)
 
             with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
-                pred = model(kp, emb, fl)  # [B, T]
-                metric_batch = compute_regression_metrics(
-                    pred,
-                    lbl,
-                    spectral_kernel=args.spectral_kernel,
-                    activity_gain=args.event_activity_gain,
-                    activity_power=args.event_activity_power,
-                    active_quantile=args.active_quantile,
-                )
-                pos_loss = ((1.0 - args.event_weight) * metric_batch["pos_mse"]
-                            + args.event_weight * metric_batch["event_mse"])
-                temp_loss = metric_batch["acc_mse"]
-                vel_loss = metric_batch["vel_mse"]
-                spec_loss = metric_batch["spec_mse"]
-
-                loss = (pos_loss
-                        + args.temporal_weight * temp_loss
-                        + args.velocity_weight * vel_loss
-                        + args.spectral_weight * spec_loss)
+                pred = model(kp, emb, fl)  # [B, 4, T]
+                loss, main_pred, metric_batch = _compute_loss_from_multichannel(pred, lbl, args)
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -1046,10 +1016,13 @@ def train() -> None:
 
             train_losses.append(loss.item())
             for key in train_metric_history:
-                train_metric_history[key].append(metric_batch[key].item())
+                if key in metric_batch:
+                    train_metric_history[key].append(metric_batch[key].item())
             global_step += 1
 
             if global_step % 50 == 0:
+                pos_loss = ((1.0 - args.event_weight) * metric_batch["pos_mse"]
+                            + args.event_weight * metric_batch["event_mse"])
                 writer.add_scalar("train/loss", loss.item(), global_step)
                 writer.add_scalar("train/pos_loss", pos_loss.item(), global_step)
                 writer.add_scalar("train/pos_mse", metric_batch["pos_mse"].item(), global_step)
@@ -1057,13 +1030,12 @@ def train() -> None:
                 writer.add_scalar("train/active_mse", metric_batch["active_mse"].item(), global_step)
                 writer.add_scalar("train/vel_mae", metric_batch["vel_mae"].item(), global_step)
                 writer.add_scalar("train/acc_mae", metric_batch["acc_mae"].item(), global_step)
-                writer.add_scalar("train/temp_loss", temp_loss.item(), global_step)
-                writer.add_scalar("train/vel_loss", vel_loss.item(), global_step)
-                writer.add_scalar("train/spec_loss", spec_loss.item(), global_step)
-                writer.add_scalar("train/pred_mean", pred.mean().item(), global_step)
-                writer.add_scalar("train/pred_std", pred.std().item(), global_step)
+                writer.add_scalar("train/pred_mean", main_pred.mean().item(), global_step)
+                writer.add_scalar("train/pred_std", main_pred.std().item(), global_step)
                 writer.add_scalar("train/grad_norm", grad_norm.item(), global_step)
                 writer.add_scalar("lr", optimizer.param_groups[0]["lr"], global_step)
+                if "aux_loss" in metric_batch:
+                    writer.add_scalar("train/aux_loss", metric_batch["aux_loss"].item(), global_step)
 
         avg_train = np.mean(train_losses)
         avg_train_metrics = {key: float(np.mean(values)) for key, values in train_metric_history.items()}
@@ -1106,31 +1078,15 @@ def train() -> None:
                 lbl = batch["labels"].to(device, non_blocking=True)
 
                 with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
-                    pred = model(kp, emb, fl)
-                    metric_batch = compute_regression_metrics(
-                        pred,
-                        lbl,
-                        spectral_kernel=args.spectral_kernel,
-                        activity_gain=args.event_activity_gain,
-                        activity_power=args.event_activity_power,
-                        active_quantile=args.active_quantile,
-                    )
-                    pos_loss = ((1.0 - args.event_weight) * metric_batch["pos_mse"]
-                                + args.event_weight * metric_batch["event_mse"])
-                    temp_loss = metric_batch["acc_mse"]
-                    vel_loss = metric_batch["vel_mse"]
-                    spec_loss = metric_batch["spec_mse"]
-
-                    loss = (pos_loss
-                            + args.temporal_weight * temp_loss
-                            + args.velocity_weight * vel_loss
-                            + args.spectral_weight * spec_loss)
+                    pred = model(kp, emb, fl)  # [B, 4, T]
+                    loss, main_pred, metric_batch = _compute_loss_from_multichannel(pred, lbl, args)
 
                 val_losses.append(loss.item())
                 for key in val_metric_history:
-                    val_metric_history[key].append(metric_batch[key].item())
-                val_pred_means.append(pred.mean().item())
-                val_pred_stds.append(pred.std().item())
+                    if key in metric_batch:
+                        val_metric_history[key].append(metric_batch[key].item())
+                val_pred_means.append(main_pred.mean().item())
+                val_pred_stds.append(main_pred.std().item())
 
         avg_val = np.mean(val_losses)
         avg_val_metrics = {key: float(np.mean(values)) for key, values in val_metric_history.items()}
@@ -1181,18 +1137,23 @@ def train() -> None:
                 lbl_s = samples["labels"]
 
                 with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
-                    pred_s = model(kp_s, emb_s, fl_s)  # [8, T]
+                    pred_s = model(kp_s, emb_s, fl_s)  # [8, 4, T]
 
-                pred_s = pred_s.float().cpu().numpy()
+                pred_s = pred_s.float().cpu().numpy()  # [8, 4, T]
                 lbl_s = lbl_s.float().cpu().numpy()
 
             n_plots = min(8, len(pred_s))
             fig, axes = plt.subplots(n_plots, 1, figsize=(12, 2 * n_plots), sharex=False)
             if n_plots == 1:
                 axes = [axes]
+            aux_colors = ["green", "purple", "red"]
+            aux_labels = ["pose", "emb", "flow"]
             for i, ax in enumerate(axes):
                 ax.plot(lbl_s[i], label="target", alpha=0.85, lw=1.5, color="steelblue")
-                ax.plot(pred_s[i], label="pred",   alpha=0.85, lw=1.5, color="darkorange")
+                ax.plot(pred_s[i, 0], label="fused", alpha=0.85, lw=1.5, color="darkorange")
+                for ch in range(1, 4):
+                    ax.plot(pred_s[i, ch], label=aux_labels[ch - 1],
+                            alpha=0.4, lw=0.8, color=aux_colors[ch - 1])
                 ax.set_ylim(-0.05, 1.05)
                 ax.set_ylabel(f"#{i}", fontsize=7)
                 if i == 0:

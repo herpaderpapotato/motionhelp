@@ -133,4 +133,4 @@ def test_funscript_tcn_multiclass_forward_shape() -> None:
     with torch.no_grad():
         out = model(keypoints, embeddings, flow)
 
-    assert out.shape == (2, 16)
+    assert out.shape == (2, 4, 16)

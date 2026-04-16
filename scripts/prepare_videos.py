@@ -324,6 +324,144 @@ def extract_labels(
     return True
 
 
+# ── Reprocess labels mode ─────────────────────────────────────────────────────
+
+import re as _re
+_SEG_RE = _re.compile(r"^scene_(\d+)_t(\d+)_(\d+)s$")
+
+
+def _parse_seg_name(seg_name: str) -> tuple[int, float, float] | None:
+    """Parse scene_id, start_sec, duration_sec from a segment directory name.
+
+    Returns None for legacy names without timing (e.g. 'scene_00018').
+    """
+    m = _SEG_RE.match(seg_name)
+    if not m:
+        return None
+    return int(m.group(1)), float(m.group(2)), float(m.group(3))
+
+
+def _reprocess_all_labels(
+    preprocessed_dir: Path,
+    processed_dir: Path,
+    xbvr_by_scene: dict[int, tuple[Path, Path]] | None = None,
+) -> None:
+    """Re-extract labels.npy for every segment found in the preprocessed folder.
+
+    xbvr_by_scene: mapping of scene_id → (video_path, funscript_path) built from xbvr,
+    used as a fallback when metadata.json lacks those fields (legacy format).
+    """
+    mp4_files = sorted(preprocessed_dir.glob("*.mp4"))
+    if not mp4_files:
+        log.info("No preprocessed segments found in %s", preprocessed_dir)
+        return
+
+    log.info("Reprocessing labels for %d preprocessed segments", len(mp4_files))
+    ok_count = skipped = failed = 0
+
+    for mp4_path in mp4_files:
+        seg_name = mp4_path.stem
+        scene_dir = processed_dir / seg_name
+        meta_path = scene_dir / "metadata.json"
+
+        if not meta_path.exists():
+            log.warning("SKIP %s — no metadata.json in %s", seg_name, scene_dir)
+            skipped += 1
+            continue
+
+        with open(meta_path) as f:
+            meta = json.load(f)
+
+        seg_fps: float = meta["fps"]
+        seg_total_frames: int = meta["total_frames"]
+
+        # ── Resolve timing ────────────────────────────────────────────────
+        if "segment_start_sec" in meta and "segment_duration_sec" in meta:
+            start_sec: float = meta["segment_start_sec"]
+            duration_sec: float = meta["segment_duration_sec"]
+        else:
+            parsed = _parse_seg_name(seg_name)
+            if parsed is None:
+                log.warning("SKIP %s — legacy metadata with no parseable timing", seg_name)
+                skipped += 1
+                continue
+            _, start_sec, duration_sec = parsed
+            log.debug("Derived timing from name: start=%.0f  duration=%.0f", start_sec, duration_sec)
+
+        # ── Resolve video + funscript paths ───────────────────────────────
+        raw_video = meta.get("video_path", "")
+        raw_script = meta.get("funscript_path", "")
+        video_path: Path | None = None
+        funscript_path: Path | None = None
+
+        # Only trust video_path from metadata if it's NOT the preprocessed file itself
+        if raw_video and "preprocessed" not in raw_video.replace("\\", "/"):
+            video_path = Path(raw_video)
+        if raw_script:
+            funscript_path = Path(raw_script)
+
+        # Fall back to xbvr lookup by scene_id
+        if (video_path is None or funscript_path is None) and xbvr_by_scene is not None:
+            parsed = _parse_seg_name(seg_name)
+            if parsed is not None:
+                scene_id = parsed[0]
+                entry = xbvr_by_scene.get(scene_id)
+                if entry:
+                    if video_path is None:
+                        video_path = entry[0]
+                    if funscript_path is None:
+                        funscript_path = entry[1]
+
+        if video_path is None:
+            log.warning("SKIP %s — cannot determine original video path", seg_name)
+            skipped += 1
+            continue
+        if funscript_path is None:
+            log.warning("SKIP %s — cannot determine funscript path", seg_name)
+            skipped += 1
+            continue
+
+        if not video_path.exists():
+            log.warning("SKIP %s — original video not found: %s", seg_name, video_path)
+            skipped += 1
+            continue
+        if not funscript_path.exists():
+            log.warning("SKIP %s — funscript not found: %s", seg_name, funscript_path)
+            skipped += 1
+            continue
+
+        try:
+            orig_info = get_video_info(video_path)
+        except Exception as e:
+            log.error("SKIP %s — cannot probe original video: %s", seg_name, e)
+            skipped += 1
+            continue
+
+        labels_path = scene_dir / "labels.npy"
+        if labels_path.exists():
+            labels_path.unlink()
+
+        log.info("Reprocessing labels: %s", seg_name)
+        ok = extract_labels(
+            funscript_path=funscript_path,
+            output_dir=scene_dir,
+            seg_start_sec=start_sec,
+            seg_duration_sec=duration_sec,
+            seg_fps=seg_fps,
+            seg_total_frames=seg_total_frames,
+            original_fps=orig_info.fps,
+            original_duration_sec=orig_info.duration_seconds,
+        )
+        if ok:
+            ok_count += 1
+        else:
+            log.error("Label extraction failed for %s", seg_name)
+            failed += 1
+
+    log.info("═" * 50)
+    log.info("Reprocess complete: %d ok, %d failed, %d skipped", ok_count, failed, skipped)
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -351,6 +489,8 @@ def main() -> None:
                         help="Skip segments with fewer than N funscript actions")
     parser.add_argument("--overwrite",           action="store_true",
                         help="Re-import scenes that already exist")
+    parser.add_argument("--reprocess-labels",    action="store_true",
+                        help="Re-extract labels.npy for all segments found in preprocessed folder")
     parser.add_argument("--blacklist-bins",       type=str, default="",
                         help="Comma-separated bin IDs to exclude (e.g. '3,4,5')")
     args = parser.parse_args()
@@ -368,6 +508,24 @@ def main() -> None:
     lock_dir = Path(args.lock_dir) if args.lock_dir else None
     interp_dir = data_dir / "interpolated"
     binsdef_path = data_dir / "binsdef.json"
+
+    # ── Reprocess-labels mode ──────────────────────────────────────────────
+    if args.reprocess_labels:
+        xbvr_by_scene: dict[int, tuple[Path, Path]] | None = None
+        try:
+            db_url = _load_database_url()
+            from src.data.xbvr import query_scene_pairs
+            xbvr_pairs = query_scene_pairs(db_url, projections=None, min_duration=0.0)
+            xbvr_by_scene = {p.scene_id: (p.video_path, p.funscript_path) for p in xbvr_pairs}
+            log.info("Built xbvr lookup with %d entries", len(xbvr_by_scene))
+        except Exception as e:
+            log.warning("Could not load xbvr lookup (legacy-format segments may be skipped): %s", e)
+        _reprocess_all_labels(
+            preprocessed_dir=preprocessed_dir,
+            processed_dir=processed_dir,
+            xbvr_by_scene=xbvr_by_scene,
+        )
+        return
 
     # ── Load bin definitions (for bin-aware sampling) ─────────────────────
     bins_def: list[dict] | None = None

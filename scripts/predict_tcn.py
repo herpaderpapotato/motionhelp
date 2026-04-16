@@ -479,9 +479,9 @@ def sliding_window_predict(
             fl = torch.from_numpy(flow[start:end]).float().unsqueeze(0).to(device)
 
             with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
-                out = model(kp, emb, fl)  # [1, seq_len]
+                out = model(kp, emb, fl)  # [1, 4, seq_len]
 
-            p = out[0].float().cpu().numpy()
+            p = out[0, 0].float().cpu().numpy()  # channel 0 = fused prediction
 
             # Triangular weighting: higher weight toward center
             weight = np.bartlett(seq_len).astype(np.float32) + 0.01
@@ -504,8 +504,8 @@ def sliding_window_predict(
             fl = torch.nn.functional.pad(fl, (0, 0, 0, pad))
         with torch.no_grad():
             with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
-                out = model(kp, emb, fl)
-        return out[0, :n_frames].float().cpu().numpy()
+                out = model(kp, emb, fl)  # [1, 4, T]
+        return out[0, 0, :n_frames].float().cpu().numpy()  # channel 0 = fused
 
     # Normalize by overlap count
     mask = pred_count > 0

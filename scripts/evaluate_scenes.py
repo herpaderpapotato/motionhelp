@@ -114,8 +114,8 @@ def sliding_window_predict(
             fl = torch.nn.functional.pad(fl, (0, 0, 0, pad))
         with torch.no_grad():
             with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
-                out = model(kp, emb, fl)
-        return out[0, :n_frames].float().cpu().numpy()
+                out = model(kp, emb, fl)  # [1, 4, T]
+        return out[0, 0, :n_frames].float().cpu().numpy()  # channel 0 = fused
 
     starts = list(range(0, n_frames - seq_len + 1, stride))
     if starts[-1] + seq_len < n_frames:
@@ -129,9 +129,9 @@ def sliding_window_predict(
             fl = torch.from_numpy(flow[start:end]).float().unsqueeze(0).to(device)
 
             with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
-                out = model(kp, emb, fl)
+                out = model(kp, emb, fl)  # [1, 4, seq_len]
 
-            p = out[0].float().cpu().numpy()
+            p = out[0, 0].float().cpu().numpy()  # channel 0 = fused
             weight = np.bartlett(seq_len).astype(np.float32) + 0.01
             pred_sum[start:end] += p * weight
             pred_count[start:end] += weight

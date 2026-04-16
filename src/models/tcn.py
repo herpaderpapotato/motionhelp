@@ -496,7 +496,11 @@ class FunscriptTCN(nn.Module):
         Slots 0..n_partners-1 are partner detections
         Slots n_partners.. are beholder detections (keypoints truncated to n_beholder_keypoints)
 
-    Output: [B, T] position values in [0, 1]
+    Output: [B, 4, T] position values in [0, 1]
+        Channel 0: fused (all modalities through main TCN backbone)
+        Channel 1: pose-only auxiliary branch
+        Channel 2: embedding-only auxiliary branch
+        Channel 3: flow-only auxiliary branch
     """
 
     def __init__(
@@ -647,12 +651,66 @@ class FunscriptTCN(nn.Module):
             block_cls(d_model, kernel_size, d, dropout) for d in dilations
         ])
 
-        # -- Output head --
+        # -- Output head (main fused path) --
         self.output_head = nn.Sequential(
             nn.Linear(d_model, 64),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(64, 1),
+        )
+
+        # -- Auxiliary per-modality branches --
+        # Each branch: project → small TCN (3 blocks) → output head
+        aux_d = d_model // 4  # 64 by default
+        aux_n_blocks = min(3, n_blocks)
+        aux_dilations = [2 ** i for i in range(aux_n_blocks)]  # [1, 2, 4]
+
+        # Pose auxiliary branch (input: 128-d from pose attention pooling)
+        self.aux_pose_proj = nn.Sequential(
+            nn.Linear(128, aux_d),
+            nn.LayerNorm(aux_d),
+            nn.GELU(),
+        )
+        self.aux_pose_tcn = nn.ModuleList([
+            block_cls(aux_d, kernel_size, d, dropout) for d in aux_dilations
+        ])
+        self.aux_pose_head = nn.Sequential(
+            nn.Linear(aux_d, 32),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(32, 1),
+        )
+
+        # Embedding auxiliary branch (input: 128-d from emb attention pooling)
+        self.aux_emb_proj = nn.Sequential(
+            nn.Linear(128, aux_d),
+            nn.LayerNorm(aux_d),
+            nn.GELU(),
+        )
+        self.aux_emb_tcn = nn.ModuleList([
+            block_cls(aux_d, kernel_size, d, dropout) for d in aux_dilations
+        ])
+        self.aux_emb_head = nn.Sequential(
+            nn.Linear(aux_d, 32),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(32, 1),
+        )
+
+        # Flow auxiliary branch (input: 64-d from flow encoder)
+        self.aux_flow_proj = nn.Sequential(
+            nn.Linear(flow_out_dim, aux_d),
+            nn.LayerNorm(aux_d),
+            nn.GELU(),
+        )
+        self.aux_flow_tcn = nn.ModuleList([
+            block_cls(aux_d, kernel_size, d, dropout) for d in aux_dilations
+        ])
+        self.aux_flow_head = nn.Sequential(
+            nn.Linear(aux_d, 32),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(32, 1),
         )
 
     def forward(
@@ -667,7 +725,8 @@ class FunscriptTCN(nn.Module):
                                             or n_persons (single-class)
             embeddings: [B, T, N, E]
             flow:       [B, T, F] (summary mode) or [B, T, 2, H, W] (dense mode)
-        Returns: [B, T] positions in [0, 1]
+        Returns: [B, 4, T] positions in [0, 1]
+            Channel 0: fused, 1: pose-only, 2: emb-only, 3: flow-only
         """
         B, T = keypoints.shape[:2]
 
@@ -745,14 +804,36 @@ class FunscriptTCN(nn.Module):
         else:
             x = self.fusion(torch.cat(fusion_parts, dim=-1))           # [B, T, d_model]
 
-        # -- TCN (expects channels-first) --
+        # -- Auxiliary per-modality branches (before main TCN) --
+        # Pose auxiliary
+        aux_p = self.aux_pose_proj(pose_out).transpose(1, 2)          # [B, aux_d, T]
+        for block in self.aux_pose_tcn:
+            aux_p = block(aux_p)
+        aux_p = self.aux_pose_head(aux_p.transpose(1, 2)).squeeze(-1) # [B, T]
+
+        # Embedding auxiliary
+        aux_e = self.aux_emb_proj(emb_out).transpose(1, 2)            # [B, aux_d, T]
+        for block in self.aux_emb_tcn:
+            aux_e = block(aux_e)
+        aux_e = self.aux_emb_head(aux_e.transpose(1, 2)).squeeze(-1)  # [B, T]
+
+        # Flow auxiliary
+        aux_f = self.aux_flow_proj(flow_out).transpose(1, 2)          # [B, aux_d, T]
+        for block in self.aux_flow_tcn:
+            aux_f = block(aux_f)
+        aux_f = self.aux_flow_head(aux_f.transpose(1, 2)).squeeze(-1) # [B, T]
+
+        # -- Main TCN backbone (expects channels-first) --
         x = x.transpose(1, 2)                                         # [B, d_model, T]
         for block in self.tcn_blocks:
             x = block(x)
         x = x.transpose(1, 2)                                         # [B, T, d_model]
 
-        # -- Output --
-        out = self.output_head(x).squeeze(-1)                          # [B, T]
+        # -- Main output --
+        main_out = self.output_head(x).squeeze(-1)                     # [B, T]
+
+        # -- Stack all channels: [fused, pose, emb, flow] --
+        out = torch.stack([main_out, aux_p, aux_e, aux_f], dim=1)      # [B, 4, T]
         return torch.sigmoid(out)
 
     def _compute_kinematics(
