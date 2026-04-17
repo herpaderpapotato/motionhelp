@@ -33,8 +33,9 @@ import torch
 from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from src.models.lite_tcn import FunscriptLiteTCN, extract_lite_model_config
 from src.models.tcn import FunscriptTCN, extract_model_config
-from src.data.pose import load_pose_model
+from src.data.pose import extract_pose_batch, load_pose_model
 from src.data.extraction import SinglePassExtractor, extract_single_pass_batched
 from src.data.decode import stream_video_gpu
 from src.data.flow import compute_flow_raft_batched, compute_flow_raft_dense_batched, normalize_flow_components, downsample_dense_flow, summarize_dense_flow
@@ -68,17 +69,37 @@ def _extract_pose_batched(
     return np.concatenate(all_kpts, axis=0)
 
 
-def load_model(checkpoint_path: Path, device: torch.device) -> tuple[FunscriptTCN, dict]:
-    """Load TCN model from checkpoint. Returns (model, model_config)."""
+def _build_model_from_config(config: dict[str, object]) -> torch.nn.Module:
+    model_type = config.get("model_type", "tcn")
+    if model_type == "lite_tcn":
+        return FunscriptLiteTCN(**extract_lite_model_config(config))
+    return FunscriptTCN(**extract_model_config(config))
+
+
+def _extract_prediction_tensor(output: torch.Tensor) -> torch.Tensor:
+    if output.ndim == 2:
+        return output
+    if output.ndim == 3:
+        return output[:, 0]
+    raise ValueError(f"Unsupported model output shape: {tuple(output.shape)}")
+
+
+def load_model(checkpoint_path: Path, device: torch.device) -> tuple[torch.nn.Module, dict]:
+    """Load a checkpointed funscript model. Returns (model, model_config)."""
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     cfg = ckpt["model_config"]
-    model = FunscriptTCN(**extract_model_config(cfg))
+    model = _build_model_from_config(cfg)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
     model.to(device)
     is_mc = cfg.get("n_partners") is not None
-    print(f"Loaded checkpoint: epoch {ckpt.get('epoch', '?')}, val_loss={ckpt.get('val_loss', '?'):.6f}"
-          f" [{'multiclass' if is_mc else 'single-class'}]")
+    model_type = cfg.get("model_type", "tcn")
+    val_loss = ckpt.get("val_loss")
+    val_loss_str = f"{val_loss:.6f}" if isinstance(val_loss, (int, float)) else str(val_loss)
+    print(
+        f"Loaded checkpoint: epoch {ckpt.get('epoch', '?')}, val_loss={val_loss_str}"
+        f" [{model_type}, {'multiclass' if is_mc else 'single-class'}]",
+    )
     return model, cfg
 
 
@@ -453,7 +474,7 @@ def extract_features_from_video(
 
 
 def sliding_window_predict(
-    model: FunscriptTCN,
+    model: torch.nn.Module,
     keypoints: np.ndarray,
     embeddings: np.ndarray,
     flow: np.ndarray,
@@ -479,9 +500,9 @@ def sliding_window_predict(
             fl = torch.from_numpy(flow[start:end]).float().unsqueeze(0).to(device)
 
             with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
-                out = model(kp, emb, fl)  # [1, 4, seq_len]
+                out = model(kp, emb, fl)
 
-            p = out[0, 0].float().cpu().numpy()  # channel 0 = fused prediction
+            p = _extract_prediction_tensor(out)[0].float().cpu().numpy()
 
             # Triangular weighting: higher weight toward center
             weight = np.bartlett(seq_len).astype(np.float32) + 0.01
@@ -504,8 +525,8 @@ def sliding_window_predict(
             fl = torch.nn.functional.pad(fl, (0, 0, 0, pad))
         with torch.no_grad():
             with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
-                out = model(kp, emb, fl)  # [1, 4, T]
-        return out[0, 0, :n_frames].float().cpu().numpy()  # channel 0 = fused
+                out = model(kp, emb, fl)
+        return _extract_prediction_tensor(out)[0, :n_frames].float().cpu().numpy()
 
     # Normalize by overlap count
     mask = pred_count > 0
@@ -574,7 +595,7 @@ def live_playback_with_prediction(
     from PIL import Image, ImageTk
 
     #MAX_FRAME_BUF = 600       # max decoded frames to keep in RAM (~150MB at 640px)
-    MAX_FRAME_BUF = 1200
+    MAX_FRAME_BUF = seq_len * 3
     STATS_EVERY_N = 8         # update stats panel every N display ticks
     GRAPH_EVERY_N = 4         # update matplotlib graph every N display ticks
 
@@ -1350,6 +1371,13 @@ def main() -> None:
     parser.add_argument("--duration", type=float, default=None,
                         help="Duration in seconds to extract")
     parser.add_argument("--device", default="auto")
+    parser.add_argument(
+        "--flow-flip-override",
+        type=str,
+        default=None,
+        choices=["none", "hflip", "vflip", "hvflip"],
+        help="Override dense-flow flip handling for lite checkpoints.",
+    )
     parser.add_argument("--out", type=Path, default=None,
                         help="Output funscript JSON path")
     parser.add_argument("--plot", action="store_true",
@@ -1372,6 +1400,13 @@ def main() -> None:
 
     # Load model early so flow_mode is available in playback mode
     model, model_cfg = load_model(args.checkpoint, device)
+    if args.flow_flip_override is not None:
+        if hasattr(model, "set_flow_flip"):
+            model.set_flow_flip(args.flow_flip_override)
+            model_cfg["flow_flip"] = args.flow_flip_override
+            print(f"Applied flow flip override: {args.flow_flip_override}")
+        else:
+            print("Warning: --flow-flip-override ignored for this checkpoint type")
     is_multiclass = model_cfg.get("n_partners") is not None
     n_total = (model_cfg.get("n_partners", 5) + model_cfg.get("n_beholders", 1)) if is_multiclass else model_cfg.get("n_persons", 10)
     flow_mode = model_cfg.get("flow_mode", "summary")
