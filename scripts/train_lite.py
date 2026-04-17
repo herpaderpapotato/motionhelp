@@ -32,6 +32,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from src.data.embeddings import load_embeddings_metadata
 from src.models.lite_tcn import FunscriptLiteTCN
 from src.training.funscript_metrics import compute_regression_metrics
 
@@ -40,13 +41,11 @@ os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 log = logging.getLogger(__name__)
 
+DEFAULT_MULTICLASS_FEATURE_MODEL = "vrlens-finetunes-multiclass-v2-yolo11m-pose"
+
 
 class LiteMotionDataset(Dataset):
     """Load multiclass keypoints, embeddings, dense flow, and labels for lite training."""
-
-    KP_FILE = "keypoints/vrlens-finetunes-multiclass-v2-yolo11m-pose.npy"
-    EMB_FILE = "embeddings/vrlens-finetunes-multiclass-v2-yolo11m-pose.npy"
-    EMB_FILE_META = "embeddings/vrlens-finetunes-multiclass-v2-yolo11m-pose.json"
     DENSE_FLOW_FILE = "flow/raft_dense_32x32_s0.5.npy"
 
     def __init__(
@@ -58,7 +57,8 @@ class LiteMotionDataset(Dataset):
         n_partners: int = 5,
         n_beholders: int = 1,
         n_keypoints: int = 21,
-        embed_dim: int = 512,
+        embed_dim: int | None = None,
+        feature_model_name: str = DEFAULT_MULTICLASS_FEATURE_MODEL,
         flow_dense_size: int = 32,
         max_scenes: int | None = None,
         max_sequences: int | None = None,
@@ -70,7 +70,10 @@ class LiteMotionDataset(Dataset):
         self.n_beholders = n_beholders
         self.n_total = n_partners + n_beholders
         self.n_keypoints = n_keypoints
-        self.embed_dim = embed_dim
+        self.feature_model_name = Path(feature_model_name).stem
+        self.KP_FILE = str(Path("keypoints") / f"{self.feature_model_name}.npy")
+        self.EMB_FILE = str(Path("embeddings") / f"{self.feature_model_name}.npy")
+        self.EMB_FILE_META = str(Path("embeddings") / f"{self.feature_model_name}.json")
         self.flow_dense_size = flow_dense_size
         self.stats_path: Path | None = None
 
@@ -78,6 +81,11 @@ class LiteMotionDataset(Dataset):
             video_ids = json.load(handle)
         if max_scenes is not None:
             video_ids = video_ids[:max_scenes]
+
+        if embed_dim is None:
+            self.embed_dim = self._infer_embed_dim(video_ids)
+        else:
+            self.embed_dim = embed_dim
 
         self._load_stats()
 
@@ -106,6 +114,9 @@ class LiteMotionDataset(Dataset):
 
             meta = json.loads(emb_meta_path.read_text(encoding="utf-8"))
             if meta.get("method") != "single_pass_hook_roi_align" or not meta.get("multiclass", False):
+                skipped += 1
+                continue
+            if int(meta.get("embed_dim", self.embed_dim)) != self.embed_dim:
                 skipped += 1
                 continue
 
@@ -174,10 +185,49 @@ class LiteMotionDataset(Dataset):
             out = {key: value.to(device) for key, value in out.items()}
         return out
 
+    def _infer_embed_dim(self, video_ids: list[str]) -> int:
+        processed = self.data_dir / "processed"
+        for vid_id in video_ids:
+            emb_path = processed / vid_id / self.EMB_FILE
+            metadata = load_embeddings_metadata(emb_path)
+            if metadata is not None and metadata.get("embed_dim") is not None:
+                try:
+                    return int(metadata["embed_dim"])
+                except (TypeError, ValueError):
+                    pass
+            if emb_path.exists():
+                try:
+                    emb_shape = np.load(str(emb_path), mmap_mode="r").shape
+                except Exception:
+                    continue
+                if len(emb_shape) == 3:
+                    return int(emb_shape[2])
+
+        log.warning(
+            "Could not infer embedding width for multiclass feature model %s; defaulting to 512",
+            self.feature_model_name,
+        )
+        return 512
+
     def _load_stats(self) -> None:
-        stats_path = self.data_dir / "featurestats" / "feature_stats.npz"
-        if not stats_path.exists():
-            log.warning("No featurestats/feature_stats.npz found; lite training will be unnormalized")
+        stats_candidates: list[Path] = []
+        if self.multiclass:
+            feature_model_name = Path(self.feature_model_name).stem
+            stats_candidates.extend(
+                [
+                    self.data_dir / f"feature_stats_{feature_model_name}.npz",
+                    self.data_dir / "featurestats" / f"feature_stats_{feature_model_name}.npz",
+                ]
+            )
+        stats_candidates.extend(
+            [
+                self.data_dir / "featurestats" / "feature_stats.npz",
+                self.data_dir / "feature_stats.npz",
+            ]
+        )
+        stats_path = next((candidate for candidate in stats_candidates if candidate.exists()), None)
+        if stats_path is None:
+            log.warning("No feature stats file found; lite training will be unnormalized")
             self.emb_mean = None
             self.emb_std = None
             self.flow_dense_mean = None
@@ -256,7 +306,7 @@ def train() -> None:
     parser.add_argument("--n-blocks", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.15)
     parser.add_argument("--grad-clip", type=float, default=1.0)
-    parser.add_argument("--temporal-weight", type=float, default=0.1)
+    parser.add_argument("--temporal-weight", type=float, default=0.05)
     parser.add_argument("--velocity-weight", type=float, default=0.05)
     parser.add_argument("--spectral-weight", type=float, default=0.05)
     parser.add_argument("--spectral-kernel", type=int, default=15)
@@ -277,6 +327,12 @@ def train() -> None:
     parser.add_argument("--n-partners", type=int, default=5)
     parser.add_argument("--n-beholders", type=int, default=1)
     parser.add_argument("--n-beholder-keypoints", type=int, default=7)
+    parser.add_argument(
+        "--feature-model-name",
+        type=str,
+        default=DEFAULT_MULTICLASS_FEATURE_MODEL,
+        help="Multiclass feature model stem used for keypoint and embedding filenames",
+    )
     parser.add_argument("--flow-dense-size", type=int, default=32)
     parser.add_argument(
         "--flow-flip",
@@ -327,7 +383,8 @@ def train() -> None:
         n_partners=args.n_partners,
         n_beholders=args.n_beholders,
         n_keypoints=21,
-        embed_dim=512,
+        embed_dim=None,
+        feature_model_name=args.feature_model_name,
         flow_dense_size=args.flow_dense_size,
         max_scenes=args.max_train_scenes,
         max_sequences=args.max_train_sequences,
@@ -340,7 +397,8 @@ def train() -> None:
         n_partners=args.n_partners,
         n_beholders=args.n_beholders,
         n_keypoints=21,
-        embed_dim=512,
+        embed_dim=train_ds.embed_dim,
+        feature_model_name=args.feature_model_name,
         flow_dense_size=args.flow_dense_size,
         max_scenes=args.max_val_scenes,
         max_sequences=args.max_val_sequences,
@@ -368,6 +426,8 @@ def train() -> None:
 
     log.info("Train: %d sequences (%d batches)", len(train_ds), len(train_loader))
     log.info("Val:   %d sequences (%d batches)", len(val_ds), len(val_loader))
+    log.info("Embedding width: %d", train_ds.embed_dim)
+    log.info("Multiclass feature model: %s", train_ds.feature_model_name)
 
     model = FunscriptLiteTCN(
         d_model=args.d_model,
@@ -377,7 +437,7 @@ def train() -> None:
         n_beholders=args.n_beholders,
         n_keypoints=21,
         n_beholder_keypoints=args.n_beholder_keypoints,
-        embed_dim=512,
+        embed_dim=train_ds.embed_dim,
         flow_mode="dense",
         flow_dense_size=args.flow_dense_size,
         flow_flip=args.flow_flip,
@@ -437,7 +497,7 @@ def train() -> None:
         "n_beholders": args.n_beholders,
         "n_keypoints": 21,
         "n_beholder_keypoints": args.n_beholder_keypoints,
-        "embed_dim": 512,
+        "embed_dim": train_ds.embed_dim,
         "flow_mode": "dense",
         "flow_dense_size": args.flow_dense_size,
         "flow_flip": args.flow_flip,
@@ -450,6 +510,7 @@ def train() -> None:
         "max_val_scenes": args.max_val_scenes,
         "max_train_sequences": args.max_train_sequences,
         "max_val_sequences": args.max_val_sequences,
+        "feature_model_name": train_ds.feature_model_name,
     }
     metric_config = {
         "event_weight": args.event_weight,

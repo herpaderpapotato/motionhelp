@@ -35,10 +35,13 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# Multiclass file names (must match reprocess_embeddings.py)
-KP_FILE_MULTICLASS = "keypoints/vrlens-finetunes-multiclass-v2-yolo11m-pose.npy"
-EMB_FILE_MULTICLASS = "embeddings/vrlens-finetunes-multiclass-v2-yolo11m-pose.npy"
-MULTICLASS_POSE_MODEL = "data/models/pose/vrlens-finetunes-multiclass-v2-yolo11m-pose.pt"
+DEFAULT_MULTICLASS_POSE_MODEL = Path("data/models/pose/vrlens-finetunes-multiclass-v2-yolo11m-pose.pt")
+
+
+def _multiclass_paths(scene_dir: Path, model_name: str) -> tuple[Path, Path, Path]:
+    kp_path = keypoints_path(scene_dir, model_name)
+    emb_path = embeddings_path(scene_dir, model_name)
+    return kp_path, emb_path, emb_path.with_suffix(".json")
 
 
 def process_scene(
@@ -131,6 +134,8 @@ def process_scene_multiclass(
     scene_dir: Path,
     preprocessed_dir: Path,
     extractor: SinglePassExtractor,
+    feature_model_name: str,
+    feature_model_path: Path,
     batch_size: int = 32,
     overwrite: bool = False,
 ) -> bool:
@@ -141,11 +146,9 @@ def process_scene_multiclass(
         log.warning("SKIP %s — no preprocessed video at %s", scene_id, video_path)
         return False
 
-    kp_out = scene_dir / KP_FILE_MULTICLASS
-    emb_out = scene_dir / EMB_FILE_MULTICLASS
+    kp_out, emb_out, meta_path = _multiclass_paths(scene_dir, feature_model_name)
 
     # Check if already processed
-    meta_path = emb_out.with_suffix(".json")
     if not overwrite and meta_path.exists():
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
         if meta.get("method") == "single_pass_hook_roi_align" and meta.get("multiclass", False):
@@ -199,11 +202,15 @@ def process_scene_multiclass(
         "multiclass": True,
         "shape": list(embeddings.shape),
         "dtype": str(embeddings.dtype),
-        "embed_dim": 512,
+        "embed_dim": int(embeddings.shape[2]),
         "max_persons": extractor.max_persons,
         "max_partners": extractor.max_partners,
         "max_beholders": extractor.max_beholders,
         "n_beholder_keypoints": extractor.n_beholder_keypoints,
+        "model_name": feature_model_name,
+        "model_path": str(feature_model_path),
+        "feature_layer_idx": extractor.layer_idx,
+        "feature_layer_name": extractor.layer_name,
     }
     meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
     log.info("Saved multiclass: kp=%s emb=%s", kp_out, emb_out)
@@ -226,6 +233,12 @@ def main() -> None:
                         help="Only process these scene IDs (default: all pending)")
     parser.add_argument("--multiclass", action="store_true",
                         help="Use multiclass model (partner + beholder)")
+    parser.add_argument(
+        "--multiclass-model",
+        type=Path,
+        default=None,
+        help="Path to multiclass YOLO pose weights (defaults to yolo11m multiclass)",
+    )
     parser.add_argument("--max-partners", type=int, default=5)
     parser.add_argument("--max-beholders", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=32)
@@ -241,12 +254,12 @@ def main() -> None:
 
     # Load model
     if args.multiclass:
-        import torch
-        pose_model_path = MULTICLASS_POSE_MODEL
+        pose_model_path = args.multiclass_model or DEFAULT_MULTICLASS_POSE_MODEL
+        feature_model_name = pose_model_path.stem
         log.info("Loading multiclass pose model: %s", pose_model_path)
         pose_model = load_pose_model(
-            model_name="yolo11m-pose",
-            model_path=pose_model_path,
+            model_name=feature_model_name,
+            model_path=str(pose_model_path),
             device=cfg.pose.device,
         )
         extractor = SinglePassExtractor(
@@ -271,8 +284,8 @@ def main() -> None:
         all_scenes = discover_scenes(data_dir, include_rejected=False, require_labels=True)
         pending = []
         for sid, state in all_scenes:
-            # if state["status"] != "approved":
-            #     continue
+            if state["status"] != "approved":
+                continue
             if state["status"] == "rejected":
                 continue
             sd = processed_dir / sid
@@ -281,7 +294,7 @@ def main() -> None:
 
             if args.multiclass:
                 # Check multiclass outputs
-                meta_path = sd / "embeddings" / "vrlens-finetunes-multiclass-v2-yolo11m-pose.json"
+                meta_path = embeddings_path(sd, feature_model_name).with_suffix(".json")
                 if not args.overwrite and meta_path.exists():
                     meta = json.loads(meta_path.read_text(encoding="utf-8"))
                     if meta.get("method") == "single_pass_hook_roi_align" and meta.get("multiclass"):
@@ -305,6 +318,8 @@ def main() -> None:
                 if args.multiclass:
                     success = process_scene_multiclass(
                         processed_dir / sid, preprocessed_dir, extractor,
+                        feature_model_name=feature_model_name,
+                        feature_model_path=pose_model_path,
                         batch_size=args.batch_size, overwrite=args.overwrite,
                     )
                 else:

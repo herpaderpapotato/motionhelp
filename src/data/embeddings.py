@@ -26,6 +26,40 @@ def embeddings_metadata_path(embeddings_path: str | Path) -> Path:
     return Path(embeddings_path).with_suffix(".json")
 
 
+def load_embeddings_metadata(embeddings_path: str | Path) -> dict[str, Any] | None:
+    """Load the sidecar metadata for an embeddings array if it exists."""
+    meta_path = embeddings_metadata_path(embeddings_path)
+    if not meta_path.exists():
+        return None
+    try:
+        return json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def infer_embeddings_dim(embeddings_path: str | Path) -> int | None:
+    """Infer embedding width from metadata first, then the array shape."""
+    metadata = load_embeddings_metadata(embeddings_path)
+    if metadata is not None and metadata.get("embed_dim") is not None:
+        try:
+            return int(metadata["embed_dim"])
+        except (TypeError, ValueError):
+            pass
+
+    path = Path(embeddings_path)
+    if not path.exists():
+        return None
+
+    try:
+        embeddings = np.load(path, mmap_mode="r")
+    except Exception:
+        return None
+
+    if embeddings.ndim != 3:
+        return None
+    return int(embeddings.shape[2])
+
+
 def save_embeddings_artifacts(
     embeddings_path: str | Path,
     embeddings: np.ndarray,
@@ -56,27 +90,22 @@ def save_embeddings_artifacts(
 def validate_embeddings_file(
     embeddings_path: str | Path,
     max_persons: int | None = None,
-    embed_dim: int = EMBED_DIM,
+    embed_dim: int | None = None,
 ) -> tuple[bool, str]:
     """Validate that an embeddings cache matches the current extraction format."""
     path = Path(embeddings_path)
     if not path.exists():
         return False, "missing embeddings file"
 
-    meta_path = embeddings_metadata_path(path)
-    if not meta_path.exists():
+    metadata = load_embeddings_metadata(path)
+    if metadata is None:
         return False, "missing embeddings metadata"
-
-    try:
-        metadata = json.loads(meta_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        return False, f"invalid embeddings metadata: {exc}"
 
     if metadata.get("format_version") != EMBEDDING_FORMAT_VERSION:
         return False, f"format_version={metadata.get('format_version')}"
     if metadata.get("method") != EMBEDDING_METHOD:
         return False, f"method={metadata.get('method')}"
-    if metadata.get("embed_dim") != embed_dim:
+    if embed_dim is not None and metadata.get("embed_dim") != embed_dim:
         return False, f"embed_dim={metadata.get('embed_dim')}"
     if max_persons is not None and int(metadata.get("max_persons", 0)) < max_persons:
         return False, f"max_persons={metadata.get('max_persons')}"
@@ -88,7 +117,7 @@ def validate_embeddings_file(
 
     if embeddings.ndim != 3:
         return False, f"expected 3 dims, got {embeddings.ndim}"
-    if embeddings.shape[2] != embed_dim:
+    if embed_dim is not None and embeddings.shape[2] != embed_dim:
         return False, f"expected embed_dim {embed_dim}, got {embeddings.shape[2]}"
     if max_persons is not None and embeddings.shape[1] < max_persons:
         return False, f"expected at least {max_persons} persons, got {embeddings.shape[1]}"

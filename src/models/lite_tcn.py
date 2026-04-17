@@ -42,6 +42,7 @@ def extract_lite_model_config(config: dict[str, object]) -> dict[str, object]:
 
 
 class _DenseFlowEncoder(nn.Module):
+    """Encodes global dense optical flow maps into a flat feature vector."""
     def __init__(self, out_dim: int, dropout: float):
         super().__init__()
         self.net = nn.Sequential(
@@ -64,12 +65,16 @@ class _DenseFlowEncoder(nn.Module):
 
     def forward(self, flow: torch.Tensor) -> torch.Tensor:
         bsz, seq_len, _, height, width = flow.shape  # [B, T, 2, H, W]
+        # Only uses the Y-component of the flow (index 1) since we primarily care about vertical motion
         x = flow[:, :, 1:2].reshape(bsz * seq_len, 1, height, width)
         x = self.net(x)
         return x.view(bsz, seq_len, -1)
 
 
 class _KeypointFlowEncoder(nn.Module):
+    """Encodes a person's spatial presence by combining their keypoint geometry
+    and the optical flow vectors sampled at those keypoint locations.
+    """
     def __init__(
         self,
         n_keypoints: int,
@@ -103,21 +108,28 @@ class _KeypointFlowEncoder(nn.Module):
     ) -> torch.Tensor:
         xy = keypoints[..., :2]  # [B, T, K, 2]
         conf = keypoints[..., 2:3]  # [B, T, K, 1]
+        
+        # Calculate the center of mass (root) of visible keypoints
         weights = conf.clamp_min(0.0)
         root = (xy * weights).sum(dim=2) / weights.sum(dim=2).clamp_min(1e-6)  # [B, T, 2]
         rel_xy = xy - root.unsqueeze(2)  # [B, T, K, 2]
+        
+        # Fuse absolute pos, relative pos, confidence, and local motion (flow) for each point
         point_inputs = torch.cat([xy, rel_xy, conf, sampled_flow], dim=-1)  # [B, T, K, 6]
         point_features = self.point_proj(point_inputs) * conf  # [B, T, K, D]
 
+        # Process additional non-keypoint spatial samples if provided (e.g. for beholder vertical strip)
         if extra_xy is not None and extra_sampled_flow is not None and extra_conf is not None:
             extra_rel_xy = extra_xy - root.unsqueeze(2)  # [B, T, E, 2]
             extra_inputs = torch.cat([extra_xy, extra_rel_xy, extra_conf, extra_sampled_flow], dim=-1)
             extra_features = self.point_proj(extra_inputs) * extra_conf
             point_features = torch.cat([point_features, extra_features], dim=2)
 
+        # Aggregate overall summary statistics for the person
         visible_ratio = (conf > 0).to(conf.dtype).mean(dim=2)  # [B, T, 1]
         mean_conf = conf.mean(dim=2)  # [B, T, 1]
         summary = torch.cat([root, visible_ratio, mean_conf], dim=-1)  # [B, T, 4]
+        
         flat = point_features.flatten(start_dim=2)  # [B, T, K*D]
         return self.person_proj(torch.cat([flat, summary], dim=-1))
 
@@ -125,13 +137,53 @@ class _KeypointFlowEncoder(nn.Module):
 class FunscriptLiteTCN(nn.Module):
     """Dense-flow lite TCN with flow-aligned keypoint sampling.
 
-    Inputs:
-        keypoints:  [B, T, 6, 21, 3]
-        embeddings: [B, T, 6, 512]
-        flow:       [B, T, 2, 32, 32]
+    Architecture & Data Merging Process:
+    ------------------------------------
+    1. Parsing Inputs: Receives keypoints and semantic embeddings for multiple candidates
+       (partners) and a camera view (beholder), along with dense optical flow maps.
+    2. Primary Selection: Dynamically identifies the main active performer out of all partners
+       based on maximum visibility and proximity to frame center.
+    3. Motion Sampling: Extracts global motion context from the dense flow map, and simultaneously
+       samples pinpoint local motion vectors from the flow map precisely at the coordinates
+       of the performer's and beholder's keypoints.
+    4. Independent Encoding:
+       - Spatial encoders process local geometry + local flow for both the performer and beholder.
+       - A Pair encoder computes relative interactions (distance, root movement) between them.
+       - Global flow is compressed via CNN.
+    5. Feature Fusion: All spatial/motion features are fused into a main `spatial` vector.
+       Semantic embeddings (like YOLO/CLIP features) are separately compressed and then combined
+       with the spatial vector using a learned gating mechanism. This prevents noisy semantic
+       data from overriding reliable physical motion data.
+    6. Temporal Processing: The fused sequence passes through a Bidirectional GRU to capture
+       overall context and smooth out anomalies, followed by a stack of Temporal Convolutional
+       Networks (TCN) with exponentially increasing dilation to model complex, fast motion
+       dynamics across a massive temporal receptive field.
+    7. Output Projection: An MLP head projects the main hidden dimension down to a final sequence
+       of 1D positions, normalized to [0, 1] bounds using a sigmoid.
 
-    Output:
-        [B, 1, T] sigmoid-normalized position values.
+    Model Arguments:
+    ----------------
+    d_model: Dimensionality of the main internal hidden state (TCN, GRU). Increasing it improves
+             representational power but slows down training/inference and increases risk of overfitting.
+    n_blocks: Number of dilated TCN blocks. More blocks exponentially increase the temporal receptive
+              field (how far back/forward the model looks) but increase parameter count.
+    dropout: Regularization probability used throughout the network to prevent overfitting.
+    n_partners: The maximum number of performer candidates in the input tensor. Allows the model to
+                handle scenes with multiple people and choose the primary one.
+    n_beholders: The number of camera perspectives / POV slots. Must be >= 1.
+    n_keypoints: The number of anatomical points tracked for performers (e.g., 21 for full body).
+                 Changing this requires retraining and matching the upstream pose tracker.
+    n_beholder_keypoints: Number of points tracked for the beholder perspective.
+    embed_dim: The dimensionality of the input semantic embeddings (e.g. YOLO/ViT features).
+    flow_mode: The flow representation type. Must be "dense".
+    flow_dense_size: Expected spatial resolution of the dense flow map (e.g. 32x32). Lower resolution
+                     is faster but loses fine-grained global context.
+    performer_hidden_dim: Dim of the output feature vector representing the primary performer's motion/pose.
+    beholder_hidden_dim: Dim of the output feature vector representing the camera/beholder's motion/pose.
+    flow_global_dim: Dim of the global optical flow feature extracted by the CNN.
+    pair_dim: Dim of the feature vector capturing relative interaction between performer and beholder.
+    flow_flip: Augmentation flag ("none", "hflip", "vflip", "hvflip") dictating how flow is mirrored.
+               Useful for test-time augmentation or training data multiplication.
     """
 
     VALID_FLOW_FLIPS = {"none", "hflip", "vflip", "hvflip"}
@@ -228,6 +280,7 @@ class FunscriptLiteTCN(nn.Module):
             nn.LayerNorm(d_model),
             nn.GELU(),
         )
+        # Gating mechanism ensures semantics only influence the output if they agree with spatial cues
         self.embedding_gate = nn.Linear(d_model, d_model)
         self.embedding_scale_logit = nn.Parameter(torch.tensor(-2.0))
         self.fuse_norm = nn.LayerNorm(d_model)
@@ -240,6 +293,8 @@ class FunscriptLiteTCN(nn.Module):
             bidirectional=True,
         )
         self.post_gru_norm = nn.LayerNorm(d_model)
+        
+        # Stack of dilated temporal convolutions to build massive receptive field
         self.tcn_blocks = nn.ModuleList([
             TCNBlock(d_model, kernel_size=3, dilation=2 ** i, dropout=dropout)
             for i in range(n_blocks)
@@ -269,20 +324,24 @@ class FunscriptLiteTCN(nn.Module):
         partner_kp = keypoints[:, :, :self.n_partners]  # [B, T, Np, K, 3]
         partner_emb = embeddings[:, :, :self.n_partners]  # [B, T, Np, E]
 
+        # 1. Select the primary performer based on visibility/center distance
         primary_idx = self._select_primary_partner(partner_kp)  # [B, T]
         performer_kp = self._gather_partner_keypoints(partner_kp, primary_idx)  # [B, T, K, 3]
         performer_emb = self._gather_partner_embeddings(partner_emb, primary_idx)  # [B, T, E]
 
+        # 2. Extract beholder data
         beholder_slot = self.n_partners
         beholder_kp = keypoints[:, :, beholder_slot, :self.n_beholder_keypoints]  # [B, T, Kb, 3]
         beholder_emb = embeddings[:, :, beholder_slot]  # [B, T, E]
 
+        # 3. Sample dense flow at specific locations
         beholder_extra_xy, beholder_extra_conf = self._build_beholder_vertical_samples(beholder_kp)
         performer_flow = self._sample_flow_vectors(flow, performer_kp[..., :2])  # [B, T, K, 1]
         beholder_flow = self._sample_flow_vectors(flow, beholder_kp[..., :2])  # [B, T, Kb, 1]
         beholder_extra_flow = self._sample_flow_vectors(flow, beholder_extra_xy)  # [B, T, 10, 1]
+        
+        # 4. Feature Extraction & Encoding
         flow_global = self.flow_encoder(flow)  # [B, T, D]
-
         performer_feat = self.performer_encoder(performer_kp, performer_flow)  # [B, T, Dp]
         beholder_feat = self.beholder_encoder(
             beholder_kp,
@@ -293,10 +352,12 @@ class FunscriptLiteTCN(nn.Module):
         )  # [B, T, Db]
         pair_feat = self._encode_pair_features(flow, performer_kp, beholder_kp)  # [B, T, Dpair]
 
+        # 5. Spatial Fusion
         spatial = self.spatial_proj(
             torch.cat([performer_feat, beholder_feat, flow_global, pair_feat], dim=-1),
         )  # [B, T, d_model]
 
+        # 6. Semantic Gating & Addition
         emb_latent = self.embedding_proj(torch.cat([
             self.performer_emb_encoder(performer_emb),
             self.beholder_emb_encoder(beholder_emb),
@@ -305,6 +366,8 @@ class FunscriptLiteTCN(nn.Module):
         emb_scale = torch.sigmoid(self.embedding_scale_logit)
 
         x = self.fuse_norm(spatial + (emb_scale * emb_gate * emb_latent))  # [B, T, d_model]
+        
+        # 7. Temporal Processing
         gru_out, _ = self.gru(x)
         x = self.post_gru_norm(x + gru_out)  # [B, T, d_model]
 
@@ -313,6 +376,7 @@ class FunscriptLiteTCN(nn.Module):
             x = block(x)
         x = x.transpose(1, 2)  # [B, T, d_model]
 
+        # 8. Final Position Output
         out = self.output_head(x).squeeze(-1)  # [B, T]
         return torch.sigmoid(out).unsqueeze(1)  # [B, 1, T]
 

@@ -35,6 +35,7 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.models.lite_tcn import FunscriptLiteTCN, extract_lite_model_config
 from src.models.tcn import FunscriptTCN, extract_model_config
+from src.data.curation import embeddings_path, keypoints_path
 from src.data.pose import extract_pose_batch, load_pose_model
 from src.data.extraction import SinglePassExtractor, extract_single_pass_batched
 from src.data.decode import stream_video_gpu
@@ -49,6 +50,29 @@ KP_FILE_MULTICLASS = "keypoints/vrlens-finetunes-multiclass-v2-yolo11m-pose.npy"
 EMB_FILE_MULTICLASS = "embeddings/vrlens-finetunes-multiclass-v2-yolo11m-pose.npy"
 FLOW_FILE = "flow/raft_f64_s0.5.npy"
 DENSE_FLOW_FILE = "flow/raft_dense_32x32_s0.5.npy"
+DEFAULT_SINGLE_CLASS_POSE_MODEL = Path("data/models/pose/pose-vrlens-finetunes-large.pt")
+DEFAULT_MULTICLASS_FEATURE_MODEL = "vrlens-finetunes-multiclass-v2-yolo11m-pose"
+
+
+def _resolve_feature_model_name(
+    is_multiclass: bool,
+    data_config: dict[str, object],
+    override: str | None,
+) -> str | None:
+    if not is_multiclass:
+        return None
+    if override:
+        return Path(override).stem
+
+    stored_name = data_config.get("feature_model_name")
+    if isinstance(stored_name, str) and stored_name:
+        return Path(stored_name).stem
+
+    return DEFAULT_MULTICLASS_FEATURE_MODEL
+
+
+def _default_multiclass_pose_model(feature_model_name: str) -> Path:
+    return Path("data/models/pose") / f"{Path(feature_model_name).stem}.pt"
 
 
 def _extract_pose_batched(
@@ -84,10 +108,11 @@ def _extract_prediction_tensor(output: torch.Tensor) -> torch.Tensor:
     raise ValueError(f"Unsupported model output shape: {tuple(output.shape)}")
 
 
-def load_model(checkpoint_path: Path, device: torch.device) -> tuple[torch.nn.Module, dict]:
-    """Load a checkpointed funscript model. Returns (model, model_config)."""
+def load_model(checkpoint_path: Path, device: torch.device) -> tuple[torch.nn.Module, dict, dict]:
+    """Load a checkpointed funscript model. Returns (model, model_config, data_config)."""
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     cfg = ckpt["model_config"]
+    data_cfg = ckpt.get("data_config", {})
     model = _build_model_from_config(cfg)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
@@ -100,7 +125,7 @@ def load_model(checkpoint_path: Path, device: torch.device) -> tuple[torch.nn.Mo
         f"Loaded checkpoint: epoch {ckpt.get('epoch', '?')}, val_loss={val_loss_str}"
         f" [{model_type}, {'multiclass' if is_mc else 'single-class'}]",
     )
-    return model, cfg
+    return model, cfg, data_cfg
 
 
 def load_stats(
@@ -109,15 +134,27 @@ def load_stats(
     embed_dim: int = 512,
     flow_dim: int = 64,
     flow_mode: str = "summary",
+    feature_model_name: str | None = None,
 ):
-    stats_path = data_dir / "feature_stats.npz"
-    if not stats_path.exists():
-        alt = data_dir / "featurestats" / "feature_stats.npz"
-        if alt.exists():
-            stats_path = alt
-        else:
-            print("Warning: no feature_stats.npz — predictions will use un-normalized features")
-            return None, None, None, None
+    stats_candidates: list[Path] = []
+    if feature_model_name:
+        feature_model_stem = Path(feature_model_name).stem
+        stats_candidates.extend(
+            [
+                data_dir / f"feature_stats_{feature_model_stem}.npz",
+                data_dir / "featurestats" / f"feature_stats_{feature_model_stem}.npz",
+            ]
+        )
+    stats_candidates.extend(
+        [
+            data_dir / "feature_stats.npz",
+            data_dir / "featurestats" / "feature_stats.npz",
+        ]
+    )
+    stats_path = next((candidate for candidate in stats_candidates if candidate.exists()), None)
+    if stats_path is None:
+        print("Warning: no feature stats file found — predictions will use un-normalized features")
+        return None, None, None, None
 
     stats = np.load(stats_path)
     emb_mean = emb_std = None
@@ -322,7 +359,7 @@ def extract_features_from_video(
     t0 = time.perf_counter()
     print(f"Loading pose model from {pose_model_path}...")
     pose_model = load_pose_model(
-        model_name="yolo11m-pose",
+        model_name=pose_model_path.stem,
         model_path=str(pose_model_path),
         device=str(device),
     )
@@ -1353,8 +1390,14 @@ def main() -> None:
     parser.add_argument("--checkpoint", type=Path,
                         default=Path("data/models/checkpoints_tcn/best_tcn.pt"))
     parser.add_argument("--pose-model", type=Path,
-                        default=Path("data/models/pose/pose-vrlens-finetunes-large.pt"),
+                        default=DEFAULT_SINGLE_CLASS_POSE_MODEL,
                         help="Path to YOLO pose model weights")
+    parser.add_argument(
+        "--feature-model-name",
+        type=str,
+        default=None,
+        help="Override the multiclass feature model stem used for scene feature files",
+    )
     parser.add_argument("--vr", dest="vr_mode", action="store_true", default=True,
                         help="Video is VR side-by-side (default)")
     parser.add_argument("--no-vr", dest="vr_mode", action="store_false",
@@ -1399,7 +1442,7 @@ def main() -> None:
     source_name = ""
 
     # Load model early so flow_mode is available in playback mode
-    model, model_cfg = load_model(args.checkpoint, device)
+    model, model_cfg, data_cfg = load_model(args.checkpoint, device)
     if args.flow_flip_override is not None:
         if hasattr(model, "set_flow_flip"):
             model.set_flow_flip(args.flow_flip_override)
@@ -1409,6 +1452,11 @@ def main() -> None:
             print("Warning: --flow-flip-override ignored for this checkpoint type")
     is_multiclass = model_cfg.get("n_partners") is not None
     n_total = (model_cfg.get("n_partners", 5) + model_cfg.get("n_beholders", 1)) if is_multiclass else model_cfg.get("n_persons", 10)
+    feature_model_name = _resolve_feature_model_name(
+        is_multiclass,
+        data_cfg,
+        args.feature_model_name,
+    )
     flow_mode = model_cfg.get("flow_mode", "summary")
     flow_dense_size = model_cfg.get("flow_dense_size", 32)
 
@@ -1420,12 +1468,16 @@ def main() -> None:
 
         # Auto-select pose model for multiclass
         pose_model_path = args.pose_model
-        if is_multiclass and "multiclass" not in str(pose_model_path):
-            pose_model_path = Path("data/models/pose/vrlens-finetunes-multiclass-v2-yolo11m-pose.pt")
+        if is_multiclass and pose_model_path == DEFAULT_SINGLE_CLASS_POSE_MODEL:
+            pose_model_path = _default_multiclass_pose_model(feature_model_name or DEFAULT_MULTICLASS_FEATURE_MODEL)
             print(f"  Auto-selected multiclass pose model: {pose_model_path}")
 
         emb_mean, emb_std, flow_mean, flow_std = load_stats(
-            args.data_dir, n_persons=n_total, flow_mode=flow_mode,
+            args.data_dir,
+            n_persons=n_total,
+            embed_dim=int(model_cfg.get("embed_dim", 512)),
+            flow_mode=flow_mode,
+            feature_model_name=feature_model_name,
         )
         source_name = args.video.stem
 
@@ -1474,14 +1526,21 @@ def main() -> None:
             print(f"Error: scene directory not found: {scene_dir}")
             sys.exit(1)
 
-        kp_file = KP_FILE_MULTICLASS if is_multiclass else KP_FILE
-        emb_file = EMB_FILE_MULTICLASS if is_multiclass else EMB_FILE
-        flow_file = DENSE_FLOW_FILE if flow_mode == "dense" else FLOW_FILE
+        if is_multiclass:
+            kp_path = keypoints_path(scene_dir, feature_model_name or DEFAULT_MULTICLASS_FEATURE_MODEL)
+            emb_path = embeddings_path(scene_dir, feature_model_name or DEFAULT_MULTICLASS_FEATURE_MODEL)
+        else:
+            kp_path = scene_dir / KP_FILE
+            emb_path = scene_dir / EMB_FILE
+        flow_path = scene_dir / (DENSE_FLOW_FILE if flow_mode == "dense" else FLOW_FILE)
 
         missing = []
-        for fname in [kp_file, emb_file, flow_file]:
-            if not (scene_dir / fname).exists():
-                missing.append(fname)
+        for path in [kp_path, emb_path, flow_path]:
+            if not path.exists():
+                try:
+                    missing.append(str(path.relative_to(scene_dir)))
+                except ValueError:
+                    missing.append(str(path))
         if missing:
             print(f"Error: missing feature files in {scene_dir}:")
             for m in missing:
@@ -1489,9 +1548,9 @@ def main() -> None:
             sys.exit(1)
 
         print(f"Loading features from {scene_dir}...")
-        keypoints  = np.load(str(scene_dir / kp_file))
-        embeddings = np.load(str(scene_dir / emb_file))
-        flow       = np.load(str(scene_dir / flow_file))
+        keypoints  = np.load(str(kp_path))
+        embeddings = np.load(str(emb_path))
+        flow       = np.load(str(flow_path))
         if flow_mode == "dense":
             flow = flow.astype(np.float32)
 
@@ -1509,8 +1568,8 @@ def main() -> None:
 
         # Auto-select pose model for multiclass
         pose_model_path = args.pose_model
-        if is_multiclass and "multiclass" not in str(pose_model_path):
-            pose_model_path = Path("data/models/pose/vrlens-finetunes-multiclass-v2-yolo11m-pose.pt")
+        if is_multiclass and pose_model_path == DEFAULT_SINGLE_CLASS_POSE_MODEL:
+            pose_model_path = _default_multiclass_pose_model(feature_model_name or DEFAULT_MULTICLASS_FEATURE_MODEL)
             print(f"  Auto-selected multiclass pose model: {pose_model_path}")
 
         print(f"Extracting features from {args.video}...")
@@ -1539,7 +1598,11 @@ def main() -> None:
 
     # Normalize features
     emb_mean, emb_std, flow_mean, flow_std = load_stats(
-        args.data_dir, n_persons=n_total, flow_mode=flow_mode,
+        args.data_dir,
+        n_persons=n_total,
+        embed_dim=int(model_cfg.get("embed_dim", 512)),
+        flow_mode=flow_mode,
+        feature_model_name=feature_model_name,
     )
     if emb_mean is not None:
         embeddings = (embeddings - emb_mean) / (emb_std + 1e-8)

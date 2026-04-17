@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import numpy as np
 import torch
 
-from src.data.curation import discover_scenes, read_review, write_review
+from src.data.curation import discover_scenes, embeddings_path, keypoints_path, read_review, write_review
 from src.models.tcn import FunscriptTCN, extract_model_config
 from src.training.funscript_metrics import compute_regression_metrics
 
@@ -39,10 +39,11 @@ KP_FILE_MULTICLASS = "keypoints/vrlens-finetunes-multiclass-v2-yolo11m-pose.npy"
 EMB_FILE_MULTICLASS = "embeddings/vrlens-finetunes-multiclass-v2-yolo11m-pose.npy"
 FLOW_FILE = "flow/raft_f64_s0.5.npy"
 DENSE_FLOW_FILE = "flow/raft_dense_32x32_s0.5.npy"
+DEFAULT_MULTICLASS_FEATURE_MODEL = "vrlens-finetunes-multiclass-v2-yolo11m-pose"
 
 
 def load_model(checkpoint_path: Path, device: torch.device):
-    """Load TCN model from checkpoint. Returns (model, model_config)."""
+    """Load TCN model from checkpoint. Returns model and checkpoint configs."""
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     cfg = ckpt["model_config"]
     model = FunscriptTCN(**extract_model_config(cfg))
@@ -53,20 +54,37 @@ def load_model(checkpoint_path: Path, device: torch.device):
     log.info("Loaded checkpoint: epoch %s, val_loss=%.6f [%s]",
              ckpt.get("epoch", "?"), ckpt.get("val_loss", 0),
              "multiclass" if is_mc else "single-class")
-    return model, cfg, ckpt.get("metric_config", {})
+    return model, cfg, ckpt.get("metric_config", {}), ckpt.get("data_config", {})
 
 
-def load_stats(data_dir: Path, n_persons: int = 10, embed_dim: int = 512, flow_dim: int = 64, flow_mode: str = "summary"):
+def load_stats(
+    data_dir: Path,
+    n_persons: int = 10,
+    embed_dim: int = 512,
+    flow_dim: int = 64,
+    flow_mode: str = "summary",
+    feature_model_name: str | None = None,
+):
     """Load feature normalization stats."""
-    stats_path = data_dir / "feature_stats.npz"
-    if not stats_path.exists():
-        # Try featurestats subdirectory
-        alt = data_dir / "featurestats" / "feature_stats.npz"
-        if alt.exists():
-            stats_path = alt
-        else:
-            log.warning("No feature_stats.npz found — using un-normalized features")
-            return None, None, None, None
+    stats_candidates: list[Path] = []
+    if feature_model_name:
+        feature_model_stem = Path(feature_model_name).stem
+        stats_candidates.extend(
+            [
+                data_dir / f"feature_stats_{feature_model_stem}.npz",
+                data_dir / "featurestats" / f"feature_stats_{feature_model_stem}.npz",
+            ]
+        )
+    stats_candidates.extend(
+        [
+            data_dir / "feature_stats.npz",
+            data_dir / "featurestats" / "feature_stats.npz",
+        ]
+    )
+    stats_path = next((candidate for candidate in stats_candidates if candidate.exists()), None)
+    if stats_path is None:
+        log.warning("No feature stats file found — using un-normalized features")
+        return None, None, None, None
 
     stats = np.load(stats_path)
     emb_mean = emb_std = None
@@ -152,6 +170,7 @@ def evaluate_scene(
     flow_mean: np.ndarray | None,
     flow_std: np.ndarray | None,
     is_multiclass: bool,
+    feature_model_name: str | None = None,
     flow_mode: str = "summary",
     seq_len: int = 120,
     stride: int = 60,
@@ -160,13 +179,14 @@ def evaluate_scene(
     scene_id = scene_dir.name
 
     # Select feature files
-    kp_file = KP_FILE_MULTICLASS if is_multiclass else KP_FILE
-    emb_file = EMB_FILE_MULTICLASS if is_multiclass else EMB_FILE
-    flow_file = DENSE_FLOW_FILE if flow_mode == "dense" else FLOW_FILE
-
-    kp_path = scene_dir / kp_file
-    emb_path = scene_dir / emb_file
-    flow_path = scene_dir / flow_file
+    if is_multiclass:
+        model_name = feature_model_name or DEFAULT_MULTICLASS_FEATURE_MODEL
+        kp_path = keypoints_path(scene_dir, model_name)
+        emb_path = embeddings_path(scene_dir, model_name)
+    else:
+        kp_path = scene_dir / KP_FILE
+        emb_path = scene_dir / EMB_FILE
+    flow_path = scene_dir / (DENSE_FLOW_FILE if flow_mode == "dense" else FLOW_FILE)
     labels_path = scene_dir / "labels.npy"
 
     for p, name in [(kp_path, "keypoints"), (emb_path, "embeddings"),
@@ -232,6 +252,12 @@ def main() -> None:
                         help="Re-evaluate scenes that already have MSE")
     parser.add_argument("--scenes", nargs="*", default=None,
                         help="Only evaluate these scene IDs (default: all ready)")
+    parser.add_argument(
+        "--feature-model-name",
+        type=str,
+        default=None,
+        help="Override the multiclass feature model stem used for scene feature files",
+    )
     args = parser.parse_args()
 
     if args.device == "auto":
@@ -241,8 +267,11 @@ def main() -> None:
     log.info("Device: %s", device)
 
     # Load model
-    model, model_cfg, metric_cfg = load_model(args.checkpoint, device)
+    model, model_cfg, metric_cfg, data_cfg = load_model(args.checkpoint, device)
     is_multiclass = model_cfg.get("n_partners") is not None
+    feature_model_name = Path(
+        args.feature_model_name or data_cfg.get("feature_model_name") or DEFAULT_MULTICLASS_FEATURE_MODEL
+    ).stem
     n_total = (
         (model_cfg.get("n_partners", 5) + model_cfg.get("n_beholders", 1))
         if is_multiclass else model_cfg.get("n_persons", 10)
@@ -250,7 +279,13 @@ def main() -> None:
     flow_mode = model_cfg.get("flow_mode", "summary")
     log.info("Flow mode: %s", flow_mode)
 
-    emb_mean, emb_std, flow_mean, flow_std = load_stats(args.data_dir, n_persons=n_total, flow_mode=flow_mode)
+    emb_mean, emb_std, flow_mean, flow_std = load_stats(
+        args.data_dir,
+        n_persons=n_total,
+        embed_dim=int(model_cfg.get("embed_dim", 512)),
+        flow_mode=flow_mode,
+        feature_model_name=feature_model_name,
+    )
 
     processed_dir = args.data_dir / "processed"
 
@@ -264,10 +299,14 @@ def main() -> None:
             scene_dir = processed_dir / sid
 
             # Check if scene has the required feature files
-            kp_file = KP_FILE_MULTICLASS if is_multiclass else KP_FILE
-            emb_file = EMB_FILE_MULTICLASS if is_multiclass else EMB_FILE
-            flow_file = DENSE_FLOW_FILE if flow_mode == "dense" else FLOW_FILE
-            if not all((scene_dir / f).exists() for f in [kp_file, emb_file, flow_file]):
+            if is_multiclass:
+                kp_path = keypoints_path(scene_dir, feature_model_name)
+                emb_path = embeddings_path(scene_dir, feature_model_name)
+            else:
+                kp_path = scene_dir / KP_FILE
+                emb_path = scene_dir / EMB_FILE
+            flow_path = scene_dir / (DENSE_FLOW_FILE if flow_mode == "dense" else FLOW_FILE)
+            if not all(path.exists() for path in [kp_path, emb_path, flow_path]):
                 continue
 
             # Check if already evaluated
@@ -286,7 +325,7 @@ def main() -> None:
                 metrics = evaluate_scene(
                     scene_dir, model, model_cfg, metric_cfg, device,
                     emb_mean, emb_std, flow_mean, flow_std,
-                    is_multiclass, flow_mode, args.seq_len, args.stride,
+                    is_multiclass, feature_model_name, flow_mode, args.seq_len, args.stride,
                 )
                 if metrics is not None:
                     # Update review.json with scene-level regression metrics.

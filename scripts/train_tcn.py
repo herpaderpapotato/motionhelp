@@ -28,12 +28,15 @@ from torch.utils.tensorboard import SummaryWriter
 
 # Resolve imports from project root
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from src.data.embeddings import load_embeddings_metadata
 from src.models.tcn import FunscriptTCN, extract_model_config
 from src.training.funscript_metrics import compute_regression_metrics
 
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 log = logging.getLogger(__name__)
+
+DEFAULT_MULTICLASS_FEATURE_MODEL = "vrlens-finetunes-multiclass-v2-yolo11m-pose"
 
 
 # ---------------------------------------------------------------------------
@@ -61,10 +64,11 @@ class MotionDataset(Dataset):
         stride: int = 60,
         n_persons: int = 10,
         n_keypoints: int = 21,
-        embed_dim: int = 512,
+        embed_dim: int | None = None,
         flow_dim: int = 64,
         augment: bool = False,
         multiclass: bool = False,
+        feature_model_name: str = DEFAULT_MULTICLASS_FEATURE_MODEL,
         phase: int = -1,
         flow_mode: str = "summary",
         flow_dense_size: int = 32,
@@ -73,10 +77,10 @@ class MotionDataset(Dataset):
         self.seq_len = seq_len
         self.n_persons = n_persons
         self.n_keypoints = n_keypoints
-        self.embed_dim = embed_dim
         self.flow_dim = flow_dim
         self.augment = augment
         self.multiclass = multiclass
+        self.feature_model_name = Path(feature_model_name).stem
         self.phase = phase
         self.flow_mode = flow_mode
         self.flow_dense_size = flow_dense_size
@@ -85,9 +89,9 @@ class MotionDataset(Dataset):
         self.last_epoch = False
 
         if multiclass:
-            self.KP_FILE = "keypoints/vrlens-finetunes-multiclass-v2-yolo11m-pose.npy"
-            self.EMB_FILE = "embeddings/vrlens-finetunes-multiclass-v2-yolo11m-pose.npy"
-            self.EMB_FILE_META = "embeddings/vrlens-finetunes-multiclass-v2-yolo11m-pose.json"
+            self.KP_FILE = str(Path("keypoints") / f"{self.feature_model_name}.npy")
+            self.EMB_FILE = str(Path("embeddings") / f"{self.feature_model_name}.npy")
+            self.EMB_FILE_META = str(Path("embeddings") / f"{self.feature_model_name}.json")
         else:
             self.KP_FILE = "keypoints/pose-vrlens-finetunes-large.npy"
             self.EMB_FILE = "embeddings/pose-vrlens-finetunes-large.npy"
@@ -104,6 +108,11 @@ class MotionDataset(Dataset):
         # Load split
         with open(self.data_dir / "splits" / f"{split}.json") as f:
             video_ids = json.load(f)
+
+        if embed_dim is None:
+            self.embed_dim = self._infer_embed_dim(video_ids) if multiclass else 512
+        else:
+            self.embed_dim = embed_dim
 
         # Load normalization stats
         self._load_stats()
@@ -146,6 +155,9 @@ class MotionDataset(Dataset):
                 if self.multiclass and not meta.get("multiclass", False):
                     skipped += 1
                     continue
+                if int(meta.get("embed_dim", self.embed_dim)) != self.embed_dim:
+                    skipped += 1
+                    continue
             
 
 
@@ -179,11 +191,50 @@ class MotionDataset(Dataset):
             out = {k: v.to(device) for k, v in out.items()}
         return out
 
+    def _infer_embed_dim(self, video_ids: list[str]) -> int:
+        processed = self.data_dir / "processed"
+        for vid_id in video_ids:
+            emb_path = processed / vid_id / self.EMB_FILE
+            metadata = load_embeddings_metadata(emb_path)
+            if metadata is not None and metadata.get("embed_dim") is not None:
+                try:
+                    return int(metadata["embed_dim"])
+                except (TypeError, ValueError):
+                    pass
+            if emb_path.exists():
+                try:
+                    emb_shape = np.load(str(emb_path), mmap_mode="r").shape
+                except Exception:
+                    continue
+                if len(emb_shape) == 3:
+                    return int(emb_shape[2])
+
+        log.warning(
+            "Could not infer embedding width for multiclass feature model %s; defaulting to 512",
+            self.feature_model_name,
+        )
+        return 512
+
     def _load_stats(self) -> None:
-        stats_path = self.data_dir / "featurestats" / "feature_stats.npz"
+        stats_candidates: list[Path] = []
+        if self.multiclass:
+            feature_model_name = Path(self.feature_model_name).stem
+            stats_candidates.extend(
+                [
+                    self.data_dir / f"feature_stats_{feature_model_name}.npz",
+                    self.data_dir / "featurestats" / f"feature_stats_{feature_model_name}.npz",
+                ]
+            )
+        stats_candidates.extend(
+            [
+                self.data_dir / "featurestats" / "feature_stats.npz",
+                self.data_dir / "feature_stats.npz",
+            ]
+        )
+        stats_path = next((candidate for candidate in stats_candidates if candidate.exists()), None)
         self.using_stats = False
-        if not stats_path.exists():
-            log.warning("No feature_stats.npz — features will NOT be normalized")
+        if stats_path is None:
+            log.warning("No feature stats file found — features will NOT be normalized")
             self.emb_mean = self.emb_std = None
             self.flow_mean = self.flow_std = None
             return
@@ -622,6 +673,12 @@ def train() -> None:
                         choices=["OneCycleLR", "CosineAnnealingLR", "CosineWarmupLR", "ReduceLROnPlateau"])
     parser.add_argument("--multiclass", action="store_true",
                         help="Use multiclass model (partner + beholder)")
+    parser.add_argument(
+        "--feature-model-name",
+        type=str,
+        default=DEFAULT_MULTICLASS_FEATURE_MODEL,
+        help="Multiclass feature model stem used for keypoint and embedding filenames",
+    )
     parser.add_argument("--n-partners", type=int, default=5)
     parser.add_argument("--n-beholders", type=int, default=1)
     parser.add_argument("--n-beholder-keypoints", type=int, default=7)
@@ -700,12 +757,21 @@ def train() -> None:
 
     train_ds = MotionDataset(
         args.data_dir, "train", args.seq_len, args.stride,
-        n_persons=n_total, augment=True, multiclass=args.multiclass, phase=args.phase,
+        n_persons=n_total,
+        embed_dim=None if args.multiclass else 512,
+        augment=True,
+        multiclass=args.multiclass,
+        feature_model_name=args.feature_model_name,
+        phase=args.phase,
         flow_mode=args.flow_mode, flow_dense_size=args.flow_dense_size,
     )
     val_ds = MotionDataset(
         args.data_dir, "val", args.seq_len, args.stride,
-        n_persons=n_total, augment=False, multiclass=args.multiclass,
+        n_persons=n_total,
+        embed_dim=train_ds.embed_dim,
+        augment=False,
+        multiclass=args.multiclass,
+        feature_model_name=args.feature_model_name,
         flow_mode=args.flow_mode, flow_dense_size=args.flow_dense_size,
     )
 
@@ -729,12 +795,16 @@ def train() -> None:
 
     log.info("Train: %d sequences (%d batches)", len(train_ds), len(train_loader))
     log.info("Val:   %d sequences (%d batches)", len(val_ds), len(val_loader))
+    log.info("Embedding width: %d", train_ds.embed_dim)
+    if args.multiclass:
+        log.info("Multiclass feature model: %s", train_ds.feature_model_name)
 
     # ── Model ─────────────────────────────────────────────────────────────
     model_kwargs = {
         "d_model": args.d_model,
         "n_blocks": args.n_blocks,
         "dropout": args.dropout,
+        "embed_dim": train_ds.embed_dim,
         "flow_mode": args.flow_mode,
         "flow_dense_size": args.flow_dense_size,
     }
@@ -921,7 +991,7 @@ def train() -> None:
         "kernel_size": 3,
         "dropout": args.dropout,
         "n_keypoints": 21,
-        "embed_dim": 512,
+        "embed_dim": train_ds.embed_dim,
         "flow_dim": 64,
         "flow_mode": args.flow_mode,
         "flow_dense_size": args.flow_dense_size,
@@ -949,6 +1019,7 @@ def train() -> None:
         "seq_len": args.seq_len,
         "stride": args.stride,
         "stats_path": str(train_ds.stats_path) if train_ds.stats_path is not None else None,
+        "feature_model_name": train_ds.feature_model_name if args.multiclass else None,
     }
     metric_config = {
         "event_weight": args.event_weight,

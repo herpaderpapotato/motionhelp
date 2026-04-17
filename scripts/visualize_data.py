@@ -13,6 +13,7 @@ Usage:
 
 import argparse
 import json
+import logging
 import sys
 import tkinter as tk
 from pathlib import Path
@@ -73,6 +74,22 @@ CONF_THRESHOLD = 0.25
 FLOW_GRID_SIDE = 4
 FLOW_N_ACTIVE_CELLS = 4
 FLOW_GLOBAL_OFFSET = 16
+
+LABEL_SHORTCUT_VALUES: dict[str, float] = {
+    "`": 0.0,
+    "1": 0.1,
+    "2": 0.2,
+    "3": 0.3,
+    "4": 0.4,
+    "5": 0.5,
+    "6": 0.6,
+    "7": 0.7,
+    "8": 0.8,
+    "9": 0.9,
+    "0": 1.0,
+}
+
+log = logging.getLogger(__name__)
 
 
 # ─── Utilities ────────────────────────────────────────────────────────────────
@@ -312,6 +329,68 @@ def fit_image(frame_bgr: np.ndarray, max_w: int, max_h: int) -> np.ndarray:
     return frame_bgr
 
 
+def interpolate_frame_labels(
+    total_frames: int,
+    points: dict[int, float],
+    base_labels: np.ndarray | None = None,
+) -> np.ndarray:
+    from scipy.interpolate import interp1d
+
+    if total_frames <= 0:
+        return np.zeros(0, dtype=np.float32)
+
+    if base_labels is not None:
+        labels = np.zeros(total_frames, dtype=np.float32)
+        n_copy = min(total_frames, int(len(base_labels)))
+        if n_copy > 0:
+            labels[:n_copy] = np.asarray(base_labels[:n_copy], dtype=np.float32)
+            if n_copy < total_frames:
+                labels[n_copy:] = labels[n_copy - 1]
+    else:
+        labels = np.zeros(total_frames, dtype=np.float32)
+
+    if not points:
+        return np.clip(labels, 0.0, 1.0).astype(np.float32)
+
+    sorted_points = sorted(
+        (int(frame), float(np.clip(value, 0.0, 1.0)))
+        for frame, value in points.items()
+    )
+    frames = np.array([frame for frame, _ in sorted_points], dtype=np.float32)
+    values = np.array([value for _, value in sorted_points], dtype=np.float32)
+
+    if base_labels is None:
+        if len(sorted_points) == 1:
+            labels.fill(values[0])
+        else:
+            interp_fn = interp1d(
+                frames,
+                values,
+                kind="cubic",
+                bounds_error=False,
+                fill_value="extrapolate",
+            )
+            labels = interp_fn(np.arange(total_frames, dtype=np.float32)).astype(np.float32)
+    else:
+        for frame, value in sorted_points:
+            labels[frame] = value
+        if len(sorted_points) >= 2:
+            interp_fn = interp1d(
+                frames,
+                values,
+                kind="cubic",
+                bounds_error=False,
+                fill_value="extrapolate",
+            )
+            start = int(frames[0])
+            end = int(frames[-1])
+            target_frames = np.arange(start, end + 1, dtype=np.float32)
+            labels[start:end + 1] = interp_fn(target_frames).astype(np.float32)
+            
+
+    return np.clip(labels, 0.0, 1.0).astype(np.float32)
+
+
 # ─── Main Application ─────────────────────────────────────────────────────────
 
 class DataVisualizer:
@@ -340,12 +419,19 @@ class DataVisualizer:
         self.cap: cv2.VideoCapture | None = None
         self.pose_data: np.ndarray | None = None   # [N, max_persons, n_kpt, 3]
         self.label_data: np.ndarray | None = None  # [N]
+        self._loaded_label_data: np.ndarray | None = None
         self.flow_data: np.ndarray | None = None   # [N, flow_dim] or None
         self.metadata: dict = {}
 
         # Playback
         self._playing = False
         self._play_after_id = None
+
+        # Label editing
+        self._label_edit_mode: bool = False
+        self._label_pending_commit: bool = False
+        self._label_edit_base: np.ndarray | None = None
+        self._label_edit_points: dict[int, float] = {}
 
         # Pose keypoint editing
         self._edit_mode: bool = False
@@ -637,6 +723,21 @@ class DataVisualizer:
             bg="#3c3c3c", fg="#cccccc", activebackground="#505050", **_edit_btn,
         )
         self.btn_edit_mode.pack(side=tk.LEFT, padx=(16, 4))
+        self.btn_label_edit_mode = tk.Button(
+            opt_row, text="✎ Edit Labels", command=self._toggle_label_edit_mode,
+            bg="#3c3c3c", fg="#cccccc", activebackground="#505050", **_edit_btn,
+        )
+        self.btn_label_edit_mode.pack(side=tk.LEFT, padx=2)
+        self.btn_wipe_label = tk.Button(
+            opt_row, text="Wipe Label", command=self._wipe_label,
+            bg="#3c3c3c", fg="#cccccc", activebackground="#505050", **_edit_btn,
+        )
+        self.btn_wipe_label.pack(side=tk.LEFT, padx=2)
+        self.btn_reset_label = tk.Button(
+            opt_row, text="Reset Label", command=self._reset_label,
+            bg="#3c3c3c", fg="#cccccc", activebackground="#505050", **_edit_btn,
+        )
+        self.btn_reset_label.pack(side=tk.LEFT, padx=2)
         self.btn_export = tk.Button(
             opt_row, text="⬆ Export Pose Dataset", command=self._export_pose_dataset,
             bg="#3c3c3c", fg="#cccccc", activebackground="#505050", **_edit_btn,
@@ -704,10 +805,12 @@ class DataVisualizer:
         self.scene_listbox.bind("<a>",     lambda e: self._hotkey_approve() or "break")
         self.scene_listbox.bind("<d>",     lambda e: self._hotkey_reject() or "break")
         self.scene_listbox.bind("<space>", lambda e: self._toggle_play() or "break")
+        self.root.bind_all("<KeyPress>", self._on_global_keypress, add="+")
         self.video_canvas.bind("<MouseWheel>", self._on_canvas_zoom)
         self.video_canvas.bind("<Button-2>",   self._on_pan_start)
         self.video_canvas.bind("<B2-Motion>",  self._on_pan)
 
+        self._update_label_edit_ui()
         self._draw_empty_plot()
 
     # ── Scene Discovery & Filtering ────────────────────────────────────────
@@ -793,6 +896,11 @@ class DataVisualizer:
         self._keyframes = {}
         self._vis_overrides = {}
         self._selected_kpt = None
+        self._loaded_label_data = None
+        self._label_edit_mode = False
+        self._label_pending_commit = False
+        self._label_edit_base = None
+        self._label_edit_points = {}
         self.btn_edit_mode.config(text="✎ Edit Keypoints", bg="#3c3c3c")
 
         was_playing = self._playing
@@ -833,7 +941,9 @@ class DataVisualizer:
         else:
             self.kpt_panel.pack_forget()
 
-        self.label_data = np.load(str(scene_dir / "labels.npy"), mmap_mode="r")
+        loaded_labels = np.asarray(np.load(str(scene_dir / "labels.npy")), dtype=np.float32)
+        self._loaded_label_data = loaded_labels.copy()
+        self.label_data = loaded_labels.copy()
 
         # Optical flow: new path first, then legacy
         flow_p = resolve_flow_path(scene_dir, self.cfg.flow.method,
@@ -870,6 +980,7 @@ class DataVisualizer:
         self.scrubber.config(to=max(1, self.total_frames - 1))
         self.scrubber_var.set(0)
 
+        self._update_label_edit_ui()
         self._update_curation_ui()
         self._update_info_panel()
         self._draw_plot()
@@ -891,6 +1002,12 @@ class DataVisualizer:
 
     def _update_info_panel(self):
         m = self.metadata
+        if self._label_edit_mode:
+            label_state = "editing"
+        elif self._label_pending_commit:
+            label_state = "pending save"
+        else:
+            label_state = "disk"
         lines = [
             f"Scene: {self.current_scene}",
             "",
@@ -916,7 +1033,10 @@ class DataVisualizer:
                 "",
                 f"Labels: [{self.label_data.min():.3f}, {self.label_data.max():.3f}]",
                 f"Mean: {self.label_data.mean():.3f}  Std: {self.label_data.std():.3f}",
+                f"Label State: {label_state}",
             ]
+        else:
+            lines += ["", f"Labels: none ({label_state})"]
         # MSE from review.json
         if self.current_review:
             mse_str = self.current_review.get("mse", "")
@@ -924,6 +1044,10 @@ class DataVisualizer:
                 lines.append(f"MSE: {mse_str}")
         if getattr(self, "_is_multiclass", False):
             lines.append("Mode: multiclass")
+        if self._label_edit_mode:
+            lines.append("Label edit: `=0.0 1=0.1 ... 0=1.0")
+        elif self._label_pending_commit:
+            lines.append("Label edit: approve to save labels.npy")
         lines += ["", "Space: play/pause", "←/→: 1fr  ⇧←/⇧→: 10fr"]
 
         self.info_text.config(state=tk.NORMAL)
@@ -982,8 +1106,160 @@ class DataVisualizer:
             self._stage2_sep.pack_forget()
             self._stage2_frame.pack_forget()
 
+    # ── Label Editing ─────────────────────────────────────────────────────
+
+    def _update_label_edit_ui(self):
+        can_edit = self.current_scene is not None and self.total_frames > 0
+        self.btn_label_edit_mode.config(
+            text="✓ Finish Label Edit" if self._label_edit_mode else "✎ Edit Labels",
+            bg="#5a3a00" if self._label_edit_mode else "#3c3c3c",
+            state=tk.NORMAL if can_edit else tk.DISABLED,
+        )
+        self.btn_wipe_label.config(
+            state=tk.NORMAL if self._label_edit_mode else tk.DISABLED,
+            bg="#6b1a1a" if self._label_edit_mode else "#3c3c3c",
+        )
+        self.btn_reset_label.config(
+            state=(
+                tk.NORMAL
+                if can_edit and (self._label_edit_mode or self._label_pending_commit or self.label_data is None)
+                else tk.DISABLED
+            ),
+            bg="#3c3c3c",
+        )
+
+    def _label_matches_disk(self, labels: np.ndarray | None) -> bool:
+        if self._loaded_label_data is None:
+            return labels is None
+        if labels is None or labels.shape != self._loaded_label_data.shape:
+            return False
+        return bool(np.allclose(labels, self._loaded_label_data, atol=1e-6, rtol=0.0))
+
+    def _current_label_value(self, frame_idx: int) -> float | None:
+        if self._label_edit_mode and frame_idx in self._label_edit_points:
+            return self._label_edit_points[frame_idx]
+        if self.label_data is None or frame_idx < 0 or frame_idx >= len(self.label_data):
+            return None
+        return float(self.label_data[frame_idx])
+
+    def _toggle_label_edit_mode(self):
+        if self.current_scene is None or self.total_frames == 0:
+            return
+        if self._label_edit_mode:
+            self._finish_label_edit_mode()
+        else:
+            self._label_edit_mode = True
+            self._label_edit_base = (
+                None if self.label_data is None else np.array(self.label_data, dtype=np.float32, copy=True)
+            )
+            self._label_edit_points = {}
+        self._update_label_edit_ui()
+        self._update_info_panel()
+        self._draw_plot()
+        self._refresh_frame()
+
+    def _finish_label_edit_mode(self):
+        if not self._label_edit_mode:
+            return
+        if self._label_edit_base is None or self._label_edit_points:
+            self.label_data = interpolate_frame_labels(
+                self.total_frames,
+                self._label_edit_points,
+                self._label_edit_base,
+            )
+        elif self.label_data is not None:
+            self.label_data = np.array(self.label_data, dtype=np.float32, copy=True)
+        self._label_edit_mode = False
+        self._label_edit_base = None
+        self._label_edit_points = {}
+        self._label_pending_commit = not self._label_matches_disk(self.label_data)
+
+    def _wipe_label(self):
+        if not self._label_edit_mode:
+            return
+        self.label_data = None
+        self._label_edit_base = None
+        self._label_edit_points = {}
+        self._label_pending_commit = True
+        self._update_label_edit_ui()
+        self._update_info_panel()
+        self._draw_plot()
+        self._refresh_frame()
+
+    def _reset_label(self):
+        if self._loaded_label_data is None:
+            return
+        self.label_data = np.array(self._loaded_label_data, dtype=np.float32, copy=True)
+        self._label_edit_points = {}
+        self._label_edit_base = (
+            np.array(self.label_data, dtype=np.float32, copy=True)
+            if self._label_edit_mode else None
+        )
+        self._label_pending_commit = False
+        self._update_label_edit_ui()
+        self._update_info_panel()
+        self._draw_plot()
+        self._refresh_frame()
+
+    def _set_label_value(self, value: float):
+        if not self._label_edit_mode or self.current_scene is None or self.total_frames == 0:
+            return
+        frame_idx = max(0, min(self.current_frame, self.total_frames - 1))
+        self._label_edit_points[frame_idx] = float(np.clip(value, 0.0, 1.0))
+        self._label_pending_commit = True
+        self._update_label_edit_ui()
+        self._update_info_panel()
+        self._draw_plot()
+        self._refresh_frame()
+
+    def _on_global_keypress(self, event):
+        if not self._label_edit_mode:
+            return None
+        focus = self.root.focus_get()
+        if isinstance(focus, (tk.Entry, tk.Text)):
+            try:
+                if str(focus.cget("state")) != str(tk.DISABLED):
+                    return None
+            except tk.TclError:
+                return None
+        key = event.char or ""
+        if not key and event.keysym == "grave":
+            key = "`"
+        value = LABEL_SHORTCUT_VALUES.get(key)
+        if value is None:
+            return None
+        self._set_label_value(value)
+        return "break"
+
+    def _commit_label_edits(self) -> bool:
+        if not self._label_pending_commit:
+            return True
+        if self.current_scene is None:
+            return False
+        if self._label_edit_mode:
+            self._finish_label_edit_mode()
+        labels = self.label_data
+        if labels is None:
+            labels = np.zeros(self.total_frames, dtype=np.float32)
+        labels = np.clip(np.asarray(labels, dtype=np.float32), 0.0, 1.0)
+        save_path = self.processed_dir / self.current_scene / "labels.npy"
+        temp_path = save_path.with_suffix(".tmp.npy")
+        np.save(str(temp_path), labels)
+        temp_path.replace(save_path)
+        self._loaded_label_data = labels.copy()
+        self.label_data = labels.copy()
+        self._label_pending_commit = False
+        log.info("Saved labels to %s", save_path)
+        self._update_label_edit_ui()
+        self._update_info_panel()
+        self._draw_plot()
+        self._refresh_frame()
+        return True
+
     def _approve(self):
         if self.current_scene:
+            if not self._commit_label_edits():
+                return
             approve(self.processed_dir / self.current_scene)
             self._update_curation_ui()
             self._refresh_scene_list()
@@ -1078,6 +1354,7 @@ class DataVisualizer:
         if self.current_scene is None:
             return
         frame_idx = max(0, min(self.current_frame, self.total_frames - 1))
+        current_label = self._current_label_value(frame_idx)
 
         frame = self._get_video_frame(frame_idx)
         if frame is None:
@@ -1117,8 +1394,8 @@ class DataVisualizer:
         else:
             self._zoom_crop = (0.0, 0.0, 1.0, 1.0)
 
-        if self.show_position_var.get() and self.label_data is not None:
-            frame = draw_position_overlay(frame, float(self.label_data[frame_idx]))
+        if self.show_position_var.get() and current_label is not None:
+            frame = draw_position_overlay(frame, current_label)
 
         # Draw all selected keypoint highlights
         if self._get_active_pose() is not None:
@@ -1150,11 +1427,10 @@ class DataVisualizer:
         self.video_canvas._photo = photo  # prevent GC
 
         t = frame_idx / max(self.fps, 1)
-        pos = float(self.label_data[frame_idx]) if self.label_data is not None else 0
         zoom_str = f"  |  zoom {self._zoom:.1f}x" if self._zoom > 1.001 else ""
         self.frame_label.config(text=f"Frame: {frame_idx} / {self.total_frames - 1}  |  t={t:.2f}s{zoom_str}")
 
-        pos_text = f"pos={pos:.3f}"
+        pos_text = f"pos={current_label:.3f}" if current_label is not None else "pos=—"
         if self.flow_data is not None:
             finfo = _decode_flow_features(self.flow_data[frame_idx])
             gmag = finfo["global_mean_mag"]
@@ -1180,13 +1456,23 @@ class DataVisualizer:
         self.timeline_canvas.draw()
 
     def _draw_plot(self):
-        if self.label_data is None:
-            return
         frames = np.arange(self.total_frames)
 
         self.ax.clear()
         self.ax.set_facecolor("#1e1e1e")
-        self.ax.plot(frames, self.label_data, color="#4ec9b0", lw=1.0)
+        if self.label_data is not None and len(self.label_data) > 0:
+            self.ax.plot(frames, self.label_data, color="#4ec9b0", lw=1.0)
+        else:
+            self.ax.text(0.5, 0.5, "No labels in memory", transform=self.ax.transAxes,
+                         ha="center", va="center", color="#555555", fontsize=9)
+        if self._label_edit_points:
+            edit_frames = np.array(sorted(self._label_edit_points), dtype=np.int32)
+            edit_values = np.array([self._label_edit_points[int(frame)] for frame in edit_frames],
+                                   dtype=np.float32)
+            self.ax.scatter(edit_frames, edit_values, color="#f44747", s=24, zorder=5)
+            if len(edit_frames) >= 2:
+                self.ax.plot(edit_frames, edit_values, color="#f44747", lw=0.8,
+                             alpha=0.75, linestyle="--")
         self.ax.set_xlim(0, self.total_frames)
         self.ax.set_ylim(-0.05, 1.05)
         self.ax.set_ylabel("Position [0,1]", color="#666666", fontsize=8)

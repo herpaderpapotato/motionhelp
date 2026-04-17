@@ -24,16 +24,33 @@ from torchvision.ops import roi_align
 
 log = logging.getLogger(__name__)
 
-BACKBONE_LAYER = 9   # SPPF (backbone output), stride 32, [B, 512, 20, 20] for 640px
 BACKBONE_STRIDE = 32
-EMBED_DIM = 512
 ROI_OUTPUT_SIZE = 7
+FEATURE_LAYER_TYPES = ("SPPF", "C2PSA")
 
 # Multiclass constants
 PARTNER_CLASS = 0
 BEHOLDER_CLASS = 1
 PARTNER_N_KEYPOINTS = 21
 BEHOLDER_N_KEYPOINTS = 7  # real keypoints at indices 0-6 of the 21 output
+
+
+def _resolve_feature_layer(model: Any, layer_idx: int | None) -> tuple[int, str]:
+    layers = model.model.model
+    if layer_idx is not None:
+        if not 0 <= layer_idx < len(layers):
+            raise ValueError(f"Invalid feature layer index {layer_idx} for model with {len(layers)} layers")
+        return layer_idx, type(layers[layer_idx]).__name__
+
+    for layer_type in FEATURE_LAYER_TYPES:
+        for idx in range(len(layers) - 1, -1, -1):
+            if type(layers[idx]).__name__ == layer_type:
+                return idx, layer_type
+
+    raise ValueError(
+        "Could not resolve a YOLO feature layer automatically; "
+        f"expected one of {FEATURE_LAYER_TYPES}, found {[type(layer).__name__ for layer in layers]}"
+    )
 
 
 class SinglePassExtractor:
@@ -52,7 +69,7 @@ class SinglePassExtractor:
     def __init__(
         self,
         model: Any,
-        layer_idx: int = BACKBONE_LAYER,
+        layer_idx: int | None = None,
         max_persons: int = 10,
         n_keypoints: int = 21,
         confidence_threshold: float = 0.001,
@@ -64,11 +81,11 @@ class SinglePassExtractor:
         n_beholder_keypoints: int = BEHOLDER_N_KEYPOINTS,
     ):
         self.model = model
-        self.layer_idx = layer_idx
         self.n_keypoints = n_keypoints
         self.conf_threshold = confidence_threshold
         self.device = device
         self._features: torch.Tensor | None = None
+        self.embed_dim: int | None = None
 
         self.multiclass = multiclass
         if multiclass:
@@ -79,11 +96,11 @@ class SinglePassExtractor:
         else:
             self.max_persons = max_persons
 
-        self._hook = model.model.model[layer_idx].register_forward_hook(self._capture)
-        layer_name = type(model.model.model[layer_idx]).__name__
+        self.layer_idx, self.layer_name = _resolve_feature_layer(model, layer_idx)
+        self._hook = model.model.model[self.layer_idx].register_forward_hook(self._capture)
         log.info(
             "Registered hook on layer %d (%s)%s",
-            layer_idx, layer_name,
+            self.layer_idx, self.layer_name,
             f" [multiclass: {max_partners}p+{max_beholders}b]" if multiclass else "",
         )
 
@@ -101,7 +118,7 @@ class SinglePassExtractor:
 
         Returns:
             keypoints:  [N, max_persons, n_keypoints, 3] float32
-            embeddings: [N, max_persons, EMBED_DIM] float32
+            embeddings: [N, max_persons, embed_dim] float32
 
         In multiclass mode, slots 0..max_partners-1 hold partner detections
         and slots max_partners..max_persons-1 hold beholder detections.
@@ -110,9 +127,6 @@ class SinglePassExtractor:
         n_frames = len(frames)
         kp_out = np.zeros(
             (n_frames, self.max_persons, self.n_keypoints, 3), dtype=np.float32,
-        )
-        emb_out = np.zeros(
-            (n_frames, self.max_persons, EMBED_DIM), dtype=np.float32,
         )
 
         if isinstance(frames, np.ndarray):
@@ -130,6 +144,15 @@ class SinglePassExtractor:
         )
 
         features = self._features  # [B, 512, H_feat, W_feat]
+        if features is None:
+            raise RuntimeError(
+                f"No feature map captured from layer {self.layer_idx} ({self.layer_name})"
+            )
+
+        self.embed_dim = int(features.shape[1])
+        emb_out = np.zeros(
+            (n_frames, self.max_persons, self.embed_dim), dtype=np.float32,
+        )
 
         for i, result in enumerate(results):
             if result.keypoints is None or len(result.keypoints) == 0:
@@ -306,7 +329,7 @@ def extract_single_pass_batched(
 
     Returns:
         keypoints:  [N, max_persons, n_keypoints, 3] float32
-        embeddings: [N, max_persons, EMBED_DIM] float32
+        embeddings: [N, max_persons, embed_dim] float32
     """
     n_frames = len(frames)
     all_kp = []
