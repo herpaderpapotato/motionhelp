@@ -14,6 +14,7 @@ import logging
 import os
 import sys
 import time
+from tqdm import tqdm
 from pathlib import Path
 
 import matplotlib
@@ -190,6 +191,18 @@ class MotionDataset(Dataset):
         if device is not None:
             out = {k: v.to(device) for k, v in out.items()}
         return out
+    
+    def sample_random(self, n: int = 8, device: torch.device | None = None) -> dict[str, torch.Tensor]:
+        """Return a random batch of n sequences."""
+        idx = np.random.choice(len(self.sequences), n, replace=False)
+        batch = [self[i] for i in idx]
+        out = {k: torch.stack([b[k] for b in batch]) for k in batch[0]}
+        if device is not None:
+            out = {k: v.to(device) for k, v in out.items()}
+        return out
+
+
+
 
     def _infer_embed_dim(self, video_ids: list[str]) -> int:
         processed = self.data_dir / "processed"
@@ -460,16 +473,17 @@ def _compute_loss_from_multichannel(
             + args.temporal_weight * temp_loss
             + args.velocity_weight * vel_loss
             + args.spectral_weight * spec_loss)
-
-    # Auxiliary branch losses (MSE against same labels)
-    if args.aux_weight > 0:
-        aux_loss = torch.zeros(1, device=pred.device, dtype=pred.dtype)
-        for ch in range(1, 4):
-            aux_pred = pred[:, ch]  # [B, T]
-            aux_loss = aux_loss + F.mse_loss(aux_pred, lbl)
-        aux_loss = aux_loss / 3.0  # average across 3 auxiliary branches
-        loss = loss + args.aux_weight * aux_loss
-        metric_batch["aux_loss"] = aux_loss.detach()
+    
+    if args.use_aux_layers:
+        # Auxiliary branch losses (MSE against same labels)
+        if args.aux_weight > 0:
+            aux_loss = torch.zeros(1, device=pred.device, dtype=pred.dtype)
+            for ch in range(1, 4):
+                aux_pred = pred[:, ch]  # [B, T]
+                aux_loss = aux_loss + F.mse_loss(aux_pred, lbl)
+            aux_loss = aux_loss / 3.0  # average across 3 auxiliary branches
+            loss = loss + args.aux_weight * aux_loss
+            metric_batch["aux_loss"] = aux_loss.detach()
 
     return loss, main_pred, metric_batch
 
@@ -725,7 +739,15 @@ def train() -> None:
                         help="Spatial resolution for dense flow maps (default: 32)")
     parser.add_argument("--aux-weight", type=float, default=0.3,
                         help="Weight for auxiliary per-modality branch losses (0 = ignore aux branches)")
+    parser.add_argument("--use-aux-layers", action="store_true", default=False,
+                        help="Enable auxiliary per-modality branches")
+    parser.add_argument("--disable-aux-layers", action="store_false", dest="use_aux_layers",
+                        help="Disable auxiliary per-modality branches (overrides --use-aux-layers)")
     args = parser.parse_args()
+
+
+    if not args.use_aux_layers:
+        args.aux_weight = 0.0
 
     if not 0.0 <= args.event_weight <= 1.0:
         parser.error("--event-weight must be between 0 and 1")
@@ -807,6 +829,7 @@ def train() -> None:
         "embed_dim": train_ds.embed_dim,
         "flow_mode": args.flow_mode,
         "flow_dense_size": args.flow_dense_size,
+        "use_aux_layers": args.use_aux_layers,
     }
     if args.multiclass:
         model_kwargs.update({
@@ -840,6 +863,11 @@ def train() -> None:
         model.load_state_dict(ckpt["model_state_dict"])
         log.info("  Loaded model (epoch %s, val_loss=%s)",
                  ckpt.get("epoch", "?"), f"{ckpt.get('val_loss', 0):.6f}")
+        if not args.use_aux_layers:
+            log.info("  Disabling auxiliary layers as per command-line argument")
+            model.disable_aux_layers()
+                
+            
 
     params = model.count_parameters()
     log.info("Model: %s trainable / %s total parameters",
@@ -1065,7 +1093,7 @@ def train() -> None:
             "spec_mse": [],
         }
 
-        for batch in train_loader:
+        for batch in tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs}", unit="batch"):
             kp = batch["keypoints"].to(device, non_blocking=True)
             emb = batch["embeddings"].to(device, non_blocking=True)
             fl = batch["flow"].to(device, non_blocking=True)
@@ -1105,8 +1133,9 @@ def train() -> None:
                 writer.add_scalar("train/pred_std", main_pred.std().item(), global_step)
                 writer.add_scalar("train/grad_norm", grad_norm.item(), global_step)
                 writer.add_scalar("lr", optimizer.param_groups[0]["lr"], global_step)
-                if "aux_loss" in metric_batch:
-                    writer.add_scalar("train/aux_loss", metric_batch["aux_loss"].item(), global_step)
+                if args.use_aux_layers:
+                    if "aux_loss" in metric_batch:
+                        writer.add_scalar("train/aux_loss", metric_batch["aux_loss"].item(), global_step)
 
         avg_train = np.mean(train_losses)
         avg_train_metrics = {key: float(np.mean(values)) for key, values in train_metric_history.items()}
@@ -1142,7 +1171,7 @@ def train() -> None:
             
 
         with torch.no_grad():
-            for batch in val_loader:
+            for batch in tqdm(val_loader, desc=f"Epoch {epoch}/{args.epochs}", unit="batch"):
                 kp = batch["keypoints"].to(device, non_blocking=True)
                 emb = batch["embeddings"].to(device, non_blocking=True)
                 fl = batch["flow"].to(device, non_blocking=True)
@@ -1201,7 +1230,11 @@ def train() -> None:
         if epoch % 2 == 0 or epoch == 1:
             model.eval()
             with torch.no_grad():
-                samples = val_ds.sample_high_variance(n=8, device=device)
+                # samples = val_ds.sample_high_variance(n=8, device=device)
+                if epoch == 1: # choose 4 random, and 4 high-variance samples in the first epoch and reuse them for consistency in future epochs
+                    samples = val_ds.sample_random(n=4, device=device)
+                    samples_high_var = val_ds.sample_high_variance(n=4, device=device)
+                    samples = {key: torch.cat([samples[key], samples_high_var[key]], dim=0) for key in samples}
                 kp_s = samples["keypoints"]
                 emb_s = samples["embeddings"]
                 fl_s = samples["flow"]
@@ -1217,19 +1250,34 @@ def train() -> None:
             fig, axes = plt.subplots(n_plots, 1, figsize=(12, 2 * n_plots), sharex=False)
             if n_plots == 1:
                 axes = [axes]
-            aux_colors = ["green", "purple", "red"]
-            aux_labels = ["pose", "emb", "flow"]
-            for i, ax in enumerate(axes):
-                ax.plot(lbl_s[i], label="target", alpha=0.85, lw=1.5, color="steelblue")
-                ax.plot(pred_s[i, 0], label="fused", alpha=0.85, lw=1.5, color="darkorange")
-                for ch in range(1, 4):
-                    ax.plot(pred_s[i, ch], label=aux_labels[ch - 1],
-                            alpha=0.4, lw=0.8, color=aux_colors[ch - 1])
-                ax.set_ylim(-0.05, 1.05)
-                ax.set_ylabel(f"#{i}", fontsize=7)
-                if i == 0:
-                    ax.legend(fontsize=7)
-                    ax.set_title(f"Epoch {epoch} predictions (high-variance val samples)")
+            if args.use_aux_layers:
+                aux_colors = ["green", "purple", "red"]
+                aux_labels = ["pose", "emb", "flow"]
+                for i, ax in enumerate(axes):
+                    ax.plot(lbl_s[i], label="target", alpha=0.85, lw=1.5, color="steelblue")
+                    ax.plot(pred_s[i, 0], label="fused", alpha=0.85, lw=1.5, color="darkorange")
+                    for ch in range(1, 4):
+                        ax.plot(pred_s[i, ch], label=aux_labels[ch - 1],
+                                alpha=0.4, lw=0.8, color=aux_colors[ch - 1])
+                    
+                    ax.set_ylim(-0.05, 1.05)
+                    ax.set_ylabel(f"#{i}", fontsize=7)
+                    if i == 0:
+                        ax.legend(fontsize=7)
+                        ax.set_title(f"Epoch {epoch} predictions (high-variance val samples)")
+            else:
+                # just plot the main prediction channel without aux branches
+                for i, ax in enumerate(axes):
+                    ax.plot(lbl_s[i], label="target", alpha=0.85, lw=1.5, color="steelblue")
+                    ax.plot(pred_s[i, 0], label="pred", alpha=0.85, lw=1.5, color="darkorange")
+                    ax.set_ylim(-0.05, 1.05)
+                    ax.set_ylabel(f"#{i}", fontsize=7)
+                    if i == 0:
+                        ax.legend(fontsize=7)
+                        ax.set_title(f"Epoch {epoch} predictions (high-variance val samples)")
+
+
+                
             fig.tight_layout()
             writer.add_figure("Predictions/overlay", fig, epoch)
             plt.close(fig)

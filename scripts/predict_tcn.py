@@ -632,7 +632,7 @@ def live_playback_with_prediction(
     from PIL import Image, ImageTk
 
     #MAX_FRAME_BUF = 600       # max decoded frames to keep in RAM (~150MB at 640px)
-    MAX_FRAME_BUF = seq_len * 3
+    MAX_FRAME_BUF = 60000
     STATS_EVERY_N = 8         # update stats panel every N display ticks
     GRAPH_EVERY_N = 4         # update matplotlib graph every N display ticks
 
@@ -658,7 +658,7 @@ def live_playback_with_prediction(
                 _state["status"] = "Loading pose model…"
 
             pose_model = load_pose_model(
-                model_name="yolo11m-pose",
+                model_name="vrlens-finetunes-multiclass-v2-yolo26x-pose",
                 model_path=str(pose_model_path),
                 device=str(device),
             )
@@ -893,8 +893,8 @@ def live_playback_with_prediction(
     _tick     = [0]                  # display update counter
 
     # Buffer thresholds
-    BUF_START_THRESHOLD = 640       # must fill completely before initial play
-    BUF_RESUME_THRESHOLD = MAX_FRAME_BUF//2
+    BUF_START_THRESHOLD = 360       # must fill completely before initial play
+    BUF_RESUME_THRESHOLD = 360
     BUF_LOW_THRESHOLD    = 30                 # pause playback when buffer drops below this
 
     frame_delay_ms = max(16, int(round(1000.0 / target_fps)))

@@ -527,6 +527,7 @@ class FunscriptTCN(nn.Module):
         kin_dim: int = 64,
         use_gated_fusion: bool = False,
         use_difference_pathway: bool = False,
+        use_aux_layers: bool = True,
         difference_dim: int = 64,
     ):
         super().__init__()
@@ -543,6 +544,7 @@ class FunscriptTCN(nn.Module):
         self.use_gated_fusion = use_gated_fusion
         self.use_difference_pathway = use_difference_pathway and self.multiclass
         self.difference_dim = difference_dim
+        self.use_aux_layers = use_aux_layers
         self._kernel_size = kernel_size
         self._dropout = dropout
 
@@ -659,59 +661,87 @@ class FunscriptTCN(nn.Module):
             nn.Linear(64, 1),
         )
 
-        # -- Auxiliary per-modality branches --
-        # Each branch: project → small TCN (3 blocks) → output head
-        aux_d = d_model // 4  # 64 by default
-        aux_n_blocks = min(3, n_blocks)
-        aux_dilations = [2 ** i for i in range(aux_n_blocks)]  # [1, 2, 4]
+        if self.use_aux_layers:
+            # -- Auxiliary per-modality branches --
+            # Each branch: project → small TCN (3 blocks) → output head
+            aux_d = d_model // 4  # 64 by default
+            aux_n_blocks = min(3, n_blocks)
+            aux_dilations = [2 ** i for i in range(aux_n_blocks)]  # [1, 2, 4]
 
-        # Pose auxiliary branch (input: 128-d from pose attention pooling)
-        self.aux_pose_proj = nn.Sequential(
-            nn.Linear(128, aux_d),
-            nn.LayerNorm(aux_d),
-            nn.GELU(),
-        )
-        self.aux_pose_tcn = nn.ModuleList([
-            block_cls(aux_d, kernel_size, d, dropout) for d in aux_dilations
-        ])
-        self.aux_pose_head = nn.Sequential(
-            nn.Linear(aux_d, 32),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(32, 1),
-        )
+            # Pose auxiliary branch (input: 128-d from pose attention pooling)
+            self.aux_pose_proj = nn.Sequential(
+                nn.Linear(128, aux_d),
+                nn.LayerNorm(aux_d),
+                nn.GELU(),
+            )
+            self.aux_pose_tcn = nn.ModuleList([
+                block_cls(aux_d, kernel_size, d, dropout) for d in aux_dilations
+            ])
+            self.aux_pose_head = nn.Sequential(
+                nn.Linear(aux_d, 32),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(32, 1),
+            )
 
-        # Embedding auxiliary branch (input: 128-d from emb attention pooling)
-        self.aux_emb_proj = nn.Sequential(
-            nn.Linear(128, aux_d),
-            nn.LayerNorm(aux_d),
-            nn.GELU(),
-        )
-        self.aux_emb_tcn = nn.ModuleList([
-            block_cls(aux_d, kernel_size, d, dropout) for d in aux_dilations
-        ])
-        self.aux_emb_head = nn.Sequential(
-            nn.Linear(aux_d, 32),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(32, 1),
-        )
+            # Embedding auxiliary branch (input: 128-d from emb attention pooling)
+            self.aux_emb_proj = nn.Sequential(
+                nn.Linear(128, aux_d),
+                nn.LayerNorm(aux_d),
+                nn.GELU(),
+            )
+            self.aux_emb_tcn = nn.ModuleList([
+                block_cls(aux_d, kernel_size, d, dropout) for d in aux_dilations
+            ])
+            self.aux_emb_head = nn.Sequential(
+                nn.Linear(aux_d, 32),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(32, 1),
+            )
 
-        # Flow auxiliary branch (input: 64-d from flow encoder)
-        self.aux_flow_proj = nn.Sequential(
-            nn.Linear(flow_out_dim, aux_d),
-            nn.LayerNorm(aux_d),
-            nn.GELU(),
-        )
-        self.aux_flow_tcn = nn.ModuleList([
-            block_cls(aux_d, kernel_size, d, dropout) for d in aux_dilations
-        ])
-        self.aux_flow_head = nn.Sequential(
-            nn.Linear(aux_d, 32),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(32, 1),
-        )
+            # Flow auxiliary branch (input: 64-d from flow encoder)
+            self.aux_flow_proj = nn.Sequential(
+                nn.Linear(flow_out_dim, aux_d),
+                nn.LayerNorm(aux_d),
+                nn.GELU(),
+            )
+            self.aux_flow_tcn = nn.ModuleList([
+                block_cls(aux_d, kernel_size, d, dropout) for d in aux_dilations
+            ])
+            self.aux_flow_head = nn.Sequential(
+                nn.Linear(aux_d, 32),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(32, 1),
+            )
+
+    def disable_aux_layers(self):
+        """Permanently disable auxiliary branches for inference efficiency."""
+        self.use_aux_layers = False
+        # del self.aux_pose_proj, self.aux_pose_tcn, self.aux_pose_head
+        # del self.aux_emb_proj, self.aux_emb_tcn, self.aux_emb_head
+        # del self.aux_flow_proj, self.aux_flow_tcn, self.aux_flow_head
+        if hasattr(self, "aux_pose_proj"):
+            del self.aux_pose_proj
+        if hasattr(self, "aux_pose_tcn"):
+            del self.aux_pose_tcn
+        if hasattr(self, "aux_pose_head"):
+            del self.aux_pose_head
+        if hasattr(self, "aux_emb_proj"):
+            del self.aux_emb_proj
+        if hasattr(self, "aux_emb_tcn"):
+            del self.aux_emb_tcn
+        if hasattr(self, "aux_emb_head"):
+            del self.aux_emb_head
+        if hasattr(self, "aux_flow_proj"):
+            del self.aux_flow_proj
+        if hasattr(self, "aux_flow_tcn"):
+            del self.aux_flow_tcn
+        if hasattr(self, "aux_flow_head"):
+            del self.aux_flow_head
+                   
+
 
     def forward(
         self,
@@ -726,7 +756,8 @@ class FunscriptTCN(nn.Module):
             embeddings: [B, T, N, E]
             flow:       [B, T, F] (summary mode) or [B, T, 2, H, W] (dense mode)
         Returns: [B, 4, T] positions in [0, 1]
-            Channel 0: fused, 1: pose-only, 2: emb-only, 3: flow-only
+            AUX mode Channel 0: fused, 1: pose-only, 2: emb-only, 3: flow-only
+            Normal mode Channel 0: fused
         """
         B, T = keypoints.shape[:2]
 
@@ -804,24 +835,25 @@ class FunscriptTCN(nn.Module):
         else:
             x = self.fusion(torch.cat(fusion_parts, dim=-1))           # [B, T, d_model]
 
-        # -- Auxiliary per-modality branches (before main TCN) --
-        # Pose auxiliary
-        aux_p = self.aux_pose_proj(pose_out).transpose(1, 2)          # [B, aux_d, T]
-        for block in self.aux_pose_tcn:
-            aux_p = block(aux_p)
-        aux_p = self.aux_pose_head(aux_p.transpose(1, 2)).squeeze(-1) # [B, T]
+        if self.use_aux_layers:
+            # -- Auxiliary per-modality branches (before main TCN) --
+            # Pose auxiliary
+            aux_p = self.aux_pose_proj(pose_out).transpose(1, 2)          # [B, aux_d, T]
+            for block in self.aux_pose_tcn:
+                aux_p = block(aux_p)
+            aux_p = self.aux_pose_head(aux_p.transpose(1, 2)).squeeze(-1) # [B, T]
 
-        # Embedding auxiliary
-        aux_e = self.aux_emb_proj(emb_out).transpose(1, 2)            # [B, aux_d, T]
-        for block in self.aux_emb_tcn:
-            aux_e = block(aux_e)
-        aux_e = self.aux_emb_head(aux_e.transpose(1, 2)).squeeze(-1)  # [B, T]
+            # Embedding auxiliary
+            aux_e = self.aux_emb_proj(emb_out).transpose(1, 2)            # [B, aux_d, T]
+            for block in self.aux_emb_tcn:
+                aux_e = block(aux_e)
+            aux_e = self.aux_emb_head(aux_e.transpose(1, 2)).squeeze(-1)  # [B, T]
 
-        # Flow auxiliary
-        aux_f = self.aux_flow_proj(flow_out).transpose(1, 2)          # [B, aux_d, T]
-        for block in self.aux_flow_tcn:
-            aux_f = block(aux_f)
-        aux_f = self.aux_flow_head(aux_f.transpose(1, 2)).squeeze(-1) # [B, T]
+            # Flow auxiliary
+            aux_f = self.aux_flow_proj(flow_out).transpose(1, 2)          # [B, aux_d, T]
+            for block in self.aux_flow_tcn:
+                aux_f = block(aux_f)
+            aux_f = self.aux_flow_head(aux_f.transpose(1, 2)).squeeze(-1) # [B, T]
 
         # -- Main TCN backbone (expects channels-first) --
         x = x.transpose(1, 2)                                         # [B, d_model, T]
@@ -832,8 +864,11 @@ class FunscriptTCN(nn.Module):
         # -- Main output --
         main_out = self.output_head(x).squeeze(-1)                     # [B, T]
 
-        # -- Stack all channels: [fused, pose, emb, flow] --
-        out = torch.stack([main_out, aux_p, aux_e, aux_f], dim=1)      # [B, 4, T]
+        if self.use_aux_layers:
+            # -- Stack all channels: [fused, pose, emb, flow] --
+            out = torch.stack([main_out, aux_p, aux_e, aux_f], dim=1)      # [B, 4, T]
+        else:
+            out = main_out.unsqueeze(1)                                         # [B, 1, T]
         return torch.sigmoid(out)
 
     def _compute_kinematics(
