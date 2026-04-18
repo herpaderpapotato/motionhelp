@@ -11,10 +11,10 @@ and trains a temporal convolutional network for per-frame position prediction.
 import argparse
 import json
 import logging
+import math
 import os
 import sys
 import time
-from tqdm import tqdm
 from pathlib import Path
 
 import matplotlib
@@ -24,8 +24,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader, Dataset, Sampler
 from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
 
 # Resolve imports from project root
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -422,6 +423,43 @@ class MotionDataset(Dataset):
         return kp, emb, flow, labels
 
 
+def _resolve_sequence_limit(total_sequences: int, requested_limit: int | None) -> int:
+    if requested_limit is None:
+        return total_sequences
+    return min(total_sequences, requested_limit)
+
+
+class EpochSubsetSampler(Sampler[int]):
+    # Re-samples a capped subset each epoch when shuffle=True.
+    def __init__(
+        self,
+        dataset_size: int,
+        max_samples: int | None = None,
+        shuffle: bool = False,
+        seed: int = 0,
+    ) -> None:
+        self.dataset_size = dataset_size
+        self.max_samples = _resolve_sequence_limit(dataset_size, max_samples)
+        self.shuffle = shuffle
+        self.seed = seed
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+
+    def __len__(self) -> int:
+        return self.max_samples
+
+    def __iter__(self):
+        if not self.shuffle:
+            return iter(range(self.max_samples))
+
+        generator = torch.Generator()
+        generator.manual_seed(self.seed + self.epoch)
+        indices = torch.randperm(self.dataset_size, generator=generator)[:self.max_samples]
+        return iter(indices.tolist())
+
+
 # ---------------------------------------------------------------------------
 # Loss helpers
 # ---------------------------------------------------------------------------
@@ -668,6 +706,7 @@ def _apply_phase_freezing(model: FunscriptTCN, phase: int, fill_with_noise: bool
 def train() -> None:
     import random
     parser = argparse.ArgumentParser(description="Train TCN funscript model")
+    parser.set_defaults(shuffle=True)
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=64)
@@ -680,6 +719,12 @@ def train() -> None:
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--temporal-weight", type=float, default=0.1)
+    parser.add_argument("--max-train-sequences-per-epoch", type=int, default=None,
+                        help="Cap the number of train sequences used in each epoch")
+    parser.add_argument("--shuffle", action="store_true", dest="shuffle",
+                        help="Shuffle train sequences and resample capped subsets each epoch")
+    parser.add_argument("--no-shuffle", action="store_false", dest="shuffle",
+                        help="Disable shuffling and reuse the same deterministic subset each epoch")
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--seed", type=int, default=random.randint(0, 1_000_000))
     parser.add_argument("--num-workers", type=int, default=4)
@@ -749,6 +794,8 @@ def train() -> None:
     if not args.use_aux_layers:
         args.aux_weight = 0.0
 
+    if args.max_train_sequences_per_epoch is not None and args.max_train_sequences_per_epoch <= 0:
+        parser.error("--max-train-sequences-per-epoch must be a positive integer")
     if not 0.0 <= args.event_weight <= 1.0:
         parser.error("--event-weight must be between 0 and 1")
     if not 0.0 < args.active_quantile <= 1.0:
@@ -797,10 +844,32 @@ def train() -> None:
         flow_mode=args.flow_mode, flow_dense_size=args.flow_dense_size,
     )
 
+    train_sequences_per_epoch = _resolve_sequence_limit(
+        len(train_ds),
+        args.max_train_sequences_per_epoch,
+    )
+    train_subset_is_limited = train_sequences_per_epoch < len(train_ds)
+    val_sequences_per_epoch: int | None = None
+    if train_subset_is_limited:
+        val_sequences_per_epoch = min(len(val_ds), max(1, math.ceil(train_sequences_per_epoch * 0.1)))
+
+    train_sampler = EpochSubsetSampler(
+        len(train_ds),
+        max_samples=train_sequences_per_epoch,
+        shuffle=args.shuffle,
+        seed=args.seed,
+    )
+    val_sampler = EpochSubsetSampler(
+        len(val_ds),
+        max_samples=val_sequences_per_epoch,
+        shuffle=False,
+        seed=args.seed,
+    )
+
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
-        shuffle=True,
+        sampler=train_sampler,
         num_workers=args.num_workers,
         pin_memory=(device.type == "cuda" or device.type == "cuda:0"),  # allow pinned memory for CUDA even if using a specific GPU
         persistent_workers=args.num_workers > 0,
@@ -809,14 +878,27 @@ def train() -> None:
     val_loader = DataLoader(
         val_ds,
         batch_size=args.batch_size,
-        shuffle=False,
+        sampler=val_sampler,
         num_workers=args.num_workers,
         pin_memory=(device.type == "cuda" or device.type == "cuda:0"),  # allow pinned memory for CUDA even if using a specific GPU
         persistent_workers=args.num_workers > 0,
     )
 
-    log.info("Train: %d sequences (%d batches)", len(train_ds), len(train_loader))
-    log.info("Val:   %d sequences (%d batches)", len(val_ds), len(val_loader))
+    log.info(
+        "Train: %d/%d sequences per epoch (%d batches, shuffle=%s)",
+        len(train_sampler), len(train_ds), len(train_loader), args.shuffle,
+    )
+    if train_subset_is_limited:
+        log.info(
+            "Train subset selection: %s",
+            "reshuffled each epoch" if args.shuffle else "fixed deterministic subset",
+        )
+        log.info(
+            "Val:   %d/%d sequences per epoch (%d batches, 10%% of capped train)",
+            len(val_sampler), len(val_ds), len(val_loader),
+        )
+    else:
+        log.info("Val:   %d sequences (%d batches)", len(val_ds), len(val_loader))
     log.info("Embedding width: %d", train_ds.embed_dim)
     if args.multiclass:
         log.info("Multiclass feature model: %s", train_ds.feature_model_name)
@@ -1046,6 +1128,9 @@ def train() -> None:
     data_config = {
         "seq_len": args.seq_len,
         "stride": args.stride,
+        "shuffle": args.shuffle,
+        "train_sequences_per_epoch": len(train_sampler),
+        "val_sequences_per_epoch": len(val_sampler),
         "stats_path": str(train_ds.stats_path) if train_ds.stats_path is not None else None,
         "feature_model_name": train_ds.feature_model_name if args.multiclass else None,
     }
@@ -1080,6 +1165,7 @@ def train() -> None:
         epoch_start = time.time()
 
         # --- Train ---
+        train_sampler.set_epoch(epoch - 1)
         model.train()
         train_losses = []
         train_metric_history = {
@@ -1163,7 +1249,7 @@ def train() -> None:
             val_loader = DataLoader(
                 val_ds,
                 batch_size=args.batch_size,
-                shuffle=False,
+                sampler=val_sampler,
                 num_workers=args.num_workers,
                 pin_memory=(device.type == "cuda" or device.type == "cuda:0"),  # allow pinned memory for CUDA even if using a specific GPU
                 persistent_workers=args.num_workers > 0,

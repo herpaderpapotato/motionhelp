@@ -97,7 +97,7 @@ def _build_model_from_config(config: dict[str, object]) -> torch.nn.Module:
     model_type = config.get("model_type", "tcn")
     if model_type == "lite_tcn":
         return FunscriptLiteTCN(**extract_lite_model_config(config))
-    return FunscriptTCN(**extract_model_config(config))
+    return FunscriptTCN(**extract_model_config(config), use_aux_layers=False)
 
 
 def _extract_prediction_tensor(output: torch.Tensor) -> torch.Tensor:
