@@ -1,8 +1,8 @@
 """Refinement model for postprocessing TCN predictions.
 
 A small 1D convolutional network with dilated convolutions that takes
-per-frame predictions from the upstream TCN and refines them to better
-match ground-truth labels over long sequences (1200 frames).
+per-frame funscript position predictions from the upstream TCN and refines
+them to better match ground-truth labels over long sequences.
 """
 
 import torch
@@ -34,15 +34,19 @@ class DilatedResBlock(nn.Module):
 class RefinementTCN(nn.Module):
     """Postprocessing refinement network.
 
-    Takes single-channel per-frame predictions [B, T] and outputs
-    refined predictions [B, T] in [0, 1].
+        Takes single-channel per-frame position predictions [B, T] and outputs
+        refined positions [B, T] in [0, 1].
 
     Architecture:
     - Input projection: 1 → channels
     - Stack of dilated residual blocks with exponentially growing dilation
-      (1, 2, 4, 8, 16, 32, 64, 128, 256, 512) for ~2047-frame receptive field
-    - Output projection: channels → 1 → sigmoid
-    - Global residual: output = sigmoid(learned_refinement + alpha * input)
+            (1, 2, 4, 8, 16, 32, 64, 128, 256, 512)
+        - Output projection: channels → 1 correction signal
+        - Default residual path operates directly in value space to match the
+            continuous [0, 1] funscript position target.
+
+        Legacy checkpoints used a logit-space residual. That path remains
+        available via residual_mode="logit" for backward compatibility.
     """
 
     def __init__(
@@ -51,12 +55,21 @@ class RefinementTCN(nn.Module):
         n_blocks: int = 10,
         kernel_size: int = 3,
         dropout: float = 0.1,
+        residual_mode: str = "value",
+        delta_limit: float = 0.35,
     ):
         super().__init__()
+        if residual_mode not in {"value", "logit"}:
+            raise ValueError("residual_mode must be 'value' or 'logit'")
+        if delta_limit <= 0:
+            raise ValueError("delta_limit must be positive")
+
         self.channels = channels
         self.n_blocks = n_blocks
+        self.residual_mode = residual_mode
+        self.delta_limit = delta_limit
 
-        # Input: map raw prediction to feature space
+        # Input: map the scalar position signal to feature space.
         self.input_proj = nn.Conv1d(1, channels, 1)
 
         # Dilated conv stack
@@ -73,27 +86,40 @@ class RefinementTCN(nn.Module):
             nn.Conv1d(channels // 2, 1, 1),
         )
 
-        # Learnable residual weight
+        if self.residual_mode == "value":
+            # Start from an exact identity mapping and learn corrections.
+            nn.init.zeros_(self.output_proj[-1].weight)
+            nn.init.zeros_(self.output_proj[-1].bias)
+
+        # Learnable residual scale.
         self.alpha = nn.Parameter(torch.tensor(1.0))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x: [B, T] raw predictions in [0, 1]
+            x: [B, T] raw position predictions in [0, 1]
         Returns:
-            [B, T] refined predictions in [0, 1]
+            [B, T] refined positions in [0, 1]
         """
-        # Transform input to logit space for better learning
-        x_logit = torch.logit(x.clamp(1e-4, 1 - 1e-4))
+        x = x.clamp(0.0, 1.0)
 
-        h = x_logit.unsqueeze(1)  # [B, 1, T]
-        h = self.input_proj(h)    # [B, C, T]
+        if self.residual_mode == "logit":
+            residual_base = torch.logit(x.clamp(1e-4, 1 - 1e-4))
+            model_input = residual_base
+        else:
+            residual_base = x
+            model_input = (2.0 * x) - 1.0
+
+        h = model_input.unsqueeze(1)  # [B, 1, T]
+        h = self.input_proj(h)        # [B, C, T]
 
         for block in self.blocks:
             h = block(h)
 
-        refined_logit = self.output_proj(h).squeeze(1)  # [B, T]
+        correction = self.output_proj(h).squeeze(1)  # [B, T]
 
-        # Residual in logit space
-        out = torch.sigmoid(refined_logit + self.alpha * x_logit)
-        return out
+        if self.residual_mode == "logit":
+            return torch.sigmoid(correction + self.alpha * residual_base)
+
+        bounded_delta = self.delta_limit * torch.tanh(correction)
+        return torch.clamp(residual_base + self.alpha * bounded_delta, 0.0, 1.0)

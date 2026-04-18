@@ -36,6 +36,8 @@ def load_refinement_model(
         n_blocks=cfg["n_blocks"],
         kernel_size=cfg["kernel_size"],
         dropout=cfg.get("dropout", 0.1),
+        residual_mode=cfg.get("residual_mode", "logit"),
+        delta_limit=cfg.get("delta_limit", 0.35),
     )
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()

@@ -154,6 +154,11 @@ def main():
     parser.add_argument("--n-blocks", type=int, default=10)
     parser.add_argument("--kernel-size", type=int, default=3)
     parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--residual-mode", type=str, default="value",
+                        choices=["value", "logit"],
+                        help="Refine in position space (default) or use the legacy logit residual")
+    parser.add_argument("--delta-limit", type=float, default=0.35,
+                        help="Maximum absolute correction applied per frame in value residual mode")
 
     # Training
     parser.add_argument("--epochs", type=int, default=500)
@@ -214,10 +219,13 @@ def main():
         n_blocks=args.n_blocks,
         kernel_size=args.kernel_size,
         dropout=args.dropout,
+        residual_mode=args.residual_mode,
+        delta_limit=args.delta_limit,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model: {n_params:,} trainable parameters")
+    print(f"Residual mode: {args.residual_mode}")
 
     # Compute receptive field
     rf = 1
@@ -293,6 +301,8 @@ def main():
                     "n_blocks": args.n_blocks,
                     "kernel_size": args.kernel_size,
                     "dropout": args.dropout,
+                    "residual_mode": args.residual_mode,
+                    "delta_limit": args.delta_limit,
                 },
                 "training_config": {
                     "seq_len": args.seq_len,
