@@ -217,7 +217,7 @@ def extract_spatial_gpu(
     model_name: str,
     device: torch.device,
     roi_size: int = 7,
-    batch_size: int = 32,
+    batch_size: int = 60,
     vr_mode: bool = False,
     sbs_crop: str = "left",
     target_fps: float = 30.0,
@@ -269,12 +269,13 @@ def extract_spatial_gpu(
         pass
 
     chunk_size = batch_size
+    use_gpu_path = device.type == "cuda" and _has_torchcodec_cuda()
+    print(f"Using {'GPU' if use_gpu_path else 'CPU'} path for video decoding and extraction")
     tp = tqdm(
         total=max(1, total_est // chunk_size) if total_est else None,
         unit=f"×{chunk_size}f", desc="GPU extract", dynamic_ncols=True,
     )
 
-    use_gpu_path = device.type == "cuda" and _has_torchcodec_cuda()
     t_last = time.perf_counter()
 
     for chunk_data in stream_video_gpu(
@@ -484,7 +485,7 @@ def live_playback_with_prediction(
                 _state["status"]    = "Processing video…"
 
             crop_left = vr_mode and sbs_crop == "left"
-            batch_size = 32
+            batch_size = 60
             use_gpu_path = device.type == "cuda" and _has_torchcodec_cuda()
 
             all_spatial: list[np.ndarray] = []
