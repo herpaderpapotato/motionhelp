@@ -1,19 +1,20 @@
 """Extract spatial RoI features from preprocessed videos for DispositionTCN.
 
-Runs YOLO inference on video frames and saves the full RoI-aligned spatial
-feature grids [T, N, C, H, W] instead of mean-pooled embeddings [T, N, C].
+Runs YOLO inference on video frames and saves concatenated multi-scale RoI
+features [T, N, C, H, W] from the neck feature maps that feed the final pose
+head. The default output is a quantised single-file HDF5 cache to keep the
+training I/O cost close to the original single-scale pipeline.
 
 Output per scene:
-    data/processed/{scene_id}/spatial/{model_name}.npy       [T, N, C, roi_size, roi_size] float16
-    data/processed/{scene_id}/spatial/{model_name}_conf.npy  [T, N] float32
+    data/processed/{scene_id}/spatial/{model_name}.h5
+        /spatial  [T, N, C, roi_size, roi_size] int8 or float16
+        /conf     [T, N] float32
 
 Usage:
     python scripts/extract_spatial.py --n-train 30 --n-val 5
     python scripts/extract_spatial.py --n-train 50 --n-val 10 --roi-size 7
 """
 
-
-import h5py
 import argparse
 import json
 import logging
@@ -29,10 +30,12 @@ from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.data.pose import load_pose_model
-from src.data.extraction import (
-    BACKBONE_STRIDE, FEATURE_LAYER_TYPES,
-    PARTNER_CLASS, BEHOLDER_CLASS,
-    _resolve_feature_layer,
+from src.data.extraction import PARTNER_CLASS
+from src.data.spatial import (
+    build_channel_slices,
+    resolve_disposition_feature_layers,
+    save_spatial_features_h5,
+    spatial_feature_path,
 )
 
 logging.basicConfig(
@@ -45,11 +48,7 @@ DEFAULT_MODEL = "vrlens-finetunes-multiclass-v2-yolo26m-pose"
 
 
 class SpatialExtractor:
-    """Extract spatial RoI feature grids (without mean-pooling).
-
-    Like SinglePassExtractor but saves [n_det, C, roi_size, roi_size] instead
-    of [n_det, C] per frame.
-    """
+    """Extract fused multi-scale spatial RoI feature grids."""
 
     def __init__(
         self,
@@ -57,24 +56,50 @@ class SpatialExtractor:
         roi_output_size: int = 7,
         confidence_threshold: float = 0.02,
         device: str = "cuda",
+        scale_layer_indices: tuple[int, ...] | None = None,
+        scale_strides: tuple[int, ...] | None = None,
     ):
         self.model = model
         self.roi_output_size = roi_output_size
         self.max_persons = 1
         self.conf_threshold = confidence_threshold
         self.device = device
-        self._features: torch.Tensor | None = None
+        self._features: dict[str, torch.Tensor | None] = {}
         self.embed_dim: int | None = None
-
-        self.layer_idx, self.layer_name = _resolve_feature_layer(model, None)
-        self._hook = model.model.model[self.layer_idx].register_forward_hook(self._capture)
+        self.channel_slices: dict[str, list[int]] | None = None
+        self.scale_specs = resolve_disposition_feature_layers(
+            model,
+            layer_indices=scale_layer_indices,
+            strides=scale_strides,
+        )
+        self._hooks: list[torch.utils.hooks.RemovableHandle] = []
+        for spec in self.scale_specs:
+            hook = model.model.model[spec["layer_idx"]].register_forward_hook(
+                self._make_capture(spec["name"])
+            )
+            self._hooks.append(hook)
         log.info(
-            "SpatialExtractor: hook on layer %d (%s), roi=%dx%d (combined box)",
-            self.layer_idx, self.layer_name, roi_output_size, roi_output_size,
+            "SpatialExtractor: hooks on %s, roi=%dx%d (combined box)",
+            ", ".join(
+                f"{spec['name']}=layer {spec['layer_idx']} ({spec['layer_name']}, stride {spec['stride']})"
+                for spec in self.scale_specs
+            ),
+            roi_output_size,
+            roi_output_size,
         )
 
-    def _capture(self, module, input, output):
-        self._features = output
+    def _make_capture(self, scale_name: str):
+        def _capture(module, input, output):
+            self._features[scale_name] = output
+        return _capture
+
+    def export_metadata(self) -> dict[str, object]:
+        return {
+            "scale_specs": self.scale_specs,
+            "channel_slices": self.channel_slices,
+            "source_layers": [spec["layer_idx"] for spec in self.scale_specs],
+            "source_strides": [spec["stride"] for spec in self.scale_specs],
+        }
 
     def extract_batch(
         self,
@@ -98,7 +123,7 @@ class SpatialExtractor:
         R = self.roi_output_size
         frame_h, frame_w = frames.shape[1], frames.shape[2]
 
-        self._features = None
+        self._features = {spec["name"]: None for spec in self.scale_specs}
         results = self.model.predict(
             list(frames),
             verbose=False,
@@ -107,11 +132,25 @@ class SpatialExtractor:
             iou=0.97,
         )
 
-        features = self._features
-        if features is None:
-            raise RuntimeError("No feature map captured")
+        features_by_name = {
+            spec["name"]: self._features.get(spec["name"])
+            for spec in self.scale_specs
+        }
+        missing = [
+            spec for spec in self.scale_specs if features_by_name[spec["name"]] is None
+        ]
+        if missing:
+            raise RuntimeError(
+                "Missing feature maps for scales: "
+                + ", ".join(spec["name"] for spec in missing)
+            )
 
-        C = int(features.shape[1])
+        channel_counts = [
+            int(features_by_name[spec["name"]].shape[1])
+            for spec in self.scale_specs
+        ]
+        self.channel_slices = build_channel_slices(self.scale_specs, channel_counts)
+        C = int(sum(channel_counts))
         self.embed_dim = C
 
         spatial_out = np.zeros((n_frames, 1, C, R, R), dtype=np.float16)
@@ -153,23 +192,31 @@ class SpatialExtractor:
             y2 = min(float(frame_h), y2)
 
             box_tensor = torch.tensor(
-                [[x1, y1, x2, y2]], dtype=torch.float32, device=features.device
+                [[x1, y1, x2, y2]],
+                dtype=torch.float32,
+                device=next(iter(features_by_name.values())).device,
             )
-            roi_feat = roi_align(
-                features[i:i + 1],
-                [box_tensor],
-                output_size=R,
-                spatial_scale=1.0 / BACKBONE_STRIDE,
-                aligned=True,
-            )  # [1, C, R, R]
-            spatial_out[i, 0] = roi_feat[0].detach().cpu().to(torch.float16).numpy()
+            roi_chunks = []
+            for spec in self.scale_specs:
+                scale_features = features_by_name[spec["name"]]
+                roi_feat = roi_align(
+                    scale_features[i:i + 1],
+                    [box_tensor],
+                    output_size=R,
+                    spatial_scale=1.0 / float(spec["stride"]),
+                    aligned=True,
+                )
+                roi_chunks.append(roi_feat[0])
+            fused_roi = torch.cat(roi_chunks, dim=0)
+            spatial_out[i, 0] = fused_roi.detach().cpu().to(torch.float16).numpy()
 
         return spatial_out, conf_out
 
     def close(self):
-        if hasattr(self, "_hook"):
-            self._hook.remove()
-        self._features = None
+        for hook in self._hooks:
+            hook.remove()
+        self._hooks.clear()
+        self._features = {}
 
 
 def load_video_frames(video_path: Path, max_frames: int | None = None) -> np.ndarray:
@@ -233,6 +280,20 @@ def main():
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--storage-dtype",
+        type=str,
+        choices=["int8", "float16"],
+        default="int8",
+        help="On-disk dtype for the spatial tensor; int8 uses per-channel quantisation",
+    )
+    parser.add_argument(
+        "--compression",
+        type=str,
+        choices=["lzf", "gzip", "none"],
+        default="lzf",
+        help="HDF5 compression for the spatial cache",
+    )
     args = parser.parse_args()
 
     model_path = args.data_dir / "models" / "pose" / f"{args.model_name}.pt"
@@ -277,15 +338,16 @@ def main():
         log.info("[%d/%d] %s (%s)", idx + 1, len(all_scenes), scene_id, split_label)
 
         out_dir = processed_dir / scene_id / "spatial"
-        # spatial_path = out_dir / f"{args.model_name}.npy"
-        # conf_path = out_dir / f"{args.model_name}_conf.npy"
-        spatial_path = out_dir / f"{args.model_name}.h5"
-        conf_path = out_dir / f"{args.model_name}_conf.h5"
+        spatial_path = spatial_feature_path(processed_dir / scene_id, args.model_name)
 
         if spatial_path.exists() and not args.overwrite:
-            log.info("  SKIP — already extracted")
-            continue
-
+            mtime = spatial_path.stat().st_mtime
+            if time.time() - mtime > 3 * 3600:
+                log.warning("Output file %s exists but is old; re-extracting", spatial_path)
+            else:
+                log.info("Output file %s already exists; skipping", spatial_path)
+                continue
+                
         video_path = preprocessed_dir / f"{scene_id}.mp4"
         n_frames = int(np.load(str(processed_dir / scene_id / "labels.npy"), mmap_mode="r").shape[0])
 
@@ -313,18 +375,30 @@ def main():
 
         t_extract = time.perf_counter() - t0
 
-        out_dir.mkdir(parents=True, exist_ok=True)
-        # np.save(str(spatial_path), spatial_arr)
-        # np.save(str(conf_path), conf_arr)
-        with h5py.File(str(spatial_path), "w") as f:
-            f.create_dataset("spatial", data=spatial_arr, compression="gzip")
-        with h5py.File(str(conf_path), "w") as f:
-            f.create_dataset("conf", data=conf_arr, compression="gzip")
+        metadata = extractor.export_metadata()
+        metadata.update({
+            "model_name": args.model_name,
+            "n_frames": int(spatial_arr.shape[0]),
+        })
+        save_spatial_features_h5(
+            spatial_path,
+            spatial_arr,
+            conf_arr,
+            storage_dtype=args.storage_dtype,
+            compression=args.compression,
+            metadata=metadata,
+        )
 
-        size_mb = spatial_arr.nbytes / 1e6
+        raw_mb = spatial_arr.nbytes / 1e6
+        stored_mb = spatial_path.stat().st_size / 1e6
         log.info(
-            "  Saved: %s shape=%s (%.0f MB) | load=%.1fs extract=%.1fs",
-            spatial_path.name, spatial_arr.shape, size_mb, t_load, t_extract,
+            "  Saved: %s shape=%s raw=%.0f MB stored=%.0f MB | load=%.1fs extract=%.1fs",
+            spatial_path.name,
+            spatial_arr.shape,
+            raw_mb,
+            stored_mb,
+            t_load,
+            t_extract,
         )
 
     extractor.close()

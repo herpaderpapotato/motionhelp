@@ -37,7 +37,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.models.dispositiontcn import DispositionTCN, extract_disposition_config
 from src.data.pose import load_pose_model
 from src.data.decode import stream_video_gpu, _has_torchcodec_cuda
-from src.data.extraction import BACKBONE_STRIDE, _resolve_feature_layer, PARTNER_CLASS
+from src.data.extraction import PARTNER_CLASS
+from src.data.spatial import (
+    build_channel_slices,
+    legacy_conf_path,
+    read_spatial_features_h5,
+    resolve_disposition_feature_layers,
+)
 from torchvision.ops import roi_align
 
 import os
@@ -45,6 +51,15 @@ os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 DEFAULT_MODEL_NAME = "vrlens-finetunes-multiclass-v2-yolo26m-pose"
 DEFAULT_CHECKPOINT = Path("data/models/checkpoints_disposition/best_disposition.pt")
+
+
+def _optional_int_tuple(values: object) -> tuple[int, ...] | None:
+    if values is None:
+        return None
+    values = list(values)
+    if not values:
+        return None
+    return tuple(int(value) for value in values)
 
 
 # ── GPU-native spatial extractor ──────────────────────────────────────────────
@@ -66,23 +81,36 @@ class GpuSpatialExtractor:
         roi_output_size: int = 7,
         confidence_threshold: float = 0.02,
         device: str = "cuda",
+        scale_layer_indices: tuple[int, ...] | None = None,
+        scale_strides: tuple[int, ...] | None = None,
     ):
         self.model = model
         self.roi_output_size = roi_output_size
         self.conf_threshold = confidence_threshold
         self.device = device
-        self._features: torch.Tensor | None = None
+        self._features: dict[str, torch.Tensor | None] = {}
         self.embed_dim: int | None = None
+        self.channel_slices: dict[str, list[int]] | None = None
+        self.scale_specs = resolve_disposition_feature_layers(
+            model,
+            layer_indices=scale_layer_indices,
+            strides=scale_strides,
+        )
+        self._hooks: list[torch.utils.hooks.RemovableHandle] = []
+        for spec in self.scale_specs:
+            hook = model.model.model[spec["layer_idx"]].register_forward_hook(
+                self._make_capture(spec["name"])
+            )
+            self._hooks.append(hook)
 
-        self.layer_idx, self.layer_name = _resolve_feature_layer(model, None)
-        self._hook = model.model.model[self.layer_idx].register_forward_hook(self._capture)
-
-    def _capture(self, module, input, output):
-        self._features = output  # stays on GPU
+    def _make_capture(self, scale_name: str):
+        def _capture(module, input, output):
+            self._features[scale_name] = output
+        return _capture
 
     def _run_predict(self, frames):
         """Run YOLO predict; accepts CUDA tensor or list of numpy arrays."""
-        self._features = None
+        self._features = {spec["name"]: None for spec in self.scale_specs}
         if isinstance(frames, torch.Tensor):
             # torchcodec yields [N, H, W, C] uint8 — YOLO LoadTensor needs [N, C, H, W] float32 in [0,1]
             frames = frames.permute(0, 3, 1, 2).contiguous().float().div_(255.0)
@@ -93,16 +121,35 @@ class GpuSpatialExtractor:
             conf=self.conf_threshold,
             iou=0.97,
         )
-        return results, self._features
+        features_by_name = {
+            spec["name"]: self._features.get(spec["name"])
+            for spec in self.scale_specs
+        }
+        return results, features_by_name
 
-    def _extract_rois(self, n_frames, frame_h, frame_w, features, results):
+    def _extract_rois(self, n_frames, frame_h, frame_w, features_by_name, results):
         """Shared roi_align logic. Returns (spatial_gpu float16, conf_np float32)."""
         R = self.roi_output_size
-        C = int(features.shape[1])
+        missing = [
+            spec for spec in self.scale_specs if features_by_name[spec["name"]] is None
+        ]
+        if missing:
+            raise RuntimeError(
+                "Missing feature maps for scales: "
+                + ", ".join(spec["name"] for spec in missing)
+            )
+
+        channel_counts = [
+            int(features_by_name[spec["name"]].shape[1])
+            for spec in self.scale_specs
+        ]
+        self.channel_slices = build_channel_slices(self.scale_specs, channel_counts)
+        C = int(sum(channel_counts))
         self.embed_dim = C
+        feature_device = next(iter(features_by_name.values())).device
 
         spatial_out = torch.zeros(
-            (n_frames, 1, C, R, R), dtype=torch.float16, device=features.device
+            (n_frames, 1, C, R, R), dtype=torch.float16, device=feature_device
         )
         conf_out = np.zeros((n_frames, 1), dtype=np.float32)
 
@@ -138,16 +185,20 @@ class GpuSpatialExtractor:
             y2 = max(0.0, min(float(frame_h), y2))
 
             box_tensor = torch.tensor(
-                [[x1, y1, x2, y2]], dtype=torch.float32, device=features.device
+                [[x1, y1, x2, y2]], dtype=torch.float32, device=feature_device
             )
-            roi_feat = roi_align(
-                features[i:i + 1].float(),
-                [box_tensor],
-                output_size=R,
-                spatial_scale=1.0 / BACKBONE_STRIDE,
-                aligned=True,
-            )  # [1, C, R, R] float32 on GPU
-            spatial_out[i, 0] = roi_feat[0].to(torch.float16)
+            roi_chunks = []
+            for spec in self.scale_specs:
+                scale_features = features_by_name[spec["name"]]
+                roi_feat = roi_align(
+                    scale_features[i:i + 1].float(),
+                    [box_tensor],
+                    output_size=R,
+                    spatial_scale=1.0 / float(spec["stride"]),
+                    aligned=True,
+                )
+                roi_chunks.append(roi_feat[0])
+            spatial_out[i, 0] = torch.cat(roi_chunks, dim=0).to(torch.float16)
 
         return spatial_out, conf_out
 
@@ -163,10 +214,8 @@ class GpuSpatialExtractor:
         """
         n_frames = frames.shape[0]
         frame_h, frame_w = int(frames.shape[1]), int(frames.shape[2])
-        results, features = self._run_predict(frames)
-        if features is None:
-            raise RuntimeError("No feature map captured")
-        return self._extract_rois(n_frames, frame_h, frame_w, features, results)
+        results, features_by_name = self._run_predict(frames)
+        return self._extract_rois(n_frames, frame_h, frame_w, features_by_name, results)
 
     def extract_batch_numpy(
         self,
@@ -175,18 +224,17 @@ class GpuSpatialExtractor:
         """CPU-fallback: numpy frames [N,H,W,C] → numpy outputs."""
         n_frames = len(frames)
         frame_h, frame_w = frames.shape[1], frames.shape[2]
-        results, features = self._run_predict(list(frames))
-        if features is None:
-            raise RuntimeError("No feature map captured")
+        results, features_by_name = self._run_predict(list(frames))
         spatial_gpu, conf_np = self._extract_rois(
-            n_frames, frame_h, frame_w, features, results
+            n_frames, frame_h, frame_w, features_by_name, results
         )
         return spatial_gpu.cpu().numpy(), conf_np
 
     def close(self):
-        if hasattr(self, "_hook"):
-            self._hook.remove()
-        self._features = None
+        for hook in self._hooks:
+            hook.remove()
+        self._hooks.clear()
+        self._features = {}
 
 
 # ── Model loading ─────────────────────────────────────────────────────────────
@@ -223,6 +271,8 @@ def extract_spatial_gpu(
     target_fps: float = 30.0,
     start_time: float | None = None,
     duration: float | None = None,
+    scale_layer_indices: tuple[int, ...] | None = None,
+    scale_strides: tuple[int, ...] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """GPU-accelerated spatial feature extraction.
 
@@ -243,6 +293,8 @@ def extract_spatial_gpu(
         pose_model,
         roi_output_size=roi_size,
         device=str(device),
+        scale_layer_indices=scale_layer_indices,
+        scale_strides=scale_strides,
     )
 
     crop_left_half = vr_mode and sbs_crop == "left"
@@ -404,6 +456,8 @@ def live_playback_with_prediction(
     model: DispositionTCN,
     device: torch.device,
     roi_size: int = 7,
+    scale_layer_indices: tuple[int, ...] | None = None,
+    scale_strides: tuple[int, ...] | None = None,
     vr_mode: bool = False,
     sbs_crop: str = "left",
     start_time: float | None = None,
@@ -464,6 +518,8 @@ def live_playback_with_prediction(
                 pose_model,
                 roi_output_size=roi_size,
                 device=str(device),
+                scale_layer_indices=scale_layer_indices,
+                scale_strides=scale_strides,
             )
 
             total_est = 0
@@ -1045,6 +1101,8 @@ def run_benchmark(
 
     model_name = data_cfg.get("model_name", DEFAULT_MODEL_NAME)
     roi_size   = model_cfg.get("roi_size", 7)
+    scale_layer_indices = _optional_int_tuple(data_cfg.get("spatial_layer_indices"))
+    scale_strides = _optional_int_tuple(data_cfg.get("spatial_strides"))
 
     print("\n" + "=" * 60)
     print("BENCHMARK: GPU path vs baseline path")
@@ -1056,7 +1114,12 @@ def run_benchmark(
         torch.cuda.reset_peak_memory_stats(device)
     t_gpu_start = time.perf_counter()
     spatial_gpu, conf_gpu = extract_spatial_gpu(
-        video_path, model_name, device, roi_size=roi_size,
+        video_path,
+        model_name,
+        device,
+        roi_size=roi_size,
+        scale_layer_indices=scale_layer_indices,
+        scale_strides=scale_strides,
     )
     t_gpu_extract = time.perf_counter() - t_gpu_start
     print(f"  GPU extract time : {t_gpu_extract:.2f}s")
@@ -1079,7 +1142,13 @@ def run_benchmark(
         model_path=str(model_path),
         device=str(device),
     )
-    extractor_b = SpatialExtractor(pose_model_b, roi_output_size=roi_size, device=str(device))
+    extractor_b = SpatialExtractor(
+        pose_model_b,
+        roi_output_size=roi_size,
+        device=str(device),
+        scale_layer_indices=scale_layer_indices,
+        scale_strides=scale_strides,
+    )
     frames = load_video_frames(video_path)
     all_sp, all_co = [], []
     for start in range(0, len(frames), 32):
@@ -1236,6 +1305,8 @@ def main() -> None:
     model, model_cfg, data_cfg = load_model(args.checkpoint, device)
     roi_size   = args.roi_size or model_cfg.get("roi_size", 7)
     model_name = data_cfg.get("model_name", args.model_name)
+    scale_layer_indices = _optional_int_tuple(data_cfg.get("spatial_layer_indices"))
+    scale_strides = _optional_int_tuple(data_cfg.get("spatial_strides"))
 
     # Determine video path
     if args.video is not None:
@@ -1266,6 +1337,8 @@ def main() -> None:
             model=model,
             device=device,
             roi_size=roi_size,
+            scale_layer_indices=scale_layer_indices,
+            scale_strides=scale_strides,
             vr_mode=args.vr,
             sbs_crop=args.sbs_crop,
             target_fps=args.fps,
@@ -1282,13 +1355,11 @@ def main() -> None:
         if args.scene and (args.data_dir / "processed" / args.scene / "spatial" / f"{model_name}.h5").exists():
             scene_dir    = args.data_dir / "processed" / args.scene
             spatial_path = scene_dir / "spatial" / f"{model_name}.h5"
-            conf_path    = scene_dir / "spatial" / f"{model_name}_conf.h5"
             print(f"Loading spatial features from {spatial_path}")
-            import h5py
-            with h5py.File(str(spatial_path), "r") as hf:
-                spatial = hf["spatial"][:]
-            with h5py.File(str(conf_path), "r") as hf:
-                conf = hf["conf"][:]
+            spatial, conf, _ = read_spatial_features_h5(
+                spatial_path,
+                legacy_conf_path=legacy_conf_path(scene_dir, model_name),
+            )
             label_path = scene_dir / "labels.npy"
             if label_path.exists():
                 labels = np.load(str(label_path))
@@ -1297,6 +1368,8 @@ def main() -> None:
             spatial, conf = extract_spatial_gpu(
                 video_path, model_name, device,
                 roi_size=roi_size,
+                scale_layer_indices=scale_layer_indices,
+                scale_strides=scale_strides,
                 vr_mode=args.vr,
                 sbs_crop=args.sbs_crop,
                 target_fps=args.fps,

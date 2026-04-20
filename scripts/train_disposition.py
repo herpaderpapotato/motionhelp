@@ -31,6 +31,12 @@ from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.models.dispositiontcn import DispositionTCN, extract_disposition_config
+from src.data.spatial import (
+    legacy_conf_path,
+    read_spatial_features_h5,
+    read_spatial_metadata,
+    spatial_feature_path,
+)
 from src.training.funscript_metrics import compute_regression_metrics
 
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
@@ -44,8 +50,7 @@ class SpatialDataset(Dataset):
     """Loads spatial RoI features + labels for DispositionTCN training.
 
     Expects:
-        data/processed/{scene_id}/spatial/{model_name}.h5        [T, N, C, H, W] float16
-        data/processed/{scene_id}/spatial/{model_name}_conf.h5   [T, N] float32
+        data/processed/{scene_id}/spatial/{model_name}.h5        [T, N, C, H, W] int8/float16
         data/processed/{scene_id}/labels.npy                     [T] float32
     """
 
@@ -62,6 +67,11 @@ class SpatialDataset(Dataset):
         self.seq_len = seq_len
         self.model_name = model_name
         self.augment = augment
+        self._spatial_paths: dict[str, Path] = {}
+        self._legacy_conf_paths: dict[str, Path | None] = {}
+        self._spatial_files: dict[str, object] = {}
+        self._legacy_conf_files: dict[str, object] = {}
+        self.spatial_metadata: dict[str, object] | None = None
 
         split_file = self.data_dir / "splits" / f"disposition_{split}.json"
         with open(split_file) as f:
@@ -73,13 +83,30 @@ class SpatialDataset(Dataset):
 
         for vid_id in video_ids:
             vid_dir = processed / vid_id
-            spatial_path = vid_dir / "spatial" / f"{self.model_name}.h5"
-            conf_path = vid_dir / "spatial" / f"{self.model_name}_conf.h5"
+            spatial_path = spatial_feature_path(vid_dir, self.model_name)
+            conf_path = legacy_conf_path(vid_dir, self.model_name)
             label_path = vid_dir / "labels.npy"
 
-            if not all(p.exists() for p in [spatial_path, conf_path, label_path]):
+            if not spatial_path.exists() or not label_path.exists():
                 skipped += 1
                 continue
+
+            try:
+                metadata = read_spatial_metadata(spatial_path)
+                if self.spatial_metadata is None:
+                    self.spatial_metadata = metadata
+                with h5py.File(str(spatial_path), "r") as spatial_file:
+                    has_conf = "conf" in spatial_file
+            except Exception:
+                skipped += 1
+                continue
+
+            if not has_conf and not conf_path.exists():
+                skipped += 1
+                continue
+
+            self._spatial_paths[vid_id] = spatial_path
+            self._legacy_conf_paths[vid_id] = conf_path if conf_path.exists() else None
 
             n_frames = np.load(str(label_path), mmap_mode="r").shape[0]
             if n_frames < seq_len:
@@ -97,15 +124,62 @@ class SpatialDataset(Dataset):
     def __len__(self) -> int:
         return len(self.sequences)
 
+    def __getstate__(self) -> dict[str, object]:
+        state = self.__dict__.copy()
+        state["_spatial_files"] = {}
+        state["_legacy_conf_files"] = {}
+        return state
+
+    def close(self) -> None:
+        for handle in self._spatial_files.values():
+            handle.close()
+        for handle in self._legacy_conf_files.values():
+            handle.close()
+        self._spatial_files.clear()
+        self._legacy_conf_files.clear()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def sample_metadata(self) -> dict[str, object]:
+        return dict(self.spatial_metadata or {})
+
+    def _get_spatial_file(self, vid_id: str):
+        spatial_path = self._spatial_paths[vid_id]
+        cache_key = str(spatial_path)
+        handle = self._spatial_files.get(cache_key)
+        if handle is None:
+            handle = h5py.File(str(spatial_path), "r")
+            self._spatial_files[cache_key] = handle
+        return handle
+
+    def _get_legacy_conf_file(self, vid_id: str):
+        conf_path = self._legacy_conf_paths.get(vid_id)
+        if conf_path is None:
+            return None
+        cache_key = str(conf_path)
+        handle = self._legacy_conf_files.get(cache_key)
+        if handle is None:
+            handle = h5py.File(str(conf_path), "r")
+            self._legacy_conf_files[cache_key] = handle
+        return handle
+
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         vid_id, start = self.sequences[idx]
         vid_dir = self.data_dir / "processed" / vid_id
         end = start + self.seq_len
 
-        with h5py.File(str(vid_dir / "spatial" / f"{self.model_name}.h5"), "r") as f:
-            spatial = f["spatial"][start:end].copy()
-        with h5py.File(str(vid_dir / "spatial" / f"{self.model_name}_conf.h5"), "r") as f:
-            conf = f["conf"][start:end].copy()
+        spatial, conf, _ = read_spatial_features_h5(
+            self._spatial_paths[vid_id],
+            start=start,
+            end=end,
+            file_handle=self._get_spatial_file(vid_id),
+            legacy_conf_path=self._legacy_conf_paths.get(vid_id),
+            legacy_conf_file_handle=self._get_legacy_conf_file(vid_id),
+        )
         labels = np.load(str(vid_dir / "labels.npy"), mmap_mode="r")[start:end].copy()
 
         spatial = torch.from_numpy(spatial).float()   # [T, N, C, H, W]
@@ -265,6 +339,15 @@ def train() -> None:
         "model_name": args.model_name,
         "roi_size": args.roi_size,
     }
+    spatial_metadata = train_ds.sample_metadata()
+    if spatial_metadata:
+        data_config.update({
+            "spatial_layer_indices": spatial_metadata.get("source_layers"),
+            "spatial_strides": spatial_metadata.get("source_strides"),
+            "spatial_format_version": spatial_metadata.get("format_version"),
+            "spatial_storage_dtype": spatial_metadata.get("storage_dtype"),
+            "spatial_scale_specs": spatial_metadata.get("scale_specs"),
+        })
 
     # Training loop
     best_val_loss = float("inf")
