@@ -46,7 +46,7 @@ def load_model(checkpoint_path: Path, device: torch.device):
     """Load TCN model from checkpoint. Returns model and checkpoint configs."""
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     cfg = ckpt["model_config"]
-    model = FunscriptTCN(**extract_model_config(cfg))
+    model = FunscriptTCN(**extract_model_config(cfg), use_aux_layers=False)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
     model.to(device)

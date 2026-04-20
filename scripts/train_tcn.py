@@ -148,6 +148,9 @@ class MotionDataset(Dataset):
                 if review.get("status") == "rejected" or review.get("stage2_status") == "rejected":
                     skipped += 1
                     continue
+                # if float(review.get("mse", 0)) > 0.02 and self.augment:
+                #     skipped += 1
+                #     continue
             # check embedding metadata is valid for current extraction method
             if emb_meta_path.exists():
                 meta = json.loads(emb_meta_path.read_text(encoding="utf-8"))
@@ -386,37 +389,18 @@ class MotionDataset(Dataset):
             else:
                 flow = torch.zeros_like(flow)
 
-        # emb_noise_prob = 0.2 + s * (0.9 - 0.2)    
-        # emb_noise_mag  = 0.02 + s * (0.15 - 0.02)
-        # if torch.rand(1).item() < emb_noise_prob:
-        #     emb = emb + torch.randn_like(emb) * emb_noise_mag
+        emb_noise_prob = 0.2 + s * (0.9 - 0.2)    
+        emb_noise_mag  = 0.02 + s * (0.1 - 0.02)
+        if torch.rand(1).item() < emb_noise_prob:
+            emb = emb + torch.randn_like(emb) * emb_noise_mag
 
-        # flow_noise_prob = 0.2 + s * (0.9 - 0.2) 
-        # flow_noise_mag  = 0.02 + s * (0.2 - 0.02)
+        # flow_noise_prob = 0.2 + s * (0.5 - 0.2) 
+        # flow_noise_mag  = 0.02 + s * (0.1- 0.02)
         # if torch.rand(1).item() < flow_noise_prob:
         #     # flow = flow + torch.randn_like(flow) * flow_noise_mag # makes B x Seq x FlowDim noise which may be too random
         #     # Alternate: use same noise for all flow frames in a sequence to generalize better to different flow magnitudes
         #     noise = torch.randn(flow.shape[1], device=flow.device) * flow_noise_mag
         #     flow = flow + noise
-
-
-        # kp_noise_prob = 0.2 + s * (0.3 - 0.2)
-        # kp_noise_mag = 0.01 + s * (0.04 - 0.01) # 5% max jitter
-        # if torch.rand(1).item() < kp_noise_prob:
-        #     kp = kp + torch.randn_like(kp) * kp_noise_mag
-        #     kp = torch.clamp(kp, 0.0, 1.0)
-        #     # decay all kp confidences by half
-        #     kp[..., 2] = kp[..., 2] * 0.5
-
-        # kp_intermittent_drop_prob = 0.2 + s * (0.7 - 0.2)
-        # if torch.rand(1).item() < kp_intermittent_drop_prob:
-        #     # Randomly zero out all keypoints for random contiguous segments (simulate occlusion)
-        #     T = kp.shape[0]
-        #     n_segments = max(1, int(T * 0.01))  # number of segments scales with sequence length
-        #     for _ in range(n_segments):
-        #         seg_len = torch.randint(5, 20, (1,)).item()  # segment length between 5 and 20 frames
-        #         start = torch.randint(0, T - seg_len, (1,)).item()
-        #         kp[start:start + seg_len] = 0.0
 
 
 
@@ -753,13 +737,13 @@ def train() -> None:
                         help="Disable the multiclass beholder-performer difference branch")
     parser.add_argument("--difference-dim", type=int, default=64,
                         help="Feature dimension for the beholder-performer difference branch")
-    parser.add_argument("--velocity-weight", type=float, default=0.0,
+    parser.add_argument("--velocity-weight", type=float, default=0.9,
                         help="Weight for velocity-matching loss (first derivative)")
     parser.add_argument("--spectral-weight", type=float, default=0.0,
                         help="Weight for high-frequency detail loss (multi-scale spectral)")
     parser.add_argument("--spectral-kernel", type=int, default=15,
                         help="Moving-average kernel size for spectral loss low-pass filter")
-    parser.add_argument("--event-weight", type=float, default=0.25,
+    parser.add_argument("--event-weight", type=float, default=0.0,
                         help="Blend factor between plain MSE and event-aware weighted MSE")
     parser.add_argument("--event-activity-gain", type=float, default=3.0,
                         help="Gain applied to derivative-based event weighting")
@@ -782,7 +766,7 @@ def train() -> None:
                         help="Flow representation: 'summary' (flat 64-d) or 'dense' (2×32×32 spatial)")
     parser.add_argument("--flow-dense-size", type=int, default=32,
                         help="Spatial resolution for dense flow maps (default: 32)")
-    parser.add_argument("--aux-weight", type=float, default=0.3,
+    parser.add_argument("--aux-weight", type=float, default=0.0,
                         help="Weight for auxiliary per-modality branch losses (0 = ignore aux branches)")
     parser.add_argument("--use-aux-layers", action="store_true", default=False,
                         help="Enable auxiliary per-modality branches")
@@ -835,7 +819,7 @@ def train() -> None:
         flow_mode=args.flow_mode, flow_dense_size=args.flow_dense_size,
     )
     val_ds = MotionDataset(
-        args.data_dir, "val", args.seq_len, args.stride,
+        args.data_dir, "val", args.seq_len, 60,
         n_persons=n_total,
         embed_dim=train_ds.embed_dim,
         augment=False,
@@ -1082,7 +1066,8 @@ def train() -> None:
     log.info("Initial validation metrics: %s", ", ".join(f"{k}={v:.6f}" for k, v in avg_val_metrics.items()))
     log.info("Initial validation prediction mean: %.6f, std: %.6f", avg_pred_mean, avg_pred_std)
 
-    best_val_loss = float("inf")
+    #best_val_loss = float("inf")
+    best_val_loss = avg_val
     
     for param_group in optimizer.param_groups:
         param_group["lr"] = args.lr
