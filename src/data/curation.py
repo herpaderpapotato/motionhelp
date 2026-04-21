@@ -99,6 +99,22 @@ def inspect_embeddings_path(
     return None, "missing"
 
 
+def inspect_model_embeddings_path(
+    scene_dir: Path,
+    model_name: str,
+    max_persons: int | None = None,
+) -> tuple[Path | None, str]:
+    """Validate the exact model-specific embeddings cache path for a scene."""
+    candidate = embeddings_path(scene_dir, model_name)
+    if not candidate.exists():
+        return None, f"missing model-specific embeddings at {candidate.name}"
+
+    valid, reason = validate_embeddings_file(candidate, max_persons=max_persons)
+    if valid:
+        return candidate, "ok"
+    return None, f"{candidate.name}: {reason}"
+
+
 def resolve_flow_path(scene_dir: Path, method: str, output_features: int, scale: float) -> Path | None:
     """Return existing flow path: new layout first, then legacy root file."""
     p = flow_path(scene_dir, method, output_features, scale)
