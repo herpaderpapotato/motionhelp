@@ -1290,6 +1290,8 @@ def main() -> None:
                         help="Show matplotlib prediction plot after inference")
     parser.add_argument("--save-plot",  type=Path, default=None,
                         help="Save prediction plot to this file")
+    parser.add_argument("--start-time", type=float, default=0.0,
+                        help="Start time (in seconds) for playback or benchmarking")
 
     args = parser.parse_args()
 
@@ -1344,6 +1346,7 @@ def main() -> None:
             target_fps=args.fps,
             seq_len=args.seq_len,
             stride=args.stride,
+            start_time=args.start_time,
         )
         if len(predictions) == 0:
             print("No predictions generated during playback.")

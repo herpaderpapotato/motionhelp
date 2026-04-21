@@ -111,7 +111,11 @@ class SpatialDataset(Dataset):
                             spatial_file["channel_scale"][:], dtype=np.float32,
                         ).copy()
                     else:
-                        all_valid_caches_are_quantized = False
+                        # ignore
+                        skipped += 1
+                        continue
+
+                        #all_valid_caches_are_quantized = False
             except Exception:
                 skipped += 1
                 continue
@@ -327,7 +331,7 @@ def _build_loader(
     dataset: Dataset,
     *,
     batch_size: int,
-    sampler: Sampler[int],
+    sampler: Sampler[int] = None,
     num_workers: int,
     pin_memory: bool,
     prefetch_factor: int | None,
@@ -336,6 +340,7 @@ def _build_loader(
         "dataset": dataset,
         "batch_size": batch_size,
         "sampler": sampler,
+        "shuffle": sampler is None,  # shuffle if no sampler is provided
         "num_workers": num_workers,
         "pin_memory": pin_memory,
         "persistent_workers": num_workers > 0,
@@ -419,6 +424,7 @@ def train() -> None:
     parser.add_argument("--no-device-dequantize", action="store_false", dest="device_dequantize")
     parser.add_argument("--model-name", type=str, default=DEFAULT_MODEL_NAME)
     parser.add_argument("--early-stopping-patience", type=int, default=10)
+    parser.add_argument("--resume", type=Path, default=None, help="Path to checkpoint to resume training from")
     args = parser.parse_args()
 
     if args.max_train_sequences_per_epoch is not None and args.max_train_sequences_per_epoch <= 0:
@@ -517,6 +523,22 @@ def train() -> None:
     if prefetch_factor is not None:
         log.info("DataLoader prefetch_factor=%d with %d workers", prefetch_factor, args.num_workers)
 
+    
+    # train_loader = _build_loader(
+    #     train_ds,
+    #     batch_size=args.batch_size,
+    #     num_workers=args.num_workers,
+    #     pin_memory=device.type == "cuda",
+    #     prefetch_factor=prefetch_factor,
+    # )
+    # val_loader = _build_loader(
+    #     val_ds,
+    #     batch_size=args.batch_size,
+    #     num_workers=args.num_workers,
+    #     pin_memory=device.type == "cuda",
+    #     prefetch_factor=prefetch_factor,
+    # )
+
     # Infer in_channels from first sample
     sample = train_ds[0]
     in_channels = sample["spatial"].shape[2]  # C dimension of [T, N, C, H, W]
@@ -548,6 +570,50 @@ def train() -> None:
     #     T_mult=1,
     #     eta_min=args.lr * 0.01,
     # )
+    best_val_loss = float("inf")
+    if args.resume is not None:
+        checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        start_epoch = checkpoint.get("epoch", 0) + 1
+        log.info("Resumed training from checkpoint %s at epoch %d", args.resume, start_epoch)
+
+        # initial validation
+        # Validate
+        model.eval()
+        val_losses = []
+        val_metrics = {"pos_mse": [], "vel_mse": [], "acc_mse": [], "vel_mae": []}
+
+        with torch.no_grad():
+            for batch in val_loader:
+                prepared = _prepare_batch(batch, device, device_dequantize=val_ds.device_dequantize)
+                spatial = prepared["spatial"]
+                conf = prepared["conf"]
+                lbl = prepared["labels"]
+
+                with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
+                    pred = model(spatial, conf)
+                    metrics = compute_regression_metrics(pred, lbl, spectral_kernel=15)
+                    loss = (metrics["pos_mse"]
+                            + args.velocity_weight * metrics["vel_mse"]
+                            + args.temporal_weight * metrics["acc_mse"])
+
+                val_losses.append(loss.item())
+                for key in val_metrics:
+                    val_metrics[key].append(metrics[key].item())
+
+        avg_val = np.mean(val_losses)
+        avg_val_metrics = {k: float(np.mean(v)) for k, v in val_metrics.items()}
+        epoch_time = time.time() - epoch_start
+        log.info(
+            "Epoch %d (resumed): train_loss=%.4f val_loss=%.4f pos_mse=%.4f vel_mse=%.4f acc_mse=%.4f vel_mae=%.4f time=%.1fs",
+            start_epoch - 1, float("nan"), avg_val,
+            avg_val_metrics["pos_mse"], avg_val_metrics["vel_mse"],
+            avg_val_metrics["acc_mse"], avg_val_metrics["vel_mae"],
+            epoch_time,
+        )
+        best_val_loss = avg_val
+        early_stop_counter = 0
+
 
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer,
@@ -600,13 +666,14 @@ def train() -> None:
         })
 
     # Training loop
-    best_val_loss = float("inf")
+    
     early_stop_counter = 0
     global_step = 0
 
     for epoch in range(1, args.epochs + 1):
+        sample_taken = False
         epoch_start = time.time()
-        train_sampler.set_epoch(epoch - 1)
+        #train_sampler.set_epoch(epoch - 1)
 
         # Train
         model.train()
@@ -657,7 +724,7 @@ def train() -> None:
         model.eval()
         val_losses = []
         val_metrics = {"pos_mse": [], "vel_mse": [], "acc_mse": [], "vel_mae": []}
-
+        epoch_start = 0
         with torch.no_grad():
             for batch in val_loader:
                 prepared = _prepare_batch(batch, device, device_dequantize=val_ds.device_dequantize)
@@ -694,6 +761,7 @@ def train() -> None:
 
         # Prediction plots every 5 epochs
         if epoch % 5 == 0 or epoch == 1:
+            sample_taken = True
             model.eval()
             with torch.no_grad():
                 if epoch == 1:
@@ -738,6 +806,36 @@ def train() -> None:
                 "data_config": data_config,
             }, checkpoint_dir / "best_disposition.pt")
             log.info("  -> New best val loss: %.6f", avg_val)
+            if not sample_taken:
+                # take a sample for prediction plotting if we haven't already this epoch
+                model.eval()
+                with torch.no_grad():
+                    if epoch == 1:
+                        plot_samples = val_ds.sample_random(n=4, device=device)
+                    sp = plot_samples["spatial"]
+                    co = plot_samples["conf"]
+                    lb = plot_samples["labels"]
+
+                    with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
+                        pred_s = model(sp, co)
+
+                    pred_s = pred_s.float().cpu().numpy()
+                    lb_np = lb.float().cpu().numpy()
+                n_plots = min(4, len(pred_s))
+                fig, axes = plt.subplots(n_plots, 1, figsize=(12, 2 * n_plots))
+                if n_plots == 1:
+                    axes = [axes]
+                for i, ax in enumerate(axes):
+                    ax.plot(lb_np[i], label="target", alpha=0.85, lw=1.5, color="steelblue")
+                    ax.plot(pred_s[i], label="pred", alpha=0.85, lw=1.5, color="darkorange")
+                    ax.set_ylim(-0.05, 1.05)
+                    ax.set_ylabel(f"#{i}", fontsize=7)
+                    if i == 0:
+                        ax.legend(fontsize=7)
+                        ax.set_title(f"Epoch {epoch} predictions")
+                fig.tight_layout()
+                writer.add_figure("Predictions/overlay", fig, epoch)
+                plt.close(fig)
         else:
             early_stop_counter += 1
             if args.early_stopping_patience > 0 and early_stop_counter >= args.early_stopping_patience:

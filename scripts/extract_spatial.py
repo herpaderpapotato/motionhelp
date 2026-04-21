@@ -252,9 +252,34 @@ def select_scenes(data_dir: Path, split: str, n: int) -> list[str]:
     processed = data_dir / "processed"
     selected = []
 
+    # # first pass to select already extracted scenes (to avoid unnecessary extraction if we re-run the script)
+    # for vid_id in all_ids:
+    #     if len(selected) >= n:
+    #         break
+    #     video_path = preprocessed / f"{vid_id}.mp4"
+    #     label_path = processed / vid_id / "labels.npy"
+    #     if not video_path.exists() or not label_path.exists():
+    #         continue
+    #     # Skip rejected scenes
+    #     review_path = processed / vid_id / "review.json"
+    #     if review_path.exists():
+    #         review = json.loads(review_path.read_text(encoding="utf-8"))
+    #         if review.get("status") == "rejected" or review.get("stage2_status") == "rejected":
+    #             continue
+    #     spatial_path = spatial_feature_path(processed / vid_id, DEFAULT_MODEL)
+    #     if spatial_path.exists():
+    #         mtime = spatial_path.stat().st_mtime
+    #         if time.time() - mtime > 3 * 7600:
+    #             continue
+    #         else:
+    #             selected.append(vid_id)
+
+    # second pass to select from remaining scenes until we have enough
     for vid_id in all_ids:
         if len(selected) >= n:
             break
+        if vid_id in selected:
+            continue
         video_path = preprocessed / f"{vid_id}.mp4"
         label_path = processed / vid_id / "labels.npy"
         if not video_path.exists() or not label_path.exists():
@@ -266,6 +291,7 @@ def select_scenes(data_dir: Path, split: str, n: int) -> list[str]:
             if review.get("status") == "rejected" or review.get("stage2_status") == "rejected":
                 continue
         selected.append(vid_id)
+            
 
     return selected
 
@@ -340,13 +366,16 @@ def main():
         out_dir = processed_dir / scene_id / "spatial"
         spatial_path = spatial_feature_path(processed_dir / scene_id, args.model_name)
 
+        # if spatial_path.exists() and not args.overwrite:
+        #     mtime = spatial_path.stat().st_mtime
+        #     if time.time() - mtime > 4 * 3600:
+        #         log.warning("Output file %s exists but is old; re-extracting", spatial_path)
+        #     else:
+        #         log.info("Output file %s already exists; skipping", spatial_path)
+        #         continue
         if spatial_path.exists() and not args.overwrite:
-            mtime = spatial_path.stat().st_mtime
-            if time.time() - mtime > 3 * 3600:
-                log.warning("Output file %s exists but is old; re-extracting", spatial_path)
-            else:
-                log.info("Output file %s already exists; skipping", spatial_path)
-                continue
+            log.info("Output file %s already exists; skipping", spatial_path)
+            continue
                 
         video_path = preprocessed_dir / f"{scene_id}.mp4"
         n_frames = int(np.load(str(processed_dir / scene_id / "labels.npy"), mmap_mode="r").shape[0])
