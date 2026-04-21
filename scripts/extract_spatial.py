@@ -261,10 +261,10 @@ def process_scene(
         log.warning("SKIP %s - no preprocessed video at %s", scene_id, video_path)
         return False
 
-    emb_path, emb_reason = inspect_model_embeddings_path(scene_dir, model_name)
-    if emb_path is None:
-        log.warning("SKIP %s - %s", scene_id, emb_reason)
-        return False
+    # emb_path, emb_reason = inspect_model_embeddings_path(scene_dir, model_name)
+    # if emb_path is None:
+    #     log.warning("SKIP %s - %s", scene_id, emb_reason)
+    #     return False
 
     spatial_path = spatial_feature_path(scene_dir, model_name)
     if spatial_path.exists() and not overwrite:
@@ -309,7 +309,7 @@ def process_scene(
         {
             "model_name": model_name,
             "n_frames": int(spatial_arr.shape[0]),
-            "embeddings_path": str(emb_path),
+            #"embeddings_path": str(emb_path),
         }
     )
     save_spatial_features_h5(
@@ -408,8 +408,8 @@ def main() -> None:
             video_path = preprocessed_dir / f"{scene_id}.mp4"
             if not video_path.exists():
                 continue
-            if inspect_model_embeddings_path(scene_dir, args.model_name)[0] is None:
-                continue
+            # if inspect_model_embeddings_path(scene_dir, args.model_name)[0] is None:
+            #     continue
             if not args.overwrite and spatial_feature_path(scene_dir, args.model_name).exists():
                 continue
             pending.append(scene_id)
