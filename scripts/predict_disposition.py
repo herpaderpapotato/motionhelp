@@ -258,6 +258,14 @@ def load_model(
     return model, cfg, data_cfg
 
 
+def _split_predictions(pred: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor]]:
+    if pred.ndim == 2:
+        return pred, []
+    if pred.ndim == 3:
+        return pred[:, 0], [pred[:, idx] for idx in range(1, pred.shape[1])]
+    raise ValueError(f"Unsupported prediction shape {tuple(pred.shape)}")
+
+
 # ── GPU-accelerated feature extraction ───────────────────────────────────────
 
 def extract_spatial_gpu(
@@ -396,11 +404,13 @@ def sliding_window_predict(model: DispositionTCN,
     device: torch.device,
     seq_len: int = 120,
     stride: int = 60,
-) -> np.ndarray:
+    return_all_channels: bool = False,
+) -> np.ndarray | tuple[np.ndarray, np.ndarray | None]:
     """Slide a window over the sequence and average overlapping predictions."""
     n_frames = len(spatial)
     pred_sum = np.zeros(n_frames, dtype=np.float32)
     pred_count = np.zeros(n_frames, dtype=np.float32)
+    aux_sum: np.ndarray | None = None
 
     starts = list(range(0, n_frames - seq_len + 1, stride))
     if n_frames >= seq_len and starts and starts[-1] + seq_len < n_frames:
@@ -415,10 +425,18 @@ def sliding_window_predict(model: DispositionTCN,
             with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
                 out = model(sp, co)
 
-            p = out[0].float().cpu().numpy()
+            main_out, _ = _split_predictions(out)
+            p = main_out[0].float().cpu().numpy()
             weight = np.bartlett(seq_len).astype(np.float32) + 0.01
             pred_sum[start:end] += p * weight
             pred_count[start:end] += weight
+            if return_all_channels:
+                _, aux_out = _split_predictions(out)
+                if aux_out:
+                    aux_np = torch.stack(aux_out, dim=1)[0].float().cpu().numpy()
+                    if aux_sum is None:
+                        aux_sum = np.zeros((aux_np.shape[0], n_frames), dtype=np.float32)
+                    aux_sum[:, start:end] += aux_np * weight[None, :]
 
     if n_frames < seq_len:
         sp = torch.from_numpy(spatial).float().unsqueeze(0).to(device)
@@ -429,10 +447,20 @@ def sliding_window_predict(model: DispositionTCN,
         with torch.no_grad():
             with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
                 out = model(sp, co)
-        return out[0, :n_frames].float().cpu().numpy()
+        main_out, _ = _split_predictions(out)
+        pred_np = main_out[0, :n_frames].float().cpu().numpy()
+        if return_all_channels:
+            _, aux_out = _split_predictions(out)
+            if aux_out:
+                aux_np = torch.stack(aux_out, dim=1)[0, :, :n_frames].float().cpu().numpy()
+                return pred_np, aux_np
+        return pred_np
 
     mask = pred_count > 0
     pred_sum[mask] /= pred_count[mask]
+    if return_all_channels and aux_sum is not None:
+        aux_sum[:, mask] /= pred_count[mask][None, :]
+        return pred_sum, aux_sum
     return pred_sum
 
 
@@ -1194,6 +1222,8 @@ def run_benchmark(
 
 def _plot_predictions(
     predictions: np.ndarray,
+    aux_predictions: np.ndarray | None,
+    aux_labels: tuple[str, ...],
     labels: np.ndarray | None,
     fps: float,
     source_name: str,
@@ -1212,6 +1242,18 @@ def _plot_predictions(
         axes = [axes]
 
     axes[0].plot(time_axis, predictions, lw=1.5, color="darkorange", label="Disposition prediction")
+    if aux_predictions is not None:
+        aux_colors = ["forestgreen", "purple", "crimson", "slategray"]
+        for idx, aux_values in enumerate(aux_predictions):
+            aux_label = aux_labels[idx] if idx < len(aux_labels) else f"aux_{idx + 1}"
+            axes[0].plot(
+                time_axis[:len(aux_values)],
+                aux_values,
+                lw=1.0,
+                alpha=0.45,
+                color=aux_colors[idx % len(aux_colors)],
+                label=aux_label,
+            )
     if labels is not None:
         axes[0].plot(time_axis[:len(labels)], labels, lw=1.2, alpha=0.7,
                      color="steelblue", label="Ground truth")
@@ -1307,6 +1349,7 @@ def main() -> None:
     model, model_cfg, data_cfg = load_model(args.checkpoint, device)
     roi_size   = args.roi_size or model_cfg.get("roi_size", 7)
     model_name = data_cfg.get("model_name", args.model_name)
+    aux_labels = tuple(getattr(model, "aux_scale_names", ()))
     scale_layer_indices = _optional_int_tuple(data_cfg.get("spatial_layer_indices"))
     scale_strides = _optional_int_tuple(data_cfg.get("spatial_strides"))
 
@@ -1354,6 +1397,7 @@ def main() -> None:
     else:
         # ── Batch inference mode ──────────────────────────────────────────
         labels = None
+        aux_predictions = None
 
         if args.scene and (args.data_dir / "processed" / args.scene / "spatial" / f"{model_name}.h5").exists():
             scene_dir    = args.data_dir / "processed" / args.scene
@@ -1381,13 +1425,22 @@ def main() -> None:
         print(f"Spatial features: {spatial.shape}, Confidence: {conf.shape}")
 
         t0 = time.perf_counter()
-        predictions = sliding_window_predict(
+        pred_result = sliding_window_predict(
             model, spatial, conf, device,
             seq_len=args.seq_len, stride=args.stride,
+            return_all_channels=getattr(model, "use_aux_layers", False),
         )
+        if isinstance(pred_result, tuple):
+            predictions, aux_predictions = pred_result
+        else:
+            predictions = pred_result
         t_pred = time.perf_counter() - t0
         print(f"Prediction: {len(predictions)} frames in {t_pred:.2f}s")
         print(f"  mean={predictions.mean():.4f}  std={predictions.std():.4f}")
+        if aux_predictions is not None:
+            for idx, aux_values in enumerate(aux_predictions):
+                aux_label = aux_labels[idx] if idx < len(aux_labels) else f"aux_{idx + 1}"
+                print(f"  {aux_label}: mean={aux_values.mean():.4f}  std={aux_values.std():.4f}")
 
         if labels is not None:
             n = min(len(predictions), len(labels))
@@ -1410,6 +1463,8 @@ def main() -> None:
     if args.plot or args.save_plot:
         _plot_predictions(
             predictions=predictions,
+            aux_predictions=locals().get("aux_predictions"),
+            aux_labels=aux_labels,
             labels=locals().get("labels"),
             fps=args.fps,
             source_name=str(args.scene or args.video),
