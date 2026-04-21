@@ -346,7 +346,7 @@ def main() -> None:
         )
 
     if args.dry_run:
-        log.info("Dry run — not writing splits")
+        log.info("Dry run - not writing splits")
         return
 
     splits_dir.mkdir(parents=True, exist_ok=True)

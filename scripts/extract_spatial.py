@@ -258,22 +258,22 @@ def process_scene(
     scene_id = scene_dir.name
     video_path = preprocessed_dir / f"{scene_id}.mp4"
     if not video_path.exists():
-        log.warning("SKIP %s — no preprocessed video at %s", scene_id, video_path)
+        log.warning("SKIP %s - no preprocessed video at %s", scene_id, video_path)
         return False
 
     emb_path, emb_reason = inspect_model_embeddings_path(scene_dir, model_name)
     if emb_path is None:
-        log.warning("SKIP %s — %s", scene_id, emb_reason)
+        log.warning("SKIP %s - %s", scene_id, emb_reason)
         return False
 
     spatial_path = spatial_feature_path(scene_dir, model_name)
     if spatial_path.exists() and not overwrite:
-        log.info("SKIP %s — spatial already exists at %s", scene_id, spatial_path)
+        log.info("SKIP %s - spatial already exists at %s", scene_id, spatial_path)
         return True
 
     labels_path = scene_dir / "labels.npy"
     if not labels_path.exists():
-        log.warning("SKIP %s — missing labels.npy", scene_id)
+        log.warning("SKIP %s - missing labels.npy", scene_id)
         return False
 
     n_frames = int(np.load(str(labels_path), mmap_mode="r").shape[0])
@@ -283,7 +283,7 @@ def process_scene(
     frames = load_video_frames(video_path, max_frames=n_frames)
     actual_n = min(len(frames), n_frames)
     if actual_n == 0:
-        log.warning("SKIP %s — video decoder produced 0 frames", scene_id)
+        log.warning("SKIP %s - video decoder produced 0 frames", scene_id)
         return False
     frames = frames[:actual_n]
     t_load = time.perf_counter() - t0
@@ -439,7 +439,7 @@ def main() -> None:
 
     try:
         if args.watch:
-            log.info("Watch mode (poll every %ds) — Ctrl+C to stop", args.poll_interval)
+            log.info("Watch mode (poll every %ds) - Ctrl+C to stop", args.poll_interval)
             while True:
                 run_once()
                 time.sleep(args.poll_interval)
