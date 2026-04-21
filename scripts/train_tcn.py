@@ -688,6 +688,17 @@ def _apply_phase_freezing(model: FunscriptTCN, phase: int, fill_with_noise: bool
 # ---------------------------------------------------------------------------
 
 def train() -> None:
+    # wishlist
+    # - when a job starts, dump the config for it to disk in root and in the job's checkpoint folder
+    # - allow a resume last option
+    # - use separate checkpoint folders with epoch time by default
+    # - each epoch, read from an override config file that may override certain parameters like early stopping patience or augmentation scale or whatever, so that we can have a single job that runs through multiple phases with different configs without needing to manually intervene to change the config or launch new jobs
+    # - a gui that shows the config of the current job and allows overriding certain parameters on the fly
+    #  - also show current epoch # and mse, last best epoch # and mse, and previous best epochs
+    #  - when changing config parameters on the fly, write the config to the config file with the epoch number in the json. e.g. "changes": [{"epoch": 5, "params": {"early_stopping_patience": 5, "augment_scale": 0.5}}] etc
+    
+
+
     import random
     parser = argparse.ArgumentParser(description="Train TCN funscript model")
     parser.set_defaults(shuffle=True)

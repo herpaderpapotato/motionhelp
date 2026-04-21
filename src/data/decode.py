@@ -1,15 +1,14 @@
 """GPU-accelerated video decoding via torchcodec.
 
-Provides chunked frame iteration with optional VR SBS crop, resize, and FPS
-conversion — all on GPU. Falls back to ffmpeg subprocess or OpenCV CPU decode
-when torchcodec CUDA is unavailable.
+Provides chunked frame iteration with optional VR SBS crop, resize, and exact
+half-rate frame dropping — all on GPU. Falls back to ffmpeg subprocess or
+OpenCV CPU decode when torchcodec CUDA is unavailable.
 
 Output frames are [H, W, C] uint8 numpy arrays (for YOLO/RAFT compatibility)
 or optionally [N, H, W, C] CUDA tensors for zero-copy GPU pipelines.
 """
 
 import logging
-import math
 from pathlib import Path
 
 import numpy as np
@@ -17,6 +16,64 @@ import torch
 import torch.nn.functional as F
 
 log = logging.getLogger(__name__)
+
+
+def effective_frame_rate(source_fps: float, half_rate: bool = False) -> float:
+    """Return the effective output FPS for the selected decode mode."""
+    if source_fps <= 0:
+        return source_fps
+    return source_fps / 2.0 if half_rate else source_fps
+
+
+def compute_frame_sampling_plan(
+    source_fps: float,
+    num_source_frames: int | None,
+    start_time: float | None = None,
+    duration: float | None = None,
+    half_rate: bool = False,
+) -> tuple[int, int | None, int]:
+    """Compute the frame range and stride for source-exact decode."""
+    start_frame = 0
+    if start_time is not None and start_time > 0:
+        start_frame = max(0, int(start_time * source_fps))
+
+    end_frame: int | None
+    if duration is not None:
+        end_frame = start_frame + int(duration * source_fps)
+        if num_source_frames is not None:
+            end_frame = min(end_frame, num_source_frames)
+    else:
+        end_frame = num_source_frames
+
+    if num_source_frames is not None:
+        start_frame = min(start_frame, num_source_frames)
+        if end_frame is not None:
+            end_frame = min(end_frame, num_source_frames)
+
+    frame_step = 2 if half_rate else 1
+    return start_frame, end_frame, frame_step
+
+
+def estimate_output_frames(
+    source_fps: float,
+    num_source_frames: int | None,
+    start_time: float | None = None,
+    duration: float | None = None,
+    half_rate: bool = False,
+) -> int | None:
+    """Estimate the number of decoded frames for the chosen sampling plan."""
+    start_frame, end_frame, frame_step = compute_frame_sampling_plan(
+        source_fps=source_fps,
+        num_source_frames=num_source_frames,
+        start_time=start_time,
+        duration=duration,
+        half_rate=half_rate,
+    )
+    if end_frame is None:
+        return None
+    if end_frame <= start_frame:
+        return 0
+    return (end_frame - start_frame + frame_step - 1) // frame_step
 
 
 def _has_torchcodec_cuda() -> bool:
@@ -34,7 +91,7 @@ class GPUVideoDecoder:
         decoder = GPUVideoDecoder(
             "video.mp4", device="cuda",
             crop_left_half=True, target_size=640,
-            target_fps=30.0, start_time=60.0, duration=40.0,
+            half_rate=True, start_time=60.0, duration=40.0,
         )
         for chunk_tensor in decoder.iter_chunks(chunk_size=512):
             # chunk_tensor: [N, H, W, C] uint8 CUDA tensor
@@ -47,7 +104,7 @@ class GPUVideoDecoder:
         device: str = "cuda",
         crop_left_half: bool = False,
         target_size: int | None = 640,
-        target_fps: float | None = 30.0,
+        half_rate: bool = False,
         start_time: float | None = None,
         duration: float | None = None,
     ):
@@ -57,7 +114,7 @@ class GPUVideoDecoder:
         self.device = device
         self.crop_left_half = crop_left_half
         self.target_size = target_size
-        self.target_fps = target_fps
+        self.half_rate = half_rate
         self.start_time = start_time
         self.duration = duration
 
@@ -103,33 +160,17 @@ class GPUVideoDecoder:
             return 16
 
     def _compute_frame_indices(self) -> list[int]:
-        """Compute which source frames to decode for the target FPS and time range."""
-        src_fps = self.source_fps
-        total_src = self.num_source_frames
-
-        start_frame = 0
-        if self.start_time is not None and self.start_time > 0:
-            start_frame = int(self.start_time * src_fps)
-
-        if self.duration is not None:
-            end_frame = start_frame + int(self.duration * src_fps)
-        else:
-            end_frame = total_src
-
-        start_frame = min(start_frame, total_src)
-        end_frame = min(end_frame, total_src)
-
-        if self.target_fps is not None and self.target_fps < src_fps:
-            step = src_fps / self.target_fps
-            indices = []
-            pos = float(start_frame)
-            while pos < end_frame:
-                indices.append(int(round(pos)))
-                pos += step
-        else:
-            indices = list(range(start_frame, end_frame))
-
-        return indices
+        """Compute which source frames to decode for the time range."""
+        start_frame, end_frame, frame_step = compute_frame_sampling_plan(
+            source_fps=self.source_fps,
+            num_source_frames=self.num_source_frames,
+            start_time=self.start_time,
+            duration=self.duration,
+            half_rate=self.half_rate,
+        )
+        if end_frame is None:
+            end_frame = self.num_source_frames
+        return list(range(start_frame, end_frame, frame_step))
 
     def _process_chunk(self, frames: torch.Tensor) -> torch.Tensor:
         """Apply crop and resize on GPU. Input/output: [N, H, W, C] uint8 CUDA."""
@@ -232,7 +273,7 @@ def stream_video_gpu(
     device: str = "cuda",
     crop_left_half: bool = False,
     target_size: int | None = 640,
-    target_fps: float | None = 30.0,
+    half_rate: bool = False,
     start_time: float | None = None,
     duration: float | None = None,
     chunk_size: int = 512,
@@ -247,7 +288,7 @@ def stream_video_gpu(
         log.warning("torchcodec CUDA not available, falling back to ffmpeg/cv2")
         yield from _fallback_stream(
             video_path, target_size, crop_left_half,
-            start_time, duration, target_fps, chunk_size,
+            start_time, duration, half_rate, chunk_size,
         )
         return
 
@@ -256,13 +297,16 @@ def stream_video_gpu(
             video_path, device=device,
             crop_left_half=crop_left_half,
             target_size=target_size,
-            target_fps=target_fps,
+            half_rate=half_rate,
             start_time=start_time,
             duration=duration,
         )
         log.info(
-            "GPU decode: %d frames @ %.1ffps from %s",
-            decoder.num_frames, decoder.source_fps, video_path,
+            "GPU decode: %d frames @ %.3ffps effective (source %.3ffps) from %s",
+            decoder.num_frames,
+            effective_frame_rate(decoder.source_fps, decoder.half_rate),
+            decoder.source_fps,
+            video_path,
         )
         if as_numpy:
             yield from decoder.iter_chunks_numpy(chunk_size, decode_batch=decode_batch)
@@ -275,13 +319,13 @@ def stream_video_gpu(
         torch.cuda.empty_cache()
         yield from _fallback_stream(
             video_path, target_size, crop_left_half,
-            start_time, duration, target_fps, chunk_size,
+            start_time, duration, half_rate, chunk_size,
         )
 
 
 def _fallback_stream(
     video_path, target_size, crop_left_half,
-    start_time, duration, target_fps, chunk_size,
+    start_time, duration, half_rate, chunk_size,
 ):
     """Fallback: stream via OpenCV CPU decode."""
     import cv2
@@ -291,37 +335,38 @@ def _fallback_stream(
         raise RuntimeError(f"Cannot open video: {video_path}")
 
     src_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    if start_time is not None:
-        cap.set(cv2.CAP_PROP_POS_MSEC, start_time * 1000)
-
-    step = src_fps / target_fps if target_fps and target_fps < src_fps else 1.0
-    max_frames = int(duration * target_fps) if duration and target_fps else float("inf")
+    total_src_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or None
+    start_frame, end_frame, frame_step = compute_frame_sampling_plan(
+        source_fps=src_fps,
+        num_source_frames=total_src_frames,
+        start_time=start_time,
+        duration=duration,
+        half_rate=half_rate,
+    )
+    if start_frame > 0:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
 
     chunk: list[np.ndarray] = []
-    frame_pos = 0.0
-    next_target = 0.0
-    total = 0
+    source_frame_idx = start_frame
 
-    while total < max_frames:
+    while end_frame is None or source_frame_idx < end_frame:
         ret, frame = cap.read()
         if not ret:
             break
 
-        if frame_pos >= next_target:
+        if (source_frame_idx - start_frame) % frame_step == 0:
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             if crop_left_half:
                 frame = frame[:, : frame.shape[1] // 2]
             if target_size is not None:
                 frame = cv2.resize(frame, (target_size, target_size))
             chunk.append(frame)
-            total += 1
-            next_target += step
 
             if len(chunk) >= chunk_size:
                 yield chunk
                 chunk = []
 
-        frame_pos += 1
+        source_frame_idx += 1
 
     cap.release()
     if chunk:

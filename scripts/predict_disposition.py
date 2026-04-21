@@ -36,14 +36,21 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.models.dispositiontcn import DispositionTCN, extract_disposition_config
 from src.data.pose import load_pose_model
-from src.data.decode import stream_video_gpu, _has_torchcodec_cuda
+from src.data.decode import (
+    _has_torchcodec_cuda,
+    effective_frame_rate,
+    estimate_output_frames,
+    stream_video_gpu,
+)
 from src.data.extraction import PARTNER_CLASS
+from src.data.preprocess import probe_video
 from src.data.spatial import (
     build_channel_slices,
     legacy_conf_path,
     read_spatial_features_h5,
     resolve_disposition_feature_layers,
 )
+from src.data.video import get_video_info
 from torchvision.ops import roi_align
 
 import os
@@ -60,6 +67,34 @@ def _optional_int_tuple(values: object) -> tuple[int, ...] | None:
     if not values:
         return None
     return tuple(int(value) for value in values)
+
+
+def _probe_video_fps(video_path: Path) -> float:
+    try:
+        return float(probe_video(video_path)["fps"])
+    except Exception:
+        return float(get_video_info(video_path).fps)
+
+
+def _load_scene_base_fps(scene_dir: Path, video_path: Path) -> float:
+    meta_path = scene_dir / "metadata.json"
+    if meta_path.exists():
+        with open(meta_path) as fh:
+            metadata = json.load(fh)
+        fps = metadata.get("fps")
+        if fps is not None:
+            return float(fps)
+    return _probe_video_fps(video_path)
+
+
+def _apply_half_rate(array: np.ndarray | None) -> np.ndarray | None:
+    if array is None:
+        return None
+    return array[::2]
+
+
+def _seconds_to_frames(seconds: float, fps: float) -> int:
+    return max(1, int(round(seconds * fps)))
 
 
 # ── GPU-native spatial extractor ──────────────────────────────────────────────
@@ -276,7 +311,7 @@ def extract_spatial_gpu(
     batch_size: int = 60,
     vr_mode: bool = False,
     sbs_crop: str = "left",
-    target_fps: float = 30.0,
+    half_rate: bool = False,
     start_time: float | None = None,
     duration: float | None = None,
     scale_layer_indices: tuple[int, ...] | None = None,
@@ -320,11 +355,13 @@ def extract_spatial_gpu(
         src_fps = _tmp.metadata.average_fps or 30.0
         src_n = _tmp.metadata.num_frames or 0
         _tmp = None
-        eff = target_fps or src_fps
-        if duration:
-            total_est = int(duration * eff)
-        elif src_fps > 0:
-            total_est = int(src_n * eff / src_fps)
+        total_est = estimate_output_frames(
+            source_fps=src_fps,
+            num_source_frames=src_n,
+            start_time=start_time,
+            duration=duration,
+            half_rate=half_rate,
+        )
     except Exception:
         pass
 
@@ -343,7 +380,7 @@ def extract_spatial_gpu(
         device=str(device),
         crop_left_half=crop_left_half,
         target_size=640,
-        target_fps=target_fps,
+        half_rate=half_rate,
         start_time=start_time,
         duration=duration,
         chunk_size=chunk_size,
@@ -465,7 +502,7 @@ def sliding_window_predict(model: DispositionTCN,
 
 
 def predictions_to_funscript(
-    positions: np.ndarray, fps: float = 30.0, start_time: float = 0.0,
+    positions: np.ndarray, fps: float, start_time: float = 0.0,
 ) -> dict:
     """Convert per-frame positions [0,1] to funscript JSON."""
     actions = []
@@ -490,7 +527,8 @@ def live_playback_with_prediction(
     sbs_crop: str = "left",
     start_time: float | None = None,
     duration: float | None = None,
-    target_fps: float = 30.0,
+    playback_fps: float = 30.0,
+    half_rate: bool = False,
     seq_len: int = 120,
     stride: int = 60,
 ) -> np.ndarray:
@@ -557,11 +595,13 @@ def live_playback_with_prediction(
                 src_fps = _tmp.metadata.average_fps or 30.0
                 src_n   = _tmp.metadata.num_frames or 0
                 _tmp = None
-                eff = target_fps or src_fps
-                if duration:
-                    total_est = int(duration * eff)
-                elif src_fps > 0:
-                    total_est = int(src_n * eff / src_fps)
+                total_est = estimate_output_frames(
+                    source_fps=src_fps,
+                    num_source_frames=src_n,
+                    start_time=start_time,
+                    duration=duration,
+                    half_rate=half_rate,
+                ) or 0
             except Exception:
                 pass
             with _lock:
@@ -584,7 +624,7 @@ def live_playback_with_prediction(
                 device=str(device),
                 crop_left_half=crop_left,
                 target_size=640,
-                target_fps=target_fps,
+                half_rate=half_rate,
                 start_time=start_time,
                 duration=duration,
                 chunk_size=batch_size,
@@ -732,7 +772,7 @@ def live_playback_with_prediction(
     BUF_START_THRESHOLD  = 360
     BUF_RESUME_THRESHOLD = 360
     BUF_LOW_THRESHOLD    = 30
-    frame_delay_ms = max(16, int(round(1000.0 / target_fps)))
+    frame_delay_ms = max(16, int(round(1000.0 / max(playback_fps, 1e-6))))
 
     top_row = tk.Frame(root, bg="#1e1e1e")
     top_row.pack(fill=tk.BOTH, expand=False, padx=4, pady=(4, 0))
@@ -784,7 +824,7 @@ def live_playback_with_prediction(
     def _on_timeline_click(event) -> None:
         if event.inaxes != ax or event.xdata is None:
             return
-        target_frame = max(0, int(event.xdata * target_fps))
+        target_frame = max(0, int(round(event.xdata * playback_fps)))
         _pos[0] = target_frame
         _t_start[0] = time.perf_counter()
         _f_start[0] = target_frame
@@ -838,12 +878,12 @@ def live_playback_with_prediction(
         _f_start[0] = _pos[0]
         _buf_wait[0] = False
 
-    tk.Button(ctrl_frame, text="◀◀", command=lambda: _seek(-int(target_fps * 5)), **_BTN).pack(side=tk.LEFT, padx=2)
-    tk.Button(ctrl_frame, text="◀",  command=lambda: _seek(-int(target_fps)),      **_BTN).pack(side=tk.LEFT, padx=2)
+    tk.Button(ctrl_frame, text="◀◀", command=lambda: _seek(-_seconds_to_frames(5.0, playback_fps)), **_BTN).pack(side=tk.LEFT, padx=2)
+    tk.Button(ctrl_frame, text="◀",  command=lambda: _seek(-_seconds_to_frames(1.0, playback_fps)), **_BTN).pack(side=tk.LEFT, padx=2)
     btn_play = tk.Button(ctrl_frame, text="▶ Play", command=_toggle_play, **_BTN)
     btn_play.pack(side=tk.LEFT, padx=2)
-    tk.Button(ctrl_frame, text="▶",  command=lambda: _seek(int(target_fps)),       **_BTN).pack(side=tk.LEFT, padx=2)
-    tk.Button(ctrl_frame, text="▶▶", command=lambda: _seek(int(target_fps * 5)),   **_BTN).pack(side=tk.LEFT, padx=2)
+    tk.Button(ctrl_frame, text="▶",  command=lambda: _seek(_seconds_to_frames(1.0, playback_fps)), **_BTN).pack(side=tk.LEFT, padx=2)
+    tk.Button(ctrl_frame, text="▶▶", command=lambda: _seek(_seconds_to_frames(5.0, playback_fps)), **_BTN).pack(side=tk.LEFT, padx=2)
 
     frame_label = tk.Label(ctrl_frame, text="Frame: 0  |  0.0s",
                            bg="#1e1e1e", fg="#888888", font=("Consolas", 9))
@@ -892,8 +932,8 @@ def live_playback_with_prediction(
 
     root.protocol("WM_DELETE_WINDOW", _on_close)
     root.bind("<space>",   lambda e: _toggle_play())
-    root.bind("<Left>",    lambda e: _seek(-int(target_fps)))
-    root.bind("<Right>",   lambda e: _seek(int(target_fps)))
+    root.bind("<Left>",    lambda e: _seek(-_seconds_to_frames(1.0, playback_fps)))
+    root.bind("<Right>",   lambda e: _seek(_seconds_to_frames(1.0, playback_fps)))
     root.bind("<q>",       lambda e: _on_close())
     root.bind("<Escape>",  lambda e: _on_close())
 
@@ -911,8 +951,8 @@ def live_playback_with_prediction(
     def _update_stats(st: dict, cur_frame: int) -> None:
         n_dec  = st["frames_decoded"]
         n_pred = st["frames_predicted"]
-        t_cur  = cur_frame / max(target_fps, 1.0)
-        lag    = max(0.0, (n_dec - n_pred) / max(target_fps, 1.0))
+        t_cur  = cur_frame / max(playback_fps, 1.0)
+        lag    = max(0.0, (n_dec - n_pred) / max(playback_fps, 1.0))
         buf_sz = len(st["frames"])
         status = st["status"]
         total_est = st["total_est"]
@@ -958,8 +998,8 @@ def live_playback_with_prediction(
     def _update_graph(preds: np.ndarray, cur_frame: int) -> None:
         if preds is None or len(preds) == 0:
             return
-        t_all = np.arange(len(preds)) / target_fps
-        t_cur = cur_frame / target_fps
+        t_all = np.arange(len(preds)) / playback_fps
+        t_cur = cur_frame / playback_fps
         half  = 15.0
         t0w   = max(0.0, t_cur - half)
         t1w   = t0w + half * 2
@@ -1001,7 +1041,7 @@ def live_playback_with_prediction(
 
         if _playing[0]:
             elapsed_s  = (time.perf_counter() - _t_start[0]) * _speed[0]
-            target_idx = int(_f_start[0] + elapsed_s * target_fps)
+            target_idx = int(round(_f_start[0] + elapsed_s * playback_fps))
         else:
             target_idx = _pos[0]
 
@@ -1018,7 +1058,7 @@ def live_playback_with_prediction(
                     _f_start[0] = _pos[0]
                     btn_play.config(text="⏸ Pause")
                     elapsed_s  = (time.perf_counter() - _t_start[0]) * _speed[0]
-                    target_idx = int(_f_start[0] + elapsed_s * target_fps)
+                    target_idx = int(round(_f_start[0] + elapsed_s * playback_fps))
         elif not worker_done:
             if buf_sz < BUF_LOW_THRESHOLD or (frames and target_idx > max(frames.keys())):
                 _buf_wait[0] = True
@@ -1066,7 +1106,7 @@ def live_playback_with_prediction(
                 for k in to_del:
                     del _state["frames"][k]
 
-        t_sec = _pos[0] / max(target_fps, 1.0)
+        t_sec = _pos[0] / max(playback_fps, 1.0)
         frame_label.config(text=f"Frame: {_pos[0]} / {n_decoded}  |  {t_sec:.1f}s")
 
         max_frame = max(n_decoded, n_pred, 1)
@@ -1075,7 +1115,7 @@ def live_playback_with_prediction(
         _seek_updating[0] = True
         _seek_var.set(_pos[0])
         _seek_updating[0] = False
-        total_sec = max_frame / max(target_fps, 1.0)
+        total_sec = max_frame / max(playback_fps, 1.0)
         cur_min, cur_s = divmod(int(t_sec), 60)
         tot_min, tot_s = divmod(int(total_sec), 60)
         seek_time_label.config(text=f"{cur_min}:{cur_s:02d} / {tot_min}:{tot_s:02d}")
@@ -1123,6 +1163,7 @@ def run_benchmark(
     device: torch.device,
     seq_len: int,
     stride: int,
+    half_rate: bool = False,
 ) -> None:
     """Benchmark GPU path vs CPU/baseline path and compare prediction accuracy."""
     from scripts.extract_spatial import SpatialExtractor, load_video_frames
@@ -1146,6 +1187,7 @@ def run_benchmark(
         model_name,
         device,
         roi_size=roi_size,
+        half_rate=half_rate,
         scale_layer_indices=scale_layer_indices,
         scale_strides=scale_strides,
     )
@@ -1178,6 +1220,8 @@ def run_benchmark(
         scale_strides=scale_strides,
     )
     frames = load_video_frames(video_path)
+    if half_rate:
+        frames = frames[::2]
     all_sp, all_co = [], []
     for start in range(0, len(frames), 32):
         batch = frames[start:start + 32]
@@ -1313,8 +1357,8 @@ def main() -> None:
     parser.add_argument("--model-name", type=str,  default=DEFAULT_MODEL_NAME)
     parser.add_argument("--roi-size",   type=int,  default=None,
                         help="Override roi_size from checkpoint")
-    parser.add_argument("--fps",        type=float, default=30.0,
-                        help="Target decoding FPS")
+    parser.add_argument("--half-rate",  action="store_true",
+                        help="Drop every other frame while preserving source-exact timing")
 
     parser.add_argument("--vr",         dest="vr",  action="store_true",  default=False,
                         help="VR / SBS video — crop a single eye before decode")
@@ -1354,10 +1398,18 @@ def main() -> None:
     scale_strides = _optional_int_tuple(data_cfg.get("spatial_strides"))
 
     # Determine video path
+    scene_dir = args.data_dir / "processed" / args.scene if args.scene else None
     if args.video is not None:
         video_path = args.video
     else:
         video_path = args.data_dir / "preprocessed" / f"{args.scene}.mp4"
+
+    if scene_dir is not None:
+        base_fps = _load_scene_base_fps(scene_dir, video_path)
+    else:
+        base_fps = _probe_video_fps(video_path)
+    output_fps = effective_frame_rate(base_fps, args.half_rate)
+    print(f"Using effective fps: {output_fps:.6f}")
 
     # ── Benchmark mode ────────────────────────────────────────────────────
     if args.benchmark:
@@ -1371,6 +1423,7 @@ def main() -> None:
             device=device,
             seq_len=args.seq_len,
             stride=args.stride,
+            half_rate=args.half_rate,
         )
         return
 
@@ -1386,7 +1439,8 @@ def main() -> None:
             scale_strides=scale_strides,
             vr_mode=args.vr,
             sbs_crop=args.sbs_crop,
-            target_fps=args.fps,
+            playback_fps=output_fps,
+            half_rate=args.half_rate,
             seq_len=args.seq_len,
             stride=args.stride,
             start_time=args.start_time,
@@ -1410,6 +1464,11 @@ def main() -> None:
             label_path = scene_dir / "labels.npy"
             if label_path.exists():
                 labels = np.load(str(label_path))
+            if args.half_rate:
+                print("Applying half-rate frame skip to cached spatial features")
+                spatial = spatial[::2]
+                conf = conf[::2]
+                labels = _apply_half_rate(labels)
         else:
             print(f"Extracting features from video: {video_path}")
             spatial, conf = extract_spatial_gpu(
@@ -1419,7 +1478,7 @@ def main() -> None:
                 scale_strides=scale_strides,
                 vr_mode=args.vr,
                 sbs_crop=args.sbs_crop,
-                target_fps=args.fps,
+                half_rate=args.half_rate,
             )
 
         print(f"Spatial features: {spatial.shape}, Confidence: {conf.shape}")
@@ -1453,7 +1512,7 @@ def main() -> None:
         # Auto-derive: <video_stem>.funscript alongside the video
         out_path = video_path.with_suffix(".funscript")
 
-    funscript = predictions_to_funscript(predictions, fps=args.fps)
+    funscript = predictions_to_funscript(predictions, fps=output_fps)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w") as fh:
         json.dump(funscript, fh)
@@ -1466,7 +1525,7 @@ def main() -> None:
             aux_predictions=locals().get("aux_predictions"),
             aux_labels=aux_labels,
             labels=locals().get("labels"),
-            fps=args.fps,
+            fps=output_fps,
             source_name=str(args.scene or args.video),
             args=args,
         )

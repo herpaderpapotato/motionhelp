@@ -8,7 +8,7 @@ import torch
 @dataclass
 class VideoConfig:
     vr_mode: bool = True
-    target_fps: int = 30
+    target_fps: int = 30  # deprecated; preprocessing now preserves source FPS unless half-rate is requested
     frame_size: int = 640  # resize frames to this for pose extraction
     sbs_crop: str = "left"  # "left" or "right" eye for SBS VR
 

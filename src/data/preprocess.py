@@ -8,6 +8,7 @@ encoding and CUDA for GPU-accelerated decoding.
 import logging
 import subprocess
 import json
+from fractions import Fraction
 from pathlib import Path
 import cv2
 
@@ -22,6 +23,35 @@ STEREO_LAYOUTS = {
     "180_mono": "mono",    # mono, no stereo crop needed
     "": "sbs",             # assume SBS if unknown
 }
+
+
+def _parse_fps_fraction(fps_value: str | float | int | None) -> Fraction | None:
+    if fps_value is None:
+        return None
+    if isinstance(fps_value, (int, float)):
+        if fps_value <= 0:
+            return None
+        return Fraction(str(fps_value)).limit_denominator(1000000)
+    if fps_value in {"", "0/0", "N/A"}:
+        return None
+    try:
+        return Fraction(fps_value)
+    except (ValueError, ZeroDivisionError):
+        return None
+
+
+def _format_fps_fraction(fps_fraction: Fraction) -> str:
+    if fps_fraction.denominator == 1:
+        return str(fps_fraction.numerator)
+    return f"{fps_fraction.numerator}/{fps_fraction.denominator}"
+
+
+def half_rate_fps_expr(source_fps_expr: str | float | int | None) -> str | None:
+    """Return an exact half-rate ffmpeg FPS expression when possible."""
+    fps_fraction = _parse_fps_fraction(source_fps_expr)
+    if fps_fraction is None:
+        return None
+    return _format_fps_fraction(fps_fraction / 2)
 
 
 def probe_video(video_path: Path) -> dict:
@@ -48,21 +78,28 @@ def probe_video(video_path: Path) -> dict:
     if not video_stream:
         raise RuntimeError(f"No video stream found in {video_path}")
 
-    fps_str = video_stream.get("r_frame_rate", "fail")
-    if fps_str == "fail":
+    fps_expr = video_stream.get("avg_frame_rate") or video_stream.get("r_frame_rate") or ""
+    fps_fraction = _parse_fps_fraction(fps_expr)
+    if fps_fraction is None:
         cap = cv2.VideoCapture(str(video_path))
         if not cap.isOpened():
             raise RuntimeError(f"Failed to open video with OpenCV for FPS probe: {video_path}")
         fps = cap.get(cv2.CAP_PROP_FPS)
         cap.release()
+        fps_fraction = _parse_fps_fraction(fps)
     else:
-        fps_parts = fps_str.split("/")
-        fps = float(fps_parts[0]) / float(fps_parts[1]) if len(fps_parts) == 2 else float(fps_parts[0])
+        fps = float(fps_fraction)
+
+    if fps_fraction is None:
+        raise RuntimeError(f"Failed to determine FPS for {video_path}")
+
+    fps = float(fps_fraction)
 
     return {
         "width": int(video_stream["width"]),
         "height": int(video_stream["height"]),
         "fps": fps,
+        "fps_expr": _format_fps_fraction(fps_fraction),
         "duration": float(data.get("format", {}).get("duration", 0)),
         "codec": video_stream.get("codec_name", ""),
     }
@@ -73,13 +110,14 @@ def build_preprocess_command(
     output_path: Path,
     projection: str = "180_sbs",
     target_height: int = 960,
-    target_fps: int | None = None,
+    half_rate: bool = False,
     eye: str = "left",
     use_hw_accel: bool = True,
     crf: int = 23,
     source_codec: str = "",
     source_width: int = 0,
     source_height: int = 0,
+    source_fps_expr: str | None = None,
 ) -> list[str]:
     """Build an ffmpeg command for preprocessing a VR video.
 
@@ -93,13 +131,14 @@ def build_preprocess_command(
         output_path: Destination path for preprocessed video.
         projection: VR projection type (180_sbs, fisheye190, mkx200, 360_tb, 180_mono).
         target_height: Output height in pixels. Width computed to maintain aspect.
-        target_fps: Output frame rate. None = keep original.
+        half_rate: If True, drop every other frame and encode at source_fps / 2.
         eye: Which eye to extract: "left" or "right".
         use_hw_accel: Use CUVID decoding + NVENC encoding.
         crf: Constant rate factor (quality). Lower = better. 23 is default.
         source_codec: Source video codec name (e.g. "hevc", "h264") for CUVID.
         source_width: Source video width (for decoder resize calculation).
         source_height: Source video height (for decoder resize calculation).
+        source_fps_expr: Exact source FPS expression from ffprobe (e.g. 30000/1001).
 
     Returns:
         ffmpeg command as a list of strings.
@@ -150,9 +189,13 @@ def build_preprocess_command(
     if not decoder_resize:
         vf_filters.append(f"scale=-2:{target_height}")
 
-    # Step 3: FPS conversion
-    if target_fps:
-        vf_filters.append(f"fps={target_fps}")
+    # Step 3: Optional exact half-rate conversion
+    if half_rate:
+        half_expr = half_rate_fps_expr(source_fps_expr)
+        if half_expr:
+            vf_filters.append(f"fps={half_expr}")
+        else:
+            vf_filters.append("select=not(mod(n\\,2))")
 
     vf_string = ",".join(vf_filters) if vf_filters else None
 
@@ -217,7 +260,7 @@ def preprocess_video(
     output_path: Path,
     projection: str = "180_sbs",
     target_height: int = 960,
-    target_fps: int | None = None,
+    half_rate: bool = False,
     eye: str = "left",
     use_hw_accel: bool = True,
     crf: int = 23,
@@ -230,7 +273,7 @@ def preprocess_video(
         output_path: Destination for preprocessed video.
         projection: VR projection type.
         target_height: Output height in pixels.
-        target_fps: Output FPS or None to keep original.
+        half_rate: If True, keep every other source frame.
         eye: "left" or "right" eye to extract.
         use_hw_accel: Use NVENC + CUDA.
         crf: Quality factor (lower = better).
@@ -250,10 +293,11 @@ def preprocess_video(
 
     cmd = build_preprocess_command(
         input_path, output_path, projection, target_height,
-        target_fps, eye, use_hw_accel, crf,
+        half_rate, eye, use_hw_accel, crf,
         source_codec=source_info["codec"],
         source_width=source_info["width"],
         source_height=source_info["height"],
+        source_fps_expr=source_info.get("fps_expr"),
     )
 
     log.info("Preprocessing: %s → %s", input_path.name, output_path.name)
@@ -272,7 +316,7 @@ def preprocess_video(
             log.warning("HW acceleration failed, falling back to CPU encoding")
             return preprocess_video(
                 input_path, output_path, projection, target_height,
-                target_fps, eye, use_hw_accel=False, crf=crf, overwrite=True,
+                half_rate, eye, use_hw_accel=False, crf=crf, overwrite=True,
             )
         raise RuntimeError(
             f"ffmpeg preprocessing failed for {input_path.name}:\n{result.stderr[-500:]}"

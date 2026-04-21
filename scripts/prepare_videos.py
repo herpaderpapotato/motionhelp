@@ -18,6 +18,9 @@ Usage:
     # Different segment length / count:
     python scripts/prepare_videos.py --duration 60 --segments-per-video 2
 
+    # Keep exact source timing but drop every other frame:
+    python scripts/prepare_videos.py --half-rate
+
     # Multi-machine coordination (lock files prevent duplicate work):
     python scripts/prepare_videos.py --lock-dir data/locks
 
@@ -217,10 +220,10 @@ def preprocess_segment(
     output_path: Path,
     projection: str,
     target_height: int,
-    target_fps: int,
     eye: str,
     start_sec: float,
     duration_sec: float,
+    half_rate: bool = False,
     ffmpeg_gpu: int | None = None,
 ) -> bool:
     """Run ffmpeg to extract and preprocess one video segment."""
@@ -236,12 +239,13 @@ def preprocess_segment(
             output_path=output_path,
             projection=projection,
             target_height=target_height,
-            target_fps=target_fps,
+            half_rate=half_rate,
             eye=eye,
             use_hw_accel=use_hw,
             source_codec=source_info["codec"],
             source_width=source_info["width"],
             source_height=source_info["height"],
+            source_fps_expr=source_info.get("fps_expr"),
         )
         i_idx = cmd.index("-i")
         cmd.insert(i_idx, f"{start_sec:.2f}")
@@ -281,6 +285,7 @@ def extract_labels(
     seg_total_frames: int,
     original_fps: float,
     original_duration_sec: float,
+    half_rate: bool = False,
 ) -> bool:
     labels_path = output_dir / "labels.npy"
     if labels_path.exists():
@@ -299,7 +304,9 @@ def extract_labels(
     seg_labels_orig = all_labels[seg_start_frame:seg_end_frame]
 
     # Resample to target fps if needed
-    if abs(original_fps - seg_fps) > 0.5 and len(seg_labels_orig) > 0:
+    if half_rate and len(seg_labels_orig) > 0:
+        labels = seg_labels_orig[::2].astype(np.float32)
+    elif abs(original_fps - seg_fps) > 0.005 and len(seg_labels_orig) > 0:
         from scipy.interpolate import interp1d
         t_o = np.linspace(0, 1, len(seg_labels_orig))
         t_t = np.linspace(0, 1, seg_total_frames)
@@ -374,6 +381,7 @@ def _reprocess_all_labels(
 
         seg_fps: float = meta["fps"]
         seg_total_frames: int = meta["total_frames"]
+        half_rate = bool(meta.get("half_rate", False))
 
         # ── Resolve timing ────────────────────────────────────────────────
         if "segment_start_sec" in meta and "segment_duration_sec" in meta:
@@ -451,6 +459,7 @@ def _reprocess_all_labels(
             seg_total_frames=seg_total_frames,
             original_fps=orig_info.fps,
             original_duration_sec=orig_info.duration_seconds,
+            half_rate=half_rate,
         )
         if ok:
             ok_count += 1
@@ -478,6 +487,8 @@ def main() -> None:
     parser.add_argument("--segments-per-video",  type=int, default=3,
                         help="Segments to sample per video")
     parser.add_argument("--projections",         nargs="+", default=["180_sbs"])
+    parser.add_argument("--half-rate",          action="store_true",
+                        help="Keep exact source timing but drop every other frame")
     parser.add_argument("--ffmpeg-gpu",          type=int, default=None,
                         help="GPU index for ffmpeg HW decode (e.g. 0)")
     parser.add_argument("--lock-dir",            default=None,
@@ -626,10 +637,10 @@ def main() -> None:
                     output_path=preprocessed_path,
                     projection=projection,
                     target_height=cfg.video.frame_size,
-                    target_fps=cfg.video.target_fps,
                     eye=cfg.video.sbs_crop,
                     start_sec=start_sec,
                     duration_sec=args.duration,
+                    half_rate=args.half_rate,
                     ffmpeg_gpu=args.ffmpeg_gpu,
                 )
                 if not ok:
@@ -655,6 +666,8 @@ def main() -> None:
                     "funscript_path":     str(pair.funscript_path),
                     "segment_start_sec":  start_sec,
                     "segment_duration_sec": args.duration,
+                    "source_fps":         info.fps,
+                    "half_rate":          args.half_rate,
                     "width":              seg_info.width,
                     "height":             seg_info.height,
                     "fps":                seg_info.fps,
@@ -674,6 +687,7 @@ def main() -> None:
                 seg_total_frames=seg_info.total_frames,
                 original_fps=info.fps,
                 original_duration_sec=info.duration_seconds,
+                half_rate=args.half_rate,
             )
             if not ok:
                 log.error("Label extraction failed for %s", seg_name)
