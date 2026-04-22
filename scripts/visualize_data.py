@@ -408,6 +408,8 @@ class DataVisualizer:
         self._all_scenes: list[tuple[str, dict]] = []
         # Filtered/sorted view
         self.scenes: list[str] = []
+        # Per-scene cache: sid -> (stage, review_dict, has_video)
+        self._scene_cache: dict[str, tuple[str, dict, bool]] = {}
 
         self.current_scene: str | None = None
         self.current_frame: int = 0
@@ -417,10 +419,11 @@ class DataVisualizer:
 
         # Loaded data
         self.cap: cv2.VideoCapture | None = None
-        self.pose_data: np.ndarray | None = None   # [N, max_persons, n_kpt, 3]
-        self.label_data: np.ndarray | None = None  # [N]
+        self.pose_data: np.ndarray | None = None        # [N, max_persons, n_kpt, 3]
+        self.label_data: np.ndarray | None = None       # [N]
         self._loaded_label_data: np.ndarray | None = None
-        self.flow_data: np.ndarray | None = None   # [N, flow_dim] or None
+        self.prediction_data: np.ndarray | None = None  # [N] TCN predictions, or None
+        self.flow_data: np.ndarray | None = None        # [N, flow_dim] or None
         self.metadata: dict = {}
 
         # Playback
@@ -824,12 +827,27 @@ class DataVisualizer:
             flow_scale=self.cfg.flow.scale,
         )
 
+    def _update_scene_cache_entry(self, sid: str) -> None:
+        """Recompute and store (stage, review, has_video) for a single scene."""
+        scene_dir = self.processed_dir / sid
+        stage = self._scene_stage(scene_dir)
+        review = read_review(scene_dir)
+        has_video = (self.preprocessed_dir / f"{sid}.mp4").exists()
+        self._scene_cache[sid] = (stage, review, has_video)
+
+    def _build_scene_cache(self) -> None:
+        """Populate _scene_cache for all scenes in _all_scenes."""
+        self._scene_cache = {}
+        for sid, _ in self._all_scenes:
+            self._update_scene_cache_entry(sid)
+
     def _discover_scenes(self):
         if not self.processed_dir.exists():
             return
         self._all_scenes = list(discover_scenes(
             self.data_dir, include_rejected=True, require_labels=True,
         ))
+        self._build_scene_cache()
         self._refresh_scene_list()
 
     def _refresh_scene_list(self):
@@ -839,19 +857,24 @@ class DataVisualizer:
         _order = {"rejected": 0, "pending": 1, "legacy": 2, "approved": 3,
                   "keypoints": 4, "stage2_ok": 5, "flow": 6}
 
+        def _stage(sid: str) -> str:
+            return self._scene_cache.get(sid, ("pending", {}, False))[0]
+
+        def _review(sid: str) -> dict:
+            return self._scene_cache.get(sid, ("pending", {}, False))[1]
+
         filtered = [
             (sid, st) for sid, st in self._all_scenes
-            if self._scene_stage(self.processed_dir / sid) in active
+            if _stage(sid) in active
         ]
 
         if sort_mode == "Stage":
             filtered.sort(key=lambda x: (
-                _order.get(self._scene_stage(self.processed_dir / x[0]), 99), x[0]
+                _order.get(_stage(x[0]), 99), x[0]
             ))
         elif sort_mode == "MSE":
             def _mse_key(item):
-                review = read_review(self.processed_dir / item[0])
-                mse_str = review.get("mse", "")
+                mse_str = _review(item[0]).get("mse", "")
                 try:
                     return float(mse_str)
                 except (ValueError, TypeError):
@@ -864,11 +887,11 @@ class DataVisualizer:
 
         self.scene_listbox.delete(0, tk.END)
         for sid in self.scenes:
-            stage = self._scene_stage(self.processed_dir / sid)
-            review = read_review(self.processed_dir / sid)
+            cached = self._scene_cache.get(sid, ("pending", {}, False))
+            stage, review, has_video = cached
             icon  = STAGE_ICONS.get(stage, "·")
             star  = " ★" if review.get("force_val", False) else ""
-            vid   = " ▶" if (self.preprocessed_dir / f"{sid}.mp4").exists() else ""
+            vid   = " ▶" if has_video else ""
             mse_str = review.get("mse", "")
             mse_tag = f"  mse={mse_str}" if mse_str else ""
             self.scene_listbox.insert(tk.END, f"{icon} {sid}{star}{vid}{mse_tag}")
@@ -944,6 +967,13 @@ class DataVisualizer:
         loaded_labels = np.asarray(np.load(str(scene_dir / "labels.npy")), dtype=np.float32)
         self._loaded_label_data = loaded_labels.copy()
         self.label_data = loaded_labels.copy()
+
+        # Load predictions if available (written by evaluate_scenes.py).
+        pred_path = scene_dir / "predictions.npy"
+        if pred_path.exists():
+            self.prediction_data = np.asarray(np.load(str(pred_path)), dtype=np.float32)
+        else:
+            self.prediction_data = None
 
         # Optical flow: new path first, then legacy
         flow_p = resolve_flow_path(scene_dir, self.cfg.flow.method,
@@ -1261,12 +1291,14 @@ class DataVisualizer:
             if not self._commit_label_edits():
                 return
             approve(self.processed_dir / self.current_scene)
+            self._update_scene_cache_entry(self.current_scene)
             self._update_curation_ui()
             self._refresh_scene_list()
 
     def _reject(self):
         if self.current_scene:
             reject(self.processed_dir / self.current_scene)
+            self._update_scene_cache_entry(self.current_scene)
             self._update_curation_ui()
             self._refresh_scene_list()
 
@@ -1274,18 +1306,21 @@ class DataVisualizer:
         if self.current_scene:
             current = self.current_review.get("force_val", False)
             set_force_val(self.processed_dir / self.current_scene, not current)
+            self._update_scene_cache_entry(self.current_scene)
             self._update_curation_ui()
             self._refresh_scene_list()
 
     def _approve_stage2(self):
         if self.current_scene:
             approve_stage2(self.processed_dir / self.current_scene)
+            self._update_scene_cache_entry(self.current_scene)
             self._update_curation_ui()
             self._refresh_scene_list()
 
     def _reject_stage2(self):
         if self.current_scene:
             reject_stage2(self.processed_dir / self.current_scene)
+            self._update_scene_cache_entry(self.current_scene)
             self._update_curation_ui()
             self._refresh_scene_list()
 
@@ -1461,10 +1496,14 @@ class DataVisualizer:
         self.ax.clear()
         self.ax.set_facecolor("#1e1e1e")
         if self.label_data is not None and len(self.label_data) > 0:
-            self.ax.plot(frames, self.label_data, color="#4ec9b0", lw=1.0)
+            self.ax.plot(frames, self.label_data, color="#4ec9b0", lw=1.0, label="labels")
         else:
             self.ax.text(0.5, 0.5, "No labels in memory", transform=self.ax.transAxes,
                          ha="center", va="center", color="#555555", fontsize=9)
+        if self.prediction_data is not None and len(self.prediction_data) > 0:
+            n = min(len(frames), len(self.prediction_data))
+            self.ax.plot(frames[:n], self.prediction_data[:n],
+                         color="#f5a623", lw=1.0, alpha=0.80, linestyle="--", label="prediction")
         if self._label_edit_points:
             edit_frames = np.array(sorted(self._label_edit_points), dtype=np.int32)
             edit_values = np.array([self._label_edit_points[int(frame)] for frame in edit_frames],
@@ -1480,6 +1519,9 @@ class DataVisualizer:
         plt.setp(self.ax.get_xticklabels(), visible=False)
         for spine in self.ax.spines.values():
             spine.set_edgecolor("#333333")
+        if self.prediction_data is not None:
+            self.ax.legend(fontsize=6, loc="upper right", facecolor="#1e1e1e",
+                           labelcolor="#cccccc", edgecolor="#444444")
         self._cursor_line = self.ax.axvline(x=0, color="#ffcc00", lw=1.2, alpha=0.85)
 
         self.ax_flow.clear()

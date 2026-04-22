@@ -150,6 +150,12 @@ def evaluate_scene(
 
     predictions = sliding_window_predict(model, spatial, conf, device, seq_len, stride)
 
+    # Save predictions alongside labels so visualisation tools can load them.
+    pred_path = scene_dir / "predictions.npy"
+    temp_pred_path = pred_path.with_suffix(".tmp.npy")
+    np.save(str(temp_pred_path), predictions)
+    temp_pred_path.replace(pred_path)
+
     pred_tensor = torch.from_numpy(predictions).float().unsqueeze(0)
     label_tensor = torch.from_numpy(labels).float().unsqueeze(0)
     metrics = compute_regression_metrics(
