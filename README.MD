@@ -214,3 +214,8 @@ A: Kinda, check the previous version for the hard to follow notes I had here pre
 
 **Q6: This whole thing is AI vibe coded slop.**  
 A: Some of the newer models have definitely been an accelerator for me in this space, although I'd point to my wall of text posts elsewhere as an evidence that this is notably better than the jank python I normally write.
+
+**Q7: What does training look like?**  
+A:  
+![Like graphs](docs/train.png)  
+![And text](docs/traincmd.png)
