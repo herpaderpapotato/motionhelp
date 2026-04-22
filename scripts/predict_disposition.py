@@ -1378,6 +1378,8 @@ def main() -> None:
                         help="Save prediction plot to this file")
     parser.add_argument("--start-time", type=float, default=0.0,
                         help="Start time (in seconds) for playback or benchmarking")
+    parser.add_argument("--duration",   type=float, default=None,
+                        help="Duration (in seconds) to limit playback or benchmarking")
 
     args = parser.parse_args()
 
@@ -1444,6 +1446,7 @@ def main() -> None:
             seq_len=args.seq_len,
             stride=args.stride,
             start_time=args.start_time,
+            duration=args.duration,
         )
         if len(predictions) == 0:
             print("No predictions generated during playback.")
@@ -1479,6 +1482,8 @@ def main() -> None:
                 vr_mode=args.vr,
                 sbs_crop=args.sbs_crop,
                 half_rate=args.half_rate,
+                duration=args.duration,
+                start_time=args.start_time,
             )
 
         print(f"Spatial features: {spatial.shape}, Confidence: {conf.shape}")
@@ -1512,7 +1517,7 @@ def main() -> None:
         # Auto-derive: <video_stem>.funscript alongside the video
         out_path = video_path.with_suffix(".funscript")
 
-    funscript = predictions_to_funscript(predictions, fps=output_fps)
+    funscript = predictions_to_funscript(predictions, fps=output_fps, start_time=args.start_time)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w") as fh:
         json.dump(funscript, fh)
