@@ -163,27 +163,28 @@ class SpatialExtractor:
             performer_box_xyxy = None
             performer_conf = 0.0
 
-            if result.boxes is not None and len(result.boxes) > 0:
-                boxes = result.boxes
-                det_conf = boxes.conf.cpu().numpy()
-                cls = boxes.cls.cpu().numpy().astype(int)
-                partner_idx = np.where(cls == PARTNER_CLASS)[0]
-                if len(partner_idx) > 0:
-                    best = partner_idx[int(np.argmax(det_conf[partner_idx]))]
-                    performer_box_xyxy = boxes.xyxy[best]
-                    performer_conf = float(det_conf[best])
+            # if result.boxes is not None and len(result.boxes) > 0:
+            #     boxes = result.boxes
+            #     det_conf = boxes.conf.cpu().numpy()
+            #     cls = boxes.cls.cpu().numpy().astype(int)
+            #     partner_idx = np.where(cls == PARTNER_CLASS)[0]
+            #     if len(partner_idx) > 0:
+            #         best = partner_idx[int(np.argmax(det_conf[partner_idx]))]
+            #         performer_box_xyxy = boxes.xyxy[best]
+            #         performer_conf = float(det_conf[best])
 
-            if performer_box_xyxy is not None:
-                x1 = float(performer_box_xyxy[0])
-                y1 = float(performer_box_xyxy[1])
-                x2 = float(performer_box_xyxy[2])
-                y2 = float(frame_h)
-                conf_out[i, 0] = performer_conf
-            else:
-                x1 = 0.25 * frame_w
-                y1 = 0.50 * frame_h
-                x2 = 0.75 * frame_w
-                y2 = float(frame_h)
+            # if performer_box_xyxy is not None:
+            #     x1 = float(performer_box_xyxy[0])
+            #     y1 = float(performer_box_xyxy[1])
+            #     x2 = float(performer_box_xyxy[2])
+            #     y2 = float(frame_h)
+            #     conf_out[i, 0] = performer_conf
+            # else:
+            
+            x1 = 0.25 * frame_w
+            y1 = 0.50 * frame_h
+            x2 = 0.75 * frame_w
+            y2 = float(frame_h)
 
             x1 = max(0.0, x1)
             y1 = max(0.0, y1)
