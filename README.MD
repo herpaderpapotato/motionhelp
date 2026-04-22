@@ -13,7 +13,7 @@ Looking at that plot, it might look like noise, but the wiggle at the 23 second 
 1. You use this to build a dataset from your existing content.
 2. And then you train a model on the data.
 3. And that helps you build an even bigger dataset.
-4. And that lets you train a version that really nails the tempo and magnitude on 95% of sequences, especially on the longer and more tedious scripts which free's you up to focus on the bigger questions like, *should I be basing the pos on the hand, or the mouth in this scene?*
+4. And that lets you train a version that really nails the tempo and magnitude on 95% of sequences, especially on the longer and more tedious scripts which frees you to focus on the bigger questions like, *should I be basing the pos on the hand, or the mouth in this scene?*
 
 ---
 
