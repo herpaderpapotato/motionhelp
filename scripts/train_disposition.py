@@ -410,6 +410,7 @@ def _split_predictions(pred: torch.Tensor) -> tuple[torch.Tensor, list[torch.Ten
 def _compute_loss(
     pred: torch.Tensor,
     lbl: torch.Tensor,
+    pos_weight: float,
     args: argparse.Namespace,
 ) -> tuple[torch.Tensor, torch.Tensor, list[torch.Tensor], dict[str, torch.Tensor]]:
     main_pred, aux_preds = _split_predictions(pred)
@@ -771,7 +772,7 @@ def train() -> None:
 
                 with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
                     raw_pred = model(spatial, conf)
-                    loss, pred, _, metrics = _compute_loss(raw_pred, lbl, args)
+                    loss, pred, _, metrics = _compute_loss(raw_pred, lbl, pos_weight, args)
 
                 val_losses.append(loss.item())
                 for key in val_metrics:
@@ -870,7 +871,7 @@ def train() -> None:
 
             with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
                 raw_pred = model(spatial, conf)
-                loss, pred, aux_preds, metrics = _compute_loss(raw_pred, lbl, args)
+                loss, pred, aux_preds, metrics = _compute_loss(raw_pred, lbl, pos_weight, args)
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -929,7 +930,7 @@ def train() -> None:
 
                 with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
                     raw_pred = model(spatial, conf)
-                    loss, pred, _, metrics = _compute_loss(raw_pred, lbl, args)
+                    loss, pred, _, metrics = _compute_loss(raw_pred, lbl, pos_weight, args)
 
                 val_losses.append(loss.item())
                 _append_metric_history(val_metrics, metrics)
