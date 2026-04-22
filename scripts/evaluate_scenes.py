@@ -1,7 +1,8 @@
-"""Evaluate scenes with the TCN model and store MSE in review.json.
+"""Evaluate scenes with a DispositionTCN checkpoint and store metrics in review.json.
 
-Watches data/processed/ for scenes that have keypoints, embeddings, flow, and
-labels, runs TCN prediction, and stores the MSE in each scene's review.json.
+Watches data/processed/ for scenes that have spatial features and labels, runs
+DispositionTCN prediction, and stores regression metrics in each scene's
+review.json.
 
 Usage:
     python scripts/evaluate_scenes.py                    # evaluate once and exit
@@ -11,7 +12,6 @@ Usage:
 """
 
 import argparse
-import json
 import logging
 import sys
 import time
@@ -21,9 +21,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
-from src.data.curation import discover_scenes, embeddings_path, keypoints_path, read_review, write_review
-from src.models.tcn import FunscriptTCN, extract_model_config
+from src.data.curation import discover_scenes, read_review, write_review
+from src.data.spatial import legacy_conf_path, read_spatial_features_h5, spatial_feature_path
+from src.models.dispositiontcn import DispositionTCN, extract_disposition_config
 from src.training.funscript_metrics import compute_regression_metrics
 
 logging.basicConfig(
@@ -32,108 +34,64 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# Feature file names (must match predict_tcn.py / reprocess_embeddings.py)
-KP_FILE = "keypoints/pose-vrlens-finetunes-large.npy"
-EMB_FILE = "embeddings/pose-vrlens-finetunes-large.npy"
-KP_FILE_MULTICLASS = "keypoints/vrlens-finetunes-multiclass-v2-yolo11m-pose.npy"
-EMB_FILE_MULTICLASS = "embeddings/vrlens-finetunes-multiclass-v2-yolo11m-pose.npy"
-FLOW_FILE = "flow/raft_f64_s0.5.npy"
-DENSE_FLOW_FILE = "flow/raft_dense_32x32_s0.5.npy"
-DEFAULT_MULTICLASS_FEATURE_MODEL = "vrlens-finetunes-multiclass-v2-yolo11m-pose"
+DEFAULT_CHECKPOINT = Path("data/models/checkpoints_disposition/best_disposition.pt")
+DEFAULT_MODEL_NAME = "vrlens-finetunes-multiclass-v2-yolo26m-pose"
 
 
 def load_model(checkpoint_path: Path, device: torch.device):
-    """Load TCN model from checkpoint. Returns model and checkpoint configs."""
+    """Load DispositionTCN model from checkpoint."""
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     cfg = ckpt["model_config"]
-    model = FunscriptTCN(**extract_model_config(cfg), use_aux_layers=False)
+    model_type = cfg.get("model_type")
+    if model_type not in (None, "disposition_tcn"):
+        raise ValueError(
+            f"Checkpoint {checkpoint_path} is not a disposition model "
+            f"(model_type={model_type!r})"
+        )
+    model = DispositionTCN(**extract_disposition_config(cfg))
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
     model.to(device)
-    is_mc = cfg.get("n_partners") is not None
-    log.info("Loaded checkpoint: epoch %s, val_loss=%.6f [%s]",
-             ckpt.get("epoch", "?"), ckpt.get("val_loss", 0),
-             "multiclass" if is_mc else "single-class")
-    return model, cfg, ckpt.get("metric_config", {}), ckpt.get("data_config", {})
-
-
-def load_stats(
-    data_dir: Path,
-    n_persons: int = 10,
-    embed_dim: int = 512,
-    flow_dim: int = 64,
-    flow_mode: str = "summary",
-    feature_model_name: str | None = None,
-):
-    """Load feature normalization stats."""
-    stats_candidates: list[Path] = []
-    if feature_model_name:
-        feature_model_stem = Path(feature_model_name).stem
-        stats_candidates.extend(
-            [
-                data_dir / f"feature_stats_{feature_model_stem}.npz",
-                data_dir / "featurestats" / f"feature_stats_{feature_model_stem}.npz",
-            ]
-        )
-    stats_candidates.extend(
-        [
-            data_dir / "feature_stats.npz",
-            data_dir / "featurestats" / "feature_stats.npz",
-        ]
+    log.info(
+        "Loaded checkpoint: epoch %s, val_loss=%s [disposition]",
+        ckpt.get("epoch", "?"),
+        f"{ckpt.get('val_loss'):.6f}" if isinstance(ckpt.get("val_loss"), (int, float)) else ckpt.get("val_loss"),
     )
-    stats_path = next((candidate for candidate in stats_candidates if candidate.exists()), None)
-    if stats_path is None:
-        log.warning("No feature stats file found — using un-normalized features")
-        return None, None, None, None
+    return model, cfg, ckpt.get("data_config", {})
 
-    stats = np.load(stats_path)
-    emb_mean = emb_std = None
-    expected = n_persons * embed_dim
-    if "emb_mean" in stats and stats["emb_mean"].shape[0] == expected:
-        emb_mean = stats["emb_mean"].reshape(n_persons, embed_dim)
-        emb_std = stats["emb_std"].reshape(n_persons, embed_dim)
-    flow_mean = flow_std = None
-    if flow_mode == "dense":
-        if "flow_dense_mean" in stats:
-            flow_mean = stats["flow_dense_mean"]  # [2, 1, 1]
-            flow_std = stats["flow_dense_std"]
-    else:
-        if "flow_mean" in stats and stats["flow_mean"].shape[0] == flow_dim:
-            flow_mean = stats["flow_mean"]
-            flow_std = stats["flow_std"]
-    return emb_mean, emb_std, flow_mean, flow_std
+
+def _split_predictions(pred: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor]]:
+    if pred.ndim == 2:
+        return pred, []
+    if pred.ndim == 3:
+        return pred[:, 0], [pred[:, idx] for idx in range(1, pred.shape[1])]
+    raise ValueError(f"Unsupported prediction shape {tuple(pred.shape)}")
 
 
 def sliding_window_predict(
     model,
-    keypoints: np.ndarray,
-    embeddings: np.ndarray,
-    flow: np.ndarray,
+    spatial: np.ndarray,
+    conf: np.ndarray,
     device: torch.device,
     seq_len: int = 120,
     stride: int = 60,
 ) -> np.ndarray:
     """Slide a window over the full sequence and average overlapping predictions."""
-    n_frames = len(keypoints)
+    n_frames = len(spatial)
     pred_sum = np.zeros(n_frames, dtype=np.float32)
     pred_count = np.zeros(n_frames, dtype=np.float32)
 
     if n_frames < seq_len:
-        kp = torch.from_numpy(keypoints).float().unsqueeze(0).to(device)
-        emb = torch.from_numpy(embeddings).float().unsqueeze(0).to(device)
-        fl = torch.from_numpy(flow).float().unsqueeze(0).to(device)
+        sp = torch.from_numpy(spatial).float().unsqueeze(0).to(device)
+        co = torch.from_numpy(conf).float().unsqueeze(0).to(device)
         pad = seq_len - n_frames
-        kp = torch.nn.functional.pad(kp, (0, 0, 0, 0, 0, 0, 0, pad))
-        emb = torch.nn.functional.pad(emb, (0, 0, 0, 0, 0, pad))
-        # Dense flow is [B,T,2,H,W], summary flow is [B,T,F]
-        if fl.ndim == 5:
-            fl = torch.nn.functional.pad(fl, (0, 0, 0, 0, 0, 0, 0, pad))
-        else:
-            fl = torch.nn.functional.pad(fl, (0, 0, 0, pad))
+        sp = F.pad(sp, (0, 0, 0, 0, 0, 0, 0, 0, 0, pad))
+        co = F.pad(co, (0, 0, 0, pad))
         with torch.no_grad():
             with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
-                out = model(kp, emb, fl)  # [1, 4, T]
-        return out[0, 0, :n_frames].float().cpu().numpy()  # channel 0 = fused
+                out = model(sp, co)
+        main_out, _ = _split_predictions(out)
+        return main_out[0, :n_frames].float().cpu().numpy()
 
     starts = list(range(0, n_frames - seq_len + 1, stride))
     if starts[-1] + seq_len < n_frames:
@@ -142,14 +100,14 @@ def sliding_window_predict(
     with torch.no_grad():
         for start in starts:
             end = start + seq_len
-            kp = torch.from_numpy(keypoints[start:end]).float().unsqueeze(0).to(device)
-            emb = torch.from_numpy(embeddings[start:end]).float().unsqueeze(0).to(device)
-            fl = torch.from_numpy(flow[start:end]).float().unsqueeze(0).to(device)
+            sp = torch.from_numpy(spatial[start:end]).float().unsqueeze(0).to(device)
+            co = torch.from_numpy(conf[start:end]).float().unsqueeze(0).to(device)
 
             with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
-                out = model(kp, emb, fl)  # [1, 4, seq_len]
+                out = model(sp, co)
 
-            p = out[0, 0].float().cpu().numpy()  # channel 0 = fused
+            main_out, _ = _split_predictions(out)
+            p = main_out[0].float().cpu().numpy()
             weight = np.bartlett(seq_len).astype(np.float32) + 0.01
             pred_sum[start:end] += p * weight
             pred_count[start:end] += weight
@@ -162,69 +120,42 @@ def sliding_window_predict(
 def evaluate_scene(
     scene_dir: Path,
     model,
-    model_cfg: dict,
-    metric_cfg: dict,
     device: torch.device,
-    emb_mean: np.ndarray | None,
-    emb_std: np.ndarray | None,
-    flow_mean: np.ndarray | None,
-    flow_std: np.ndarray | None,
-    is_multiclass: bool,
-    feature_model_name: str | None = None,
-    flow_mode: str = "summary",
+    spatial_model_name: str,
     seq_len: int = 120,
     stride: int = 60,
 ) -> dict[str, float] | None:
     """Run TCN prediction on a scene and return regression metrics. None on error."""
     scene_id = scene_dir.name
-
-    # Select feature files
-    if is_multiclass:
-        model_name = feature_model_name or DEFAULT_MULTICLASS_FEATURE_MODEL
-        kp_path = keypoints_path(scene_dir, model_name)
-        emb_path = embeddings_path(scene_dir, model_name)
-    else:
-        kp_path = scene_dir / KP_FILE
-        emb_path = scene_dir / EMB_FILE
-    flow_path = scene_dir / (DENSE_FLOW_FILE if flow_mode == "dense" else FLOW_FILE)
+    spatial_path = spatial_feature_path(scene_dir, spatial_model_name)
+    conf_path = legacy_conf_path(scene_dir, spatial_model_name)
     labels_path = scene_dir / "labels.npy"
 
-    for p, name in [(kp_path, "keypoints"), (emb_path, "embeddings"),
-                    (flow_path, "flow"), (labels_path, "labels")]:
+    for p, name in [(spatial_path, "spatial"), (labels_path, "labels")]:
         if not p.exists():
             log.debug("SKIP %s — missing %s", scene_id, name)
             return None
 
-    keypoints = np.load(str(kp_path))
-    embeddings = np.load(str(emb_path))
-    flow = np.load(str(flow_path)).astype(np.float32)
-    labels = np.load(str(labels_path))
+    spatial, conf, _ = read_spatial_features_h5(
+        spatial_path,
+        legacy_conf_path=conf_path,
+    )
+    labels = np.load(str(labels_path)).astype(np.float32)
 
     # Align lengths
-    n = min(len(keypoints), len(embeddings), len(flow), len(labels))
-    keypoints = keypoints[:n]
-    embeddings = embeddings[:n]
-    flow = flow[:n]
+    n = min(len(spatial), len(conf), len(labels))
+    spatial = spatial[:n]
+    conf = conf[:n]
     labels = labels[:n]
 
-    # Normalize
-    if emb_mean is not None:
-        embeddings = (embeddings - emb_mean) / (emb_std + 1e-8)
-    if flow_mean is not None:
-        flow = (flow - flow_mean) / (flow_std + 1e-8)
-
-    predictions = sliding_window_predict(model, keypoints, embeddings, flow,
-                                         device, seq_len, stride)
+    predictions = sliding_window_predict(model, spatial, conf, device, seq_len, stride)
 
     pred_tensor = torch.from_numpy(predictions).float().unsqueeze(0)
     label_tensor = torch.from_numpy(labels).float().unsqueeze(0)
     metrics = compute_regression_metrics(
         pred_tensor,
         label_tensor,
-        spectral_kernel=int(metric_cfg.get("spectral_kernel", 15)),
-        activity_gain=float(metric_cfg.get("event_activity_gain", 3.0)),
-        activity_power=float(metric_cfg.get("event_activity_power", 1.0)),
-        active_quantile=float(metric_cfg.get("active_quantile", 0.8)),
+        spectral_kernel=15,
     )
     return {
         "mse": float(metrics["pos_mse"].item()),
@@ -237,10 +168,9 @@ def evaluate_scene(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Evaluate scenes with TCN and store MSE")
+    parser = argparse.ArgumentParser(description="Evaluate scenes with DispositionTCN and store MSE")
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
-    parser.add_argument("--checkpoint", type=Path,
-                        default=Path("data/models/checkpoints_tcn/best_tcn.pt"))
+    parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--seq-len", type=int, default=120)
     parser.add_argument("--stride", type=int, default=60)
@@ -253,10 +183,10 @@ def main() -> None:
     parser.add_argument("--scenes", nargs="*", default=None,
                         help="Only evaluate these scene IDs (default: all ready)")
     parser.add_argument(
-        "--feature-model-name",
+        "--model-name",
         type=str,
         default=None,
-        help="Override the multiclass feature model stem used for scene feature files",
+        help="Override the spatial feature model stem used for scene spatial caches",
     )
     args = parser.parse_args()
 
@@ -267,25 +197,9 @@ def main() -> None:
     log.info("Device: %s", device)
 
     # Load model
-    model, model_cfg, metric_cfg, data_cfg = load_model(args.checkpoint, device)
-    is_multiclass = model_cfg.get("n_partners") is not None
-    feature_model_name = Path(
-        args.feature_model_name or data_cfg.get("feature_model_name") or DEFAULT_MULTICLASS_FEATURE_MODEL
-    ).stem
-    n_total = (
-        (model_cfg.get("n_partners", 5) + model_cfg.get("n_beholders", 1))
-        if is_multiclass else model_cfg.get("n_persons", 10)
-    )
-    flow_mode = model_cfg.get("flow_mode", "summary")
-    log.info("Flow mode: %s", flow_mode)
-
-    emb_mean, emb_std, flow_mean, flow_std = load_stats(
-        args.data_dir,
-        n_persons=n_total,
-        embed_dim=int(model_cfg.get("embed_dim", 512)),
-        flow_mode=flow_mode,
-        feature_model_name=feature_model_name,
-    )
+    model, model_cfg, data_cfg = load_model(args.checkpoint, device)
+    spatial_model_name = Path(args.model_name or data_cfg.get("model_name") or DEFAULT_MODEL_NAME).stem
+    log.info("Spatial model: %s", spatial_model_name)
 
     processed_dir = args.data_dir / "processed"
 
@@ -298,15 +212,8 @@ def main() -> None:
                 continue
             scene_dir = processed_dir / sid
 
-            # Check if scene has the required feature files
-            if is_multiclass:
-                kp_path = keypoints_path(scene_dir, feature_model_name)
-                emb_path = embeddings_path(scene_dir, feature_model_name)
-            else:
-                kp_path = scene_dir / KP_FILE
-                emb_path = scene_dir / EMB_FILE
-            flow_path = scene_dir / (DENSE_FLOW_FILE if flow_mode == "dense" else FLOW_FILE)
-            if not all(path.exists() for path in [kp_path, emb_path, flow_path]):
+            spatial_path = spatial_feature_path(scene_dir, spatial_model_name)
+            if not spatial_path.exists():
                 continue
 
             # Check if already evaluated
@@ -323,9 +230,12 @@ def main() -> None:
             scene_dir = processed_dir / sid
             try:
                 metrics = evaluate_scene(
-                    scene_dir, model, model_cfg, metric_cfg, device,
-                    emb_mean, emb_std, flow_mean, flow_std,
-                    is_multiclass, feature_model_name, flow_mode, args.seq_len, args.stride,
+                    scene_dir,
+                    model,
+                    device,
+                    spatial_model_name,
+                    args.seq_len,
+                    args.stride,
                 )
                 if metrics is not None:
                     # Update review.json with scene-level regression metrics.
