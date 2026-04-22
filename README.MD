@@ -206,11 +206,11 @@ A: This is a pretty niche thing to be running. The answer is either that you kno
 **Q3: Your model is bad and your code is bad.**  
 A: Yeah, it's all gone through a lot of changes and iterations. At some point you have to put things out there though. I'm still not 100% sure if I need all 3 spatial features, or if the finetuned YOLO is actually necessary (swapping it would mean regenerating all spatial data), or if the DDL setting is actually better, or if the N-size YOLO models would be better, or a different feature extractor entirely, etc, etc, etc.
 
-**Q4: You're not really doing any augmentation in your training loop.**
+**Q4: You're not really doing any augmentation in your training loop.**  
 A: Yeah. I'll get to it, but I'm still mulling over Q3 stuff.
 
-**Q5: Wow that's one AI ass README.MD you had AI generated!**
+**Q5: Wow that's one AI ass README.MD you had AI generated!**  
 A: Kinda, check the previous version for the hard to follow notes I had here previously.
 
-**Q6: This whole thing is AI vibe coded slop.**
-A: Some of the newer models have definitely been an accelerator for me in this space, although I'd point to my wall of text posts elsewhere as an evidence that this is notably better than the jank python I normally write! 
+**Q6: This whole thing is AI vibe coded slop.**  
+A: Some of the newer models have definitely been an accelerator for me in this space, although I'd point to my wall of text posts elsewhere as an evidence that this is notably better than the jank python I normally write.
