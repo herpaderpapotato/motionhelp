@@ -414,8 +414,9 @@ def _compute_loss(
 ) -> tuple[torch.Tensor, torch.Tensor, list[torch.Tensor], dict[str, torch.Tensor]]:
     main_pred, aux_preds = _split_predictions(pred)
     metrics = compute_regression_metrics(main_pred, lbl, spectral_kernel=15)
+
     loss = (
-        metrics["pos_mse"]
+        metrics["pos_mse"] * pos_weight
         + args.velocity_weight * metrics["vel_mse"]
         + args.temporal_weight * metrics["acc_mse"]
     )
@@ -512,7 +513,7 @@ def train() -> None:
     parser.set_defaults(shuffle=True, device_dequantize=None, use_aux_layers=False)
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
     parser.add_argument("--epochs", type=int, default=30)
-    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--seq-len", type=int, default=120)
@@ -531,9 +532,9 @@ def train() -> None:
     )
     parser.add_argument("--shuffle", action="store_true", dest="shuffle")
     parser.add_argument("--no-shuffle", action="store_false", dest="shuffle")
-    parser.add_argument("--d-model", type=int, default=256)
-    parser.add_argument("--n-blocks", type=int, default=6)
-    parser.add_argument("--encoder-dim", type=int, default=128)
+    parser.add_argument("--d-model", type=int, default=128)
+    parser.add_argument("--n-blocks", type=int, default=3)
+    parser.add_argument("--encoder-dim", type=int, default=64)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--kernel-size", type=int, default=3)
     parser.add_argument("--roi-size", type=int, default=7)
@@ -585,6 +586,16 @@ def train() -> None:
     else:
         device = torch.device(args.device)
     log.info("Using device: %s", device)
+
+    pos_weight = 1.0 - args.velocity_weight - args.temporal_weight
+    if pos_weight < 0:
+        pos_weight = 0.0
+    if args.velocity_weight + args.temporal_weight > 1.0:
+        total_weight = args.velocity_weight + args.temporal_weight  # e.g. 1.4
+        args.velocity_weight = args.velocity_weight / total_weight # bring the total back to 1.0 while keeping the relative balance (e.g. 0.5 / 1.4)
+        args.temporal_weight = args.temporal_weight / total_weight # (e.g. 0.9 / 1.4)
+        pos_weight = 0.0
+
 
     torch.manual_seed(args.seed)
     if device.type == "cuda":
@@ -876,6 +887,7 @@ def train() -> None:
                 writer.add_scalar("train/loss", loss.item(), global_step)
                 writer.add_scalar("train/pos_mse", metrics["pos_mse"].item(), global_step)
                 writer.add_scalar("train/vel_mse", metrics["vel_mse"].item(), global_step)
+                writer.add_scalar("train/acc_mse", metrics["acc_mse"].item(), global_step)
                 writer.add_scalar("train/pred_mean", pred.mean().item(), global_step)
                 writer.add_scalar("train/pred_std", pred.std().item(), global_step)
                 writer.add_scalar("train/grad_norm", grad_norm.item(), global_step)
@@ -936,8 +948,11 @@ def train() -> None:
         writer.add_scalar("val/loss", avg_val, epoch)
         writer.add_scalar("val/pos_mse", avg_val_metrics["pos_mse"], epoch)
         writer.add_scalar("val/vel_mse", avg_val_metrics["vel_mse"], epoch)
+        writer.add_scalar("val/acc_mse", avg_val_metrics["acc_mse"], epoch)
         writer.add_scalar("train/loss_epoch", avg_train, epoch)
         writer.add_scalar("train/pos_mse_epoch", avg_train_metrics["pos_mse"], epoch)
+        writer.add_scalar("train/vel_mse_epoch", avg_train_metrics["vel_mse"], epoch)
+        writer.add_scalar("train/acc_mse_epoch", avg_train_metrics["acc_mse"], epoch)
         if "aux_loss" in avg_val_metrics:
             writer.add_scalar("val/aux_loss", avg_val_metrics["aux_loss"], epoch)
         if "aux_loss" in avg_train_metrics:

@@ -482,9 +482,9 @@ def main() -> None:
     parser.add_argument("--data-dir",            default="data")
     parser.add_argument("--max-scenes",          type=int, default=50,
                         help="Max number of videos to sample from")
-    parser.add_argument("--duration",            type=float, default=40.0,
+    parser.add_argument("--duration",            type=float, default=20.0,
                         help="Segment duration in seconds")
-    parser.add_argument("--segments-per-video",  type=int, default=3,
+    parser.add_argument("--segments-per-video",  type=int, default=5,
                         help="Segments to sample per video")
     parser.add_argument("--projections",         nargs="+", default=["180_sbs"])
     parser.add_argument("--half-rate",          action="store_true",
@@ -496,7 +496,7 @@ def main() -> None:
     parser.add_argument("--seed",                type=int, default=42)
     parser.add_argument("--no-shuffle",          action="store_true",
                         help="Disable random shuffle of video order")
-    parser.add_argument("--min-actions",         type=int, default=10,
+    parser.add_argument("--min-actions",         type=int, default=3,
                         help="Skip segments with fewer than N funscript actions")
     parser.add_argument("--overwrite",           action="store_true",
                         help="Re-import scenes that already exist")

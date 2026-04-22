@@ -204,7 +204,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--target",
         choices=["default", "disposition"],
-        default="default",
+        default="disposition",
         help="Which split files to build",
     )
     parser.add_argument(
@@ -240,8 +240,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--require-embeddings",
         action="store_true",
-        default=True,
-        help="Only include scenes with valid embeddings for the selected model (default: True)",
+        default=False,
+        help="Only include scenes with valid embeddings for the selected model (default: False)",
     )
     parser.add_argument(
         "--no-require-embeddings",

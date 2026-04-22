@@ -375,10 +375,28 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+
+
+
     model_path = args.data_dir / "models" / "pose" / f"{args.model_name}.pt"
     if not model_path.exists():
         log.error("Model not found: %s", model_path)
-        sys.exit(1)
+        if args.model_name == DEFAULT_MODEL:
+            # downloading from Hugging Face https://huggingface.co/herpaderpapotato/pose-vrlens-finetunes-multiclass-v2-26/resolve/main/yolo26m-pose/weights/best.pt
+            # to file DEFAULT_MODEL.pt
+            import requests
+            url = "https://huggingface.co/herpaderpapotato/pose-vrlens-finetunes-multiclass-v2-26/resolve/main/yolo26m-pose/weights/best.pt"
+            log.info("Attempting to download default model from %s", url)
+            try:
+                response = requests.get(url, stream=True)
+                response.raise_for_status()
+                with open(model_path, "wb") as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                log.info("Downloaded model to %s", model_path)
+            except Exception as e:
+                log.error("Failed to download model: %s", e)
+                sys.exit(1)
 
     log.info("Loading model: %s", model_path)
     pose_model = load_pose_model(
