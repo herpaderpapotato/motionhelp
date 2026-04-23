@@ -110,14 +110,22 @@ def build_postprocess_config(args: argparse.Namespace) -> WavePostprocessConfig 
         chunk_seconds = None
     return WavePostprocessConfig(
         lowpass_cutoff_hz=args.postprocess_lowpass_cutoff_hz,
+        lowpass_order=args.postprocess_lowpass_order,
         trough_prominence=args.postprocess_trough_prominence,
         trough_distance_seconds=args.postprocess_trough_distance_seconds,
         min_cycle_amplitude=args.postprocess_min_cycle_amplitude,
         min_cycle_frequency_hz=args.postprocess_min_cycle_frequency_hz,
         gradient_smoothing=args.postprocess_gradient_smoothing,
         gradient_window_seconds=args.postprocess_gradient_window_seconds,
+        gradient_polyorder=args.postprocess_gradient_polyorder,
+        gradient_sigma_seconds=args.postprocess_gradient_sigma_seconds,
+        gradient_floor=args.postprocess_gradient_floor,
+        gradient_low_quantile=args.postprocess_gradient_low_quantile,
+        gradient_high_quantile=args.postprocess_gradient_high_quantile,
         min_gradient_length_seconds=args.postprocess_min_gradient_length_seconds,
         min_gradient_range=args.postprocess_min_gradient_range,
+        min_gradient_sign_balance=args.postprocess_min_gradient_sign_balance,
+        merge_gap_seconds=args.postprocess_merge_gap_seconds,
         stretch_mode=args.postprocess_stretch_mode,
         stretch_gain=args.postprocess_stretch_gain,
         chunk_seconds=chunk_seconds,
@@ -543,7 +551,10 @@ def sliding_window_predict(model: DispositionTCN,
 
 
 def predictions_to_funscript(
-    positions: np.ndarray, fps: float, start_time: float = 0.0,
+    positions: np.ndarray,
+    fps: float,
+    start_time: float = 0.0,
+    metadata: dict[str, object] | None = None,
 ) -> dict:
     """Convert per-frame positions [0,1] to funscript JSON."""
     actions = []
@@ -551,7 +562,10 @@ def predictions_to_funscript(
         at_ms = int(round((i / fps + start_time) * 1000.0))
         pos_int = max(0, min(100, int(round(float(pos) * 100.0))))
         actions.append({"at": at_ms, "pos": pos_int})
-    return {"version": "1.0", "inverted": False, "range": 100, "actions": actions}
+    funscript = {"version": "1.0", "inverted": False, "range": 100, "actions": actions}
+    if metadata:
+        funscript["metadata"] = metadata
+    return funscript
 
 
 # ── Live playback with real-time prediction ───────────────────────────────────
@@ -1433,6 +1447,9 @@ def main() -> None:
     parser.add_argument("--postprocess-lowpass-cutoff-hz", type=float,
                         default=DEFAULT_POSTPROCESS.lowpass_cutoff_hz,
                         help="Zero-phase low-pass cutoff before wave detection")
+    parser.add_argument("--postprocess-lowpass-order", type=int,
+                        default=DEFAULT_POSTPROCESS.lowpass_order,
+                        help="Butterworth low-pass filter order")
     parser.add_argument("--postprocess-trough-prominence", type=float,
                         default=DEFAULT_POSTPROCESS.trough_prominence,
                         help="Minimum trough prominence for cycle detection")
@@ -1452,12 +1469,33 @@ def main() -> None:
     parser.add_argument("--postprocess-gradient-window-seconds", type=float,
                         default=DEFAULT_POSTPROCESS.gradient_window_seconds,
                         help="Savgol window size for slow-gradient detection")
+    parser.add_argument("--postprocess-gradient-polyorder", type=int,
+                        default=DEFAULT_POSTPROCESS.gradient_polyorder,
+                        help="Savgol polynomial order for gradient smoothing")
+    parser.add_argument("--postprocess-gradient-sigma-seconds", type=float,
+                        default=DEFAULT_POSTPROCESS.gradient_sigma_seconds,
+                        help="Gaussian sigma when --postprocess-gradient-smoothing gaussian is used")
+    parser.add_argument("--postprocess-gradient-floor", type=float,
+                        default=DEFAULT_POSTPROCESS.gradient_floor,
+                        help="Minimum absolute gradient threshold floor")
+    parser.add_argument("--postprocess-gradient-low-quantile", type=float,
+                        default=DEFAULT_POSTPROCESS.gradient_low_quantile,
+                        help="Lower gradient quantile used for slow-gradient detection")
+    parser.add_argument("--postprocess-gradient-high-quantile", type=float,
+                        default=DEFAULT_POSTPROCESS.gradient_high_quantile,
+                        help="Upper gradient quantile used for slow-gradient detection")
     parser.add_argument("--postprocess-min-gradient-length-seconds", type=float,
                         default=DEFAULT_POSTPROCESS.min_gradient_length_seconds,
                         help="Minimum duration of a slow-gradient segment to stretch")
     parser.add_argument("--postprocess-min-gradient-range", type=float,
                         default=DEFAULT_POSTPROCESS.min_gradient_range,
                         help="Minimum local range before a slow-gradient segment is stretched")
+    parser.add_argument("--postprocess-min-gradient-sign-balance", type=float,
+                        default=DEFAULT_POSTPROCESS.min_gradient_sign_balance,
+                        help="Require mostly one-sided gradients inside a candidate segment")
+    parser.add_argument("--postprocess-merge-gap-seconds", type=float,
+                        default=DEFAULT_POSTPROCESS.merge_gap_seconds,
+                        help="Merge nearby gradient runs separated by this gap")
     parser.add_argument("--postprocess-stretch-mode", type=str,
                         default=DEFAULT_POSTPROCESS.stretch_mode,
                         choices=["linear", "tanh"],
@@ -1624,7 +1662,26 @@ def main() -> None:
         # Auto-derive: <video_stem>.funscript alongside the video
         out_path = video_path.with_suffix(".funscript")
 
-    funscript = predictions_to_funscript(predictions, fps=output_fps, start_time=args.start_time)
+    funscript_metadata: dict[str, object] = {
+        "creator": "VideoToMotion",
+        "type": "basic",
+        "output_fps": output_fps,
+        "start_time_seconds": args.start_time,
+        "source_video": str(video_path),
+        "postprocessed": postprocess_config is not None,
+    }
+    if args.scene is not None:
+        funscript_metadata["source_scene"] = args.scene
+    if postprocess_config is not None:
+        funscript_metadata["postprocess_method"] = "wave"
+        funscript_metadata["postprocess_config"] = postprocess_config.to_dict()
+
+    funscript = predictions_to_funscript(
+        predictions,
+        fps=output_fps,
+        start_time=args.start_time,
+        metadata=funscript_metadata,
+    )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w") as fh:
         json.dump(funscript, fh)

@@ -191,6 +191,8 @@ Useful flags:
 | `--postprocess-stretch-mode` | Choose `linear` or `tanh` stretching for slow-gradient segments |
 | `--postprocess-stretch-gain` | Tanh gain used when `--postprocess-stretch-mode tanh` is selected |
 
+Advanced postprocess flags are also available for low-pass order, Savgol polyorder, Gaussian sigma, gradient floor and quantiles, minimum gradient sign balance, merge-gap merging, and chunk overlap. Use `--help` when you want the full surface from the CLI.
+
 The postprocess thresholds use the exact effective output FPS, including half-rate output when enabled.
 
 ## Offline Wave Postprocess
@@ -211,6 +213,16 @@ Useful flags:
 | `--save-plot` | Save that comparison plot to disk |
 
 The standalone script preserves the original action timestamps and adds postprocess metadata to the output funscript.
+
+## Postprocess Tuner
+
+If you want to tune the wave settings interactively instead of juggling flags, use the dedicated GUI tuner:
+
+```bash
+python.exe scripts/tune_prediction_postprocess.py --input benchmark_8k_raw.funscript --video benchmark_8k.mp4
+```
+
+It loads a dense raw funscript, shows the original and postprocessed curves in separate panels, updates the postprocessed view live as you change settings, and can play a matching video in sync. The GUI exposes the full `WavePostprocessConfig`, including the advanced knobs that are easy to miss from the command line.
 
 ---
 

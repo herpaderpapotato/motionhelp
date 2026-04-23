@@ -43,14 +43,22 @@ def build_postprocess_config(args: argparse.Namespace) -> WavePostprocessConfig:
         chunk_seconds = None
     return WavePostprocessConfig(
         lowpass_cutoff_hz=args.lowpass_cutoff_hz,
+        lowpass_order=args.lowpass_order,
         trough_prominence=args.trough_prominence,
         trough_distance_seconds=args.trough_distance_seconds,
         min_cycle_amplitude=args.min_cycle_amplitude,
         min_cycle_frequency_hz=args.min_cycle_frequency_hz,
         gradient_smoothing=args.gradient_smoothing,
         gradient_window_seconds=args.gradient_window_seconds,
+        gradient_polyorder=args.gradient_polyorder,
+        gradient_sigma_seconds=args.gradient_sigma_seconds,
+        gradient_floor=args.gradient_floor,
+        gradient_low_quantile=args.gradient_low_quantile,
+        gradient_high_quantile=args.gradient_high_quantile,
         min_gradient_length_seconds=args.min_gradient_length_seconds,
         min_gradient_range=args.min_gradient_range,
+        min_gradient_sign_balance=args.min_gradient_sign_balance,
+        merge_gap_seconds=args.merge_gap_seconds,
         stretch_mode=args.stretch_mode,
         stretch_gain=args.stretch_gain,
         chunk_seconds=chunk_seconds,
@@ -132,6 +140,9 @@ def main() -> None:
     parser.add_argument("--lowpass-cutoff-hz", type=float,
                         default=DEFAULT_POSTPROCESS.lowpass_cutoff_hz,
                         help="Zero-phase low-pass cutoff before wave detection")
+    parser.add_argument("--lowpass-order", type=int,
+                        default=DEFAULT_POSTPROCESS.lowpass_order,
+                        help="Butterworth low-pass filter order")
     parser.add_argument("--trough-prominence", type=float,
                         default=DEFAULT_POSTPROCESS.trough_prominence,
                         help="Minimum trough prominence for cycle detection")
@@ -151,12 +162,33 @@ def main() -> None:
     parser.add_argument("--gradient-window-seconds", type=float,
                         default=DEFAULT_POSTPROCESS.gradient_window_seconds,
                         help="Savgol window size for slow-gradient detection")
+    parser.add_argument("--gradient-polyorder", type=int,
+                        default=DEFAULT_POSTPROCESS.gradient_polyorder,
+                        help="Savgol polynomial order for gradient smoothing")
+    parser.add_argument("--gradient-sigma-seconds", type=float,
+                        default=DEFAULT_POSTPROCESS.gradient_sigma_seconds,
+                        help="Gaussian sigma when --gradient-smoothing gaussian is used")
+    parser.add_argument("--gradient-floor", type=float,
+                        default=DEFAULT_POSTPROCESS.gradient_floor,
+                        help="Minimum absolute gradient threshold floor")
+    parser.add_argument("--gradient-low-quantile", type=float,
+                        default=DEFAULT_POSTPROCESS.gradient_low_quantile,
+                        help="Lower gradient quantile used for slow-gradient detection")
+    parser.add_argument("--gradient-high-quantile", type=float,
+                        default=DEFAULT_POSTPROCESS.gradient_high_quantile,
+                        help="Upper gradient quantile used for slow-gradient detection")
     parser.add_argument("--min-gradient-length-seconds", type=float,
                         default=DEFAULT_POSTPROCESS.min_gradient_length_seconds,
                         help="Minimum duration of a slow-gradient segment to stretch")
     parser.add_argument("--min-gradient-range", type=float,
                         default=DEFAULT_POSTPROCESS.min_gradient_range,
                         help="Minimum local range before a slow-gradient segment is stretched")
+    parser.add_argument("--min-gradient-sign-balance", type=float,
+                        default=DEFAULT_POSTPROCESS.min_gradient_sign_balance,
+                        help="Require mostly one-sided gradients inside a candidate segment")
+    parser.add_argument("--merge-gap-seconds", type=float,
+                        default=DEFAULT_POSTPROCESS.merge_gap_seconds,
+                        help="Merge nearby gradient runs separated by this gap")
     parser.add_argument("--stretch-mode", type=str,
                         default=DEFAULT_POSTPROCESS.stretch_mode,
                         choices=["linear", "tanh"],
@@ -182,10 +214,11 @@ def main() -> None:
 
     timestamps_ms = np.asarray([int(action["at"]) for action in actions], dtype=np.int64)
     raw_positions = np.asarray([float(action["pos"]) for action in actions], dtype=np.float32) / 100.0
+    config = build_postprocess_config(args)
     processed_positions, stats = postprocess_predictions(
         raw_positions,
         fps,
-        build_postprocess_config(args),
+        config,
         return_stats=True,
     )
     print_postprocess_stats(stats)
@@ -199,6 +232,8 @@ def main() -> None:
     metadata["postprocessed"] = True
     metadata["postprocess_method"] = "wave"
     metadata["postprocess_fps"] = fps
+    metadata["postprocess_config"] = config.to_dict()
+    metadata["source_funscript"] = str(args.input)
     out_data["metadata"] = metadata
     out_data["actions"] = [
         {
