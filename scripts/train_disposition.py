@@ -744,12 +744,6 @@ def train() -> None:
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay,
     )
-    # scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-    #     optimizer,
-    #     T_0=max(1, args.epochs * len(train_loader) // 4),
-    #     T_mult=1,
-    #     eta_min=args.lr * 0.01,
-    # )
     best_val_loss = float("inf")
     if args.resume is not None:
         checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
@@ -790,15 +784,19 @@ def train() -> None:
         )
         best_val_loss = avg_val
         early_stop_counter = 0
-
-
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            optimizer,
-            max_lr=args.lr,
-            epochs=args.epochs,
-            steps_per_epoch=len(train_loader),
-            pct_start=0.1,
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer,
+        T_0=max(1, args.epochs * len(train_loader) // 20),
+        T_mult=1,
+        eta_min=args.lr * 0.01,
     )
+    # scheduler = torch.optim.lr_scheduler.OneCycleLR(
+    #         optimizer,
+    #         max_lr=args.lr,
+    #         epochs=args.epochs,
+    #         steps_per_epoch=len(train_loader),
+    #         pct_start=0.1,
+    # )
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
 
     # Logging
