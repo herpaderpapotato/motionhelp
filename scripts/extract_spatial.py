@@ -1,15 +1,19 @@
 """Background spatial extractor for DispositionTCN.
 
-Watches processed scenes for model-matched embeddings that do not yet have a
-spatial cache, then runs YOLO inference on video frames and saves concatenated
-multi-scale RoI features [T, N, C, H, W] from the neck feature maps that feed
-the final pose head. The default output is a quantised single-file HDF5 cache
-to keep the training I/O cost close to the original single-scale pipeline.
+Runs YOLO inference on video frames to capture neck feature maps via forward
+hooks, then extracts multi-scale RoI features [T, N, C, H, W] using a fixed
+centre-bottom region of the frame. The default output is a quantised
+single-file HDF5 cache to keep training I/O cost close to the original
+single-scale pipeline.
+
+RoI region: [W*0.25, H*0.50, W*0.75, H] — covers the centre-bottom half of
+every frame unconditionally.  Detection boxes are not used for RoI placement,
+so /conf is always zero.
 
 Output per scene:
     data/processed/{scene_id}/spatial/{model_name}.h5
         /spatial  [T, N, C, roi_size, roi_size] int8 or float16
-        /conf     [T, N] float32
+        /conf     [T, N] float32  (always 0.0 with fixed-region extraction)
 
 Usage:
     python scripts/extract_spatial.py
@@ -31,7 +35,6 @@ from torchvision.ops import roi_align
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.data.curation import discover_scenes, inspect_model_embeddings_path
-from src.data.extraction import PARTNER_CLASS
 from src.data.pose import load_pose_model
 from src.data.spatial import (
     build_channel_slices,
@@ -50,7 +53,12 @@ DEFAULT_MODEL = "vrlens-finetunes-multiclass-v2-yolo26m-pose"
 
 
 class SpatialExtractor:
-    """Extract fused multi-scale spatial RoI feature grids."""
+    """Extract fused multi-scale spatial RoI feature grids.
+
+    Uses a fixed centre-bottom RoI (W*0.25–W*0.75, H*0.50–H) for every frame.
+    YOLO inference is still run in full so that the neck feature maps are
+    captured via forward hooks; detection boxes are not used.
+    """
 
     def __init__(
         self,
@@ -110,17 +118,16 @@ class SpatialExtractor:
     ) -> tuple[np.ndarray, np.ndarray]:
         """Extract a single combined spatial feature per frame.
 
-        Computes one RoI-aligned grid [1, C, roi_size, roi_size] per frame
-        using a bounding box that spans from the highest-confidence performer's
-        top edge down to the bottom of the frame. If no performer is detected
-        a fallback box covering the centre-bottom half of the frame is used.
+        Runs YOLO inference on the batch to fire the neck feature-map hooks,
+        then applies RoI-align with a fixed centre-bottom box
+        [W*0.25, H*0.50, W*0.75, H] for every frame.
 
         Args:
             frames: [N, H, W, C] uint8 RGB numpy array.
 
         Returns:
             spatial: [N, 1, C, roi_size, roi_size] float16
-            conf:    [N, 1] float32 (performer confidence, 0 if fallback)
+            conf:    [N, 1] float32 (always 0.0; reserved for future use)
         """
         n_frames = len(frames)
         roi_size = self.roi_output_size
@@ -159,28 +166,7 @@ class SpatialExtractor:
         spatial_out = np.zeros((n_frames, 1, channels, roi_size, roi_size), dtype=np.float16)
         conf_out = np.zeros((n_frames, 1), dtype=np.float32)
 
-        for i, result in enumerate(results):
-            performer_box_xyxy = None
-            performer_conf = 0.0
-
-            # if result.boxes is not None and len(result.boxes) > 0:
-            #     boxes = result.boxes
-            #     det_conf = boxes.conf.cpu().numpy()
-            #     cls = boxes.cls.cpu().numpy().astype(int)
-            #     partner_idx = np.where(cls == PARTNER_CLASS)[0]
-            #     if len(partner_idx) > 0:
-            #         best = partner_idx[int(np.argmax(det_conf[partner_idx]))]
-            #         performer_box_xyxy = boxes.xyxy[best]
-            #         performer_conf = float(det_conf[best])
-
-            # if performer_box_xyxy is not None:
-            #     x1 = float(performer_box_xyxy[0])
-            #     y1 = float(performer_box_xyxy[1])
-            #     x2 = float(performer_box_xyxy[2])
-            #     y2 = float(frame_h)
-            #     conf_out[i, 0] = performer_conf
-            # else:
-            
+        for i in range(n_frames):
             x1 = 0.25 * frame_w
             y1 = 0.50 * frame_h
             x2 = 0.75 * frame_w

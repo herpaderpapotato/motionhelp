@@ -228,9 +228,9 @@ I fixed some of the AI notes here that were wrong. It did alright though.
 
 ### Data
 
-Each scene is a short clip (default 20 seconds) extracted from a source video at its native FPS. Alongside the video, the matching funscript is sliced to the same time window and resampled to per-frame labels using cubic spline interpolation. The result is a `labels.npy` array with one float32 value per frame in `[0, 1]`, representing funscript position.
+Each scene is a short clip (default 20 seconds) extracted from a source video at its native FPS. Alongside the video, the matching funscript is sampled onto the clip's exact output frame timestamps using monotone interpolation. The result is a `labels.npy` array with one float32 value per frame in `[0, 1]`, representing funscript position.
 
-The first and last 10% of funscript actions are trimmed before interpolation to avoid edge artefacts from scripts that start or end abruptly.
+Labels now preserve the full scripted action range and hold the nearest endpoint outside the action span rather than extrapolating past it.
 
 ---
 

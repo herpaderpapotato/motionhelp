@@ -46,7 +46,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from src.config import Config
 from src.data.curation import read_review, write_review
 from src.data.datasource import pairs_from_xbvr
-from src.data.funscript import load_funscript, get_actions, actions_to_frame_labels
+from src.data.funscript import load_funscript, get_actions, actions_to_timestamps
 from src.data.preprocess import probe_video, build_preprocess_command
 from src.data.video import get_video_info
 
@@ -280,12 +280,8 @@ def extract_labels(
     funscript_path: Path,
     output_dir: Path,
     seg_start_sec: float,
-    seg_duration_sec: float,
     seg_fps: float,
     seg_total_frames: int,
-    original_fps: float,
-    original_duration_sec: float,
-    half_rate: bool = False,
 ) -> bool:
     labels_path = output_dir / "labels.npy"
     if labels_path.exists():
@@ -295,31 +291,19 @@ def extract_labels(
     fs_data = load_funscript(funscript_path)
     actions = get_actions(fs_data)
 
-    # Build the full-video label array at original fps, then slice to segment
-    total_orig = int(original_duration_sec * original_fps) + 1
-    all_labels = actions_to_frame_labels(actions, original_fps, total_orig)
+    if seg_fps <= 0 or seg_total_frames <= 0:
+        log.error(
+            "Invalid segment timing for %s: fps=%s frames=%s",
+            output_dir.name,
+            seg_fps,
+            seg_total_frames,
+        )
+        return False
 
-    seg_start_frame = int(seg_start_sec * original_fps)
-    seg_end_frame = int((seg_start_sec + seg_duration_sec) * original_fps)
-    seg_labels_orig = all_labels[seg_start_frame:seg_end_frame]
-
-    # Resample to target fps if needed
-    if half_rate and len(seg_labels_orig) > 0:
-        labels = seg_labels_orig[::2].astype(np.float32)
-    elif abs(original_fps - seg_fps) > 0.005 and len(seg_labels_orig) > 0:
-        from scipy.interpolate import interp1d
-        t_o = np.linspace(0, 1, len(seg_labels_orig))
-        t_t = np.linspace(0, 1, seg_total_frames)
-        labels = interp1d(t_o, seg_labels_orig, kind="linear",
-                          fill_value="extrapolate")(t_t).astype(np.float32)
-    else:
-        labels = seg_labels_orig[:seg_total_frames].astype(np.float32)
-
-    # Pad / trim to exact frame count
-    if len(labels) < seg_total_frames:
-        labels = np.pad(labels, (0, seg_total_frames - len(labels)), mode="edge")
-    else:
-        labels = labels[:seg_total_frames]
+    frame_timestamps_ms = (
+        seg_start_sec + (np.arange(seg_total_frames, dtype=np.float64) / seg_fps)
+    ) * 1000.0
+    labels = actions_to_timestamps(actions, frame_timestamps_ms)
 
     labels = np.clip(labels, 0.0, 1.0)
     np.save(labels_path, labels)
@@ -381,7 +365,6 @@ def _reprocess_all_labels(
 
         seg_fps: float = meta["fps"]
         seg_total_frames: int = meta["total_frames"]
-        half_rate = bool(meta.get("half_rate", False))
 
         # ── Resolve timing ────────────────────────────────────────────────
         if "segment_start_sec" in meta and "segment_duration_sec" in meta:
@@ -438,13 +421,6 @@ def _reprocess_all_labels(
             skipped += 1
             continue
 
-        try:
-            orig_info = get_video_info(video_path)
-        except Exception as e:
-            log.error("SKIP %s — cannot probe original video: %s", seg_name, e)
-            skipped += 1
-            continue
-
         labels_path = scene_dir / "labels.npy"
         if labels_path.exists():
             labels_path.unlink()
@@ -454,12 +430,8 @@ def _reprocess_all_labels(
             funscript_path=funscript_path,
             output_dir=scene_dir,
             seg_start_sec=start_sec,
-            seg_duration_sec=duration_sec,
             seg_fps=seg_fps,
             seg_total_frames=seg_total_frames,
-            original_fps=orig_info.fps,
-            original_duration_sec=orig_info.duration_seconds,
-            half_rate=half_rate,
         )
         if ok:
             ok_count += 1
@@ -682,12 +654,8 @@ def main() -> None:
                 funscript_path=pair.funscript_path,
                 output_dir=scene_dir,
                 seg_start_sec=start_sec,
-                seg_duration_sec=args.duration,
                 seg_fps=seg_info.fps,
                 seg_total_frames=seg_info.total_frames,
-                original_fps=info.fps,
-                original_duration_sec=info.duration_seconds,
-                half_rate=args.half_rate,
             )
             if not ok:
                 log.error("Label extraction failed for %s", seg_name)

@@ -9,7 +9,7 @@ import logging
 from pathlib import Path
 
 import numpy as np
-from scipy.interpolate import make_interp_spline, interp1d
+from scipy.interpolate import PchipInterpolator, interp1d
 
 log = logging.getLogger(__name__)
 
@@ -22,26 +22,108 @@ def load_funscript(path: str | Path) -> dict:
     return data
 
 
-def get_actions(data: dict) -> list[tuple[int, int]]:
-    """Extract (timestamp_ms, position_0_100) pairs from funscript data, sorted by time."""
+def get_actions(data: dict, trim_ratio: float = 0.0) -> list[tuple[int, int]]:
+    """Extract (timestamp_ms, position_0_100) pairs from funscript data.
+
+    Args:
+        data: Raw funscript JSON.
+        trim_ratio: Optional ratio of actions to drop from each end. Defaults to
+            0.0 so label generation preserves the full scripted range.
+    """
     actions = data.get("actions", [])
     pairs = [(a["at"], a["pos"]) for a in actions]
     pairs.sort(key=lambda x: x[0])
-    # remove first and last 10%
-    n = len(pairs)
-    if n > 2:
-        start_idx = n // 10
-        end_idx = n - start_idx
-        pairs = pairs[start_idx:end_idx]
+
+    if trim_ratio > 0.0 and len(pairs) > 2:
+        edge_count = int(len(pairs) * trim_ratio)
+        if edge_count > 0 and edge_count * 2 < len(pairs):
+            pairs = pairs[edge_count:len(pairs) - edge_count]
 
     return pairs
+
+
+def _prepare_interpolation_series(
+    actions: list[tuple[int, int]],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return sorted, deduplicated action timestamps and normalized positions."""
+    if not actions:
+        return np.empty((0,), dtype=np.float64), np.empty((0,), dtype=np.float64)
+
+    timestamps_ms = np.asarray([a[0] for a in actions], dtype=np.float64)
+    positions = np.asarray([a[1] for a in actions], dtype=np.float64) / 100.0
+
+    order = np.argsort(timestamps_ms, kind="stable")
+    timestamps_ms = timestamps_ms[order]
+    positions = positions[order]
+
+    dedup_timestamps: list[float] = []
+    dedup_positions: list[float] = []
+    for timestamp_ms, position in zip(timestamps_ms, positions):
+        if dedup_timestamps and timestamp_ms == dedup_timestamps[-1]:
+            dedup_positions[-1] = float(position)
+        else:
+            dedup_timestamps.append(float(timestamp_ms))
+            dedup_positions.append(float(position))
+
+    return (
+        np.asarray(dedup_timestamps, dtype=np.float64),
+        np.asarray(dedup_positions, dtype=np.float64),
+    )
+
+
+def actions_to_timestamps(
+    actions: list[tuple[int, int]],
+    timestamps_ms: np.ndarray,
+    interpolation: str = "pchip",
+) -> np.ndarray:
+    """Sample funscript actions at arbitrary timestamps.
+
+    Timestamps outside the scripted range hold the nearest endpoint value rather
+    than extrapolating, which avoids long clipped plateaus from spline drift.
+    """
+    if timestamps_ms.size == 0:
+        return np.zeros((0,), dtype=np.float32)
+
+    action_times_ms, positions = _prepare_interpolation_series(actions)
+    if action_times_ms.size == 0:
+        return np.zeros_like(timestamps_ms, dtype=np.float32)
+    if action_times_ms.size == 1:
+        return np.full(timestamps_ms.shape, positions[0], dtype=np.float32)
+
+    clipped_times_ms = np.clip(timestamps_ms.astype(np.float64), action_times_ms[0], action_times_ms[-1])
+    interp_kind = interpolation.lower()
+
+    if interp_kind in {"cubic", "pchip", "monotone", "monotonic"}:
+        try:
+            labels = PchipInterpolator(action_times_ms, positions)(clipped_times_ms)
+        except Exception:
+            log.warning("Monotone interpolation failed, falling back to linear interpolation")
+            interp_kind = "linear"
+
+    if interp_kind == "nearest":
+        labels = interp1d(
+            action_times_ms,
+            positions,
+            kind="nearest",
+            assume_sorted=True,
+        )(clipped_times_ms)
+    elif interp_kind == "linear":
+        labels = interp1d(
+            action_times_ms,
+            positions,
+            kind="linear",
+            assume_sorted=True,
+        )(clipped_times_ms)
+
+    labels = np.clip(np.asarray(labels, dtype=np.float64), 0.0, 1.0)
+    return labels.astype(np.float32)
 
 
 def actions_to_frame_labels(
     actions: list[tuple[int, int]],
     fps: float,
     total_frames: int,
-    interpolation: str = "cubic",
+    interpolation: str = "pchip",
 ) -> np.ndarray:
     """Convert funscript actions to per-frame position labels in [0, 1].
 
@@ -49,43 +131,16 @@ def actions_to_frame_labels(
         actions: List of (timestamp_ms, position_0_100) pairs.
         fps: Video frame rate.
         total_frames: Total number of frames in the video.
-        interpolation: "linear", "cubic", or "nearest".
+        interpolation: "linear", "pchip"/"cubic", or "nearest".
 
     Returns:
         np.ndarray of shape [total_frames] with values in [0, 1].
     """
-    if not actions:
+    if not actions or fps <= 0 or total_frames <= 0:
         return np.zeros(total_frames, dtype=np.float32)
 
-    timestamps_ms = np.array([a[0] for a in actions], dtype=np.float64)
-    positions = np.array([a[1] for a in actions], dtype=np.float64) / 100.0
-
-    # Convert timestamps to frame indices
-    frame_indices = timestamps_ms * fps / 1000.0
-
-    # Create frame-level labels
-    all_frames = np.arange(total_frames, dtype=np.float64)
-
-    if interpolation == "cubic" and len(actions) >= 4:
-        try:
-            spline = make_interp_spline(frame_indices, positions, k=3)
-            labels = spline(all_frames)
-        except Exception:
-            log.warning("Cubic spline failed, falling back to linear interpolation")
-            interp_fn = interp1d(frame_indices, positions, kind="linear",
-                                 fill_value="extrapolate", bounds_error=False)
-            labels = interp_fn(all_frames)
-    elif interpolation == "nearest":
-        interp_fn = interp1d(frame_indices, positions, kind="nearest",
-                             fill_value="extrapolate", bounds_error=False)
-        labels = interp_fn(all_frames)
-    else:
-        interp_fn = interp1d(frame_indices, positions, kind="linear",
-                             fill_value="extrapolate", bounds_error=False)
-        labels = interp_fn(all_frames)
-
-    labels = np.clip(labels, 0.0, 1.0).astype(np.float32)
-    return labels
+    frame_timestamps_ms = np.arange(total_frames, dtype=np.float64) * (1000.0 / fps)
+    return actions_to_timestamps(actions, frame_timestamps_ms, interpolation=interpolation)
 
 
 def frame_labels_to_funscript(
