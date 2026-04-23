@@ -3,7 +3,7 @@
 ![Great wavy lines](docs/wavy.png)
 
 It makes these. It helps with motion.
-There's no clever filtering or peak detection at play here yet.
+There is now optional wave-aware postprocessing for dense predictions, including low-pass filtering, trough-based cycle normalization, and slow-gradient stretching.
 This one feels like it's got some real potential, and I don't hate the architecture.
 
 Looking at that plot, it might look like noise, but the wiggle at the 23 second mark is spot on.
@@ -160,11 +160,19 @@ After 5–10 epochs it'll typically hit its best output and start overtraining. 
 
 ## Generation
 
-To generate a funscript prediction for a video:
+To generate a dense funscript prediction for a video:
 
 ```bash
-python.exe scripts/predict_disposition.py --vr --video benchmark_8k.mp4 --out benchmark_8k.funscript
+python.exe scripts/predict_disposition.py --vr --video benchmark_8k.mp4 --out benchmark_8k_raw.funscript
 ```
+
+To enable inline wave-aware postprocessing during generation:
+
+```bash
+python.exe scripts/predict_disposition.py --vr --video benchmark_8k.mp4 --postprocess --out benchmark_8k_wave.funscript
+```
+
+`--postprocess` works in both the normal batch path and the `--playback` path. No extra dependency is needed for it beyond the existing SciPy install listed above.
 
 Useful flags:
 
@@ -174,6 +182,35 @@ Useful flags:
 | `--playback` | Watch the prediction in a GUI as it runs (slower) |
 | `--start-time` | Start offset in seconds |
 | `--duration` | Duration to process in seconds |
+| `--postprocess` | Enable wave-aware postprocessing on the main fused prediction channel |
+| `--postprocess-lowpass-cutoff-hz` | Adjust the low-pass filter cutoff |
+| `--postprocess-trough-prominence` | Tune trough detection sensitivity |
+| `--postprocess-min-cycle-amplitude` | Require a minimum trough-to-trough cycle amplitude before normalization |
+| `--postprocess-gradient-smoothing` | Choose `none`, `savgol`, or `gaussian` smoothing for gradient analysis |
+| `--postprocess-min-gradient-length-seconds` | Minimum duration for a slow-gradient segment |
+| `--postprocess-stretch-mode` | Choose `linear` or `tanh` stretching for slow-gradient segments |
+| `--postprocess-stretch-gain` | Tanh gain used when `--postprocess-stretch-mode tanh` is selected |
+
+The postprocess thresholds use the exact effective output FPS, including half-rate output when enabled.
+
+## Offline Wave Postprocess
+
+If you already have a dense, framewise funscript produced by `predict_disposition.py`, you can postprocess it without rerunning inference:
+
+```bash
+python.exe scripts/postprocess_predictions.py --input benchmark_8k_raw.funscript --fps 30 --out benchmark_8k_wave.funscript
+```
+
+Useful flags:
+
+| Flag | Description |
+|---|---|
+| `--fps` | Explicit FPS for the dense source funscript; recommended when you know it |
+| `--save-npy` | Save the postprocessed dense positions as a NumPy array |
+| `--plot` | Show a raw-vs-postprocessed comparison plot |
+| `--save-plot` | Save that comparison plot to disk |
+
+The standalone script preserves the original action timestamps and adds postprocess metadata to the output funscript.
 
 ---
 

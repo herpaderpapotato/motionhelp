@@ -44,6 +44,10 @@ from src.data.decode import (
 )
 from src.data.extraction import PARTNER_CLASS
 from src.data.preprocess import probe_video
+from src.data.prediction_postprocess import (
+    WavePostprocessConfig,
+    postprocess_predictions,
+)
 from src.data.spatial import (
     build_channel_slices,
     legacy_conf_path,
@@ -58,6 +62,7 @@ os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 DEFAULT_MODEL_NAME = "vrlens-finetunes-multiclass-v2-yolo26m-pose"
 DEFAULT_CHECKPOINT = Path("data/models/checkpoints_disposition/best_disposition.pt")
+DEFAULT_POSTPROCESS = WavePostprocessConfig()
 
 
 def _optional_int_tuple(values: object) -> tuple[int, ...] | None:
@@ -95,6 +100,42 @@ def _apply_half_rate(array: np.ndarray | None) -> np.ndarray | None:
 
 def _seconds_to_frames(seconds: float, fps: float) -> int:
     return max(1, int(round(seconds * fps)))
+
+
+def build_postprocess_config(args: argparse.Namespace) -> WavePostprocessConfig | None:
+    if not args.postprocess:
+        return None
+    chunk_seconds = args.postprocess_chunk_seconds
+    if chunk_seconds is not None and chunk_seconds <= 0.0:
+        chunk_seconds = None
+    return WavePostprocessConfig(
+        lowpass_cutoff_hz=args.postprocess_lowpass_cutoff_hz,
+        trough_prominence=args.postprocess_trough_prominence,
+        trough_distance_seconds=args.postprocess_trough_distance_seconds,
+        min_cycle_amplitude=args.postprocess_min_cycle_amplitude,
+        min_cycle_frequency_hz=args.postprocess_min_cycle_frequency_hz,
+        gradient_smoothing=args.postprocess_gradient_smoothing,
+        gradient_window_seconds=args.postprocess_gradient_window_seconds,
+        min_gradient_length_seconds=args.postprocess_min_gradient_length_seconds,
+        min_gradient_range=args.postprocess_min_gradient_range,
+        stretch_mode=args.postprocess_stretch_mode,
+        stretch_gain=args.postprocess_stretch_gain,
+        chunk_seconds=chunk_seconds,
+        chunk_overlap_seconds=args.postprocess_chunk_overlap_seconds,
+    )
+
+
+def print_postprocess_stats(stats: dict[str, object], prefix: str = "") -> None:
+    print(
+        f"{prefix}Wave postprocess: chunks={stats['num_chunks']} "
+        f"cycles={stats['num_normalized_cycles']} gradients={stats['num_gradient_segments']} "
+        f"cycle_samples={stats['num_cycle_samples']} gradient_samples={stats['num_gradient_samples']} "
+        f"clipped={stats['num_clipped_samples']}"
+    )
+    print(
+        f"{prefix}  thresholds: gradient_low={float(stats['gradient_low_threshold']):.6f} "
+        f"gradient_high={float(stats['gradient_high_threshold']):.6f}"
+    )
 
 
 # ── GPU-native spatial extractor ──────────────────────────────────────────────
@@ -531,6 +572,7 @@ def live_playback_with_prediction(
     half_rate: bool = False,
     seq_len: int = 120,
     stride: int = 60,
+    postprocess_config: WavePostprocessConfig | None = None,
 ) -> np.ndarray:
     """Live video playback with simultaneous DispositionTCN prediction.
 
@@ -682,6 +724,8 @@ def live_playback_with_prediction(
                     preds_new = sliding_window_predict(
                         model, sp_a[:n], co_a[:n], device, seq_len, stride,
                     )
+                    if postprocess_config is not None:
+                        preds_new = postprocess_predictions(preds_new, playback_fps, postprocess_config)
 
                 with _lock:
                     _state["decode_fps"]     = decode_fps
@@ -698,6 +742,14 @@ def live_playback_with_prediction(
             preds_final = sliding_window_predict(
                 model, sp_a[:n], co_a[:n], device, seq_len, stride,
             )
+            if postprocess_config is not None:
+                preds_final, postprocess_stats = postprocess_predictions(
+                    preds_final,
+                    playback_fps,
+                    postprocess_config,
+                    return_stats=True,
+                )
+                print_postprocess_stats(postprocess_stats, prefix="  ")
 
             extractor.close()
             with _lock:
@@ -1376,6 +1428,49 @@ def main() -> None:
                         help="Show matplotlib prediction plot after inference")
     parser.add_argument("--save-plot",  type=Path, default=None,
                         help="Save prediction plot to this file")
+    parser.add_argument("--postprocess", action="store_true",
+                        help="Apply wave-aware cycle normalization and gradient stretching to predictions")
+    parser.add_argument("--postprocess-lowpass-cutoff-hz", type=float,
+                        default=DEFAULT_POSTPROCESS.lowpass_cutoff_hz,
+                        help="Zero-phase low-pass cutoff before wave detection")
+    parser.add_argument("--postprocess-trough-prominence", type=float,
+                        default=DEFAULT_POSTPROCESS.trough_prominence,
+                        help="Minimum trough prominence for cycle detection")
+    parser.add_argument("--postprocess-trough-distance-seconds", type=float,
+                        default=DEFAULT_POSTPROCESS.trough_distance_seconds,
+                        help="Minimum time between detected troughs")
+    parser.add_argument("--postprocess-min-cycle-amplitude", type=float,
+                        default=DEFAULT_POSTPROCESS.min_cycle_amplitude,
+                        help="Only normalize cycles at or above this peak-to-trough range")
+    parser.add_argument("--postprocess-min-cycle-frequency-hz", type=float,
+                        default=DEFAULT_POSTPROCESS.min_cycle_frequency_hz,
+                        help="Only normalize cycles faster than this frequency")
+    parser.add_argument("--postprocess-gradient-smoothing", type=str,
+                        default=DEFAULT_POSTPROCESS.gradient_smoothing,
+                        choices=["none", "savgol", "gaussian"],
+                        help="Smoother used before slow-gradient detection")
+    parser.add_argument("--postprocess-gradient-window-seconds", type=float,
+                        default=DEFAULT_POSTPROCESS.gradient_window_seconds,
+                        help="Savgol window size for slow-gradient detection")
+    parser.add_argument("--postprocess-min-gradient-length-seconds", type=float,
+                        default=DEFAULT_POSTPROCESS.min_gradient_length_seconds,
+                        help="Minimum duration of a slow-gradient segment to stretch")
+    parser.add_argument("--postprocess-min-gradient-range", type=float,
+                        default=DEFAULT_POSTPROCESS.min_gradient_range,
+                        help="Minimum local range before a slow-gradient segment is stretched")
+    parser.add_argument("--postprocess-stretch-mode", type=str,
+                        default=DEFAULT_POSTPROCESS.stretch_mode,
+                        choices=["linear", "tanh"],
+                        help="Stretching function used on slow-gradient segments")
+    parser.add_argument("--postprocess-stretch-gain", type=float,
+                        default=DEFAULT_POSTPROCESS.stretch_gain,
+                        help="Steepness for tanh-based slow-gradient stretching")
+    parser.add_argument("--postprocess-chunk-seconds", type=float,
+                        default=DEFAULT_POSTPROCESS.chunk_seconds,
+                        help="Chunk size for long predictions; set to 0 to disable chunking")
+    parser.add_argument("--postprocess-chunk-overlap-seconds", type=float,
+                        default=DEFAULT_POSTPROCESS.chunk_overlap_seconds,
+                        help="Overlap between postprocess chunks")
     parser.add_argument("--start-time", type=float, default=0.0,
                         help="Start time (in seconds) for playback or benchmarking")
     parser.add_argument("--duration",   type=float, default=None,
@@ -1412,6 +1507,9 @@ def main() -> None:
         base_fps = _probe_video_fps(video_path)
     output_fps = effective_frame_rate(base_fps, args.half_rate)
     print(f"Using effective fps: {output_fps:.6f}")
+    postprocess_config = build_postprocess_config(args)
+    if postprocess_config is not None:
+        print("Wave-aware prediction postprocessing enabled")
 
     # ── Benchmark mode ────────────────────────────────────────────────────
     if args.benchmark:
@@ -1447,6 +1545,7 @@ def main() -> None:
             stride=args.stride,
             start_time=args.start_time,
             duration=args.duration,
+            postprocess_config=postprocess_config,
         )
         if len(predictions) == 0:
             print("No predictions generated during playback.")
@@ -1498,6 +1597,14 @@ def main() -> None:
             predictions, aux_predictions = pred_result
         else:
             predictions = pred_result
+        if postprocess_config is not None:
+            predictions, postprocess_stats = postprocess_predictions(
+                predictions,
+                output_fps,
+                postprocess_config,
+                return_stats=True,
+            )
+            print_postprocess_stats(postprocess_stats, prefix="  ")
         t_pred = time.perf_counter() - t0
         print(f"Prediction: {len(predictions)} frames in {t_pred:.2f}s")
         print(f"  mean={predictions.mean():.4f}  std={predictions.std():.4f}")
