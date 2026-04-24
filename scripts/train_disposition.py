@@ -542,7 +542,7 @@ def train() -> None:
     parser.add_argument("--n-persons", type=int, default=1)
     parser.add_argument(
         "--output-activation",
-        choices=("sigmoid", "leaky_relu"),
+        choices=("sigmoid", "linear", "relu", "leaky_relu"),
         default=None,
         help="Output activation for the fused and aux prediction heads",
     )
@@ -591,16 +591,25 @@ def train() -> None:
     resume_checkpoint: dict[str, object] | None = None
     if args.resume is not None:
         resume_checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
+        resume_output_activation = None
+        resume_model_config = resume_checkpoint.get("model_config")
+        if isinstance(resume_model_config, dict):
+            checkpoint_activation = resume_model_config.get("output_activation")
+            if checkpoint_activation is not None:
+                resume_output_activation = str(checkpoint_activation).lower()
         if args.output_activation is None:
-            resume_model_config = resume_checkpoint.get("model_config")
-            if isinstance(resume_model_config, dict):
-                resume_output_activation = resume_model_config.get("output_activation")
-                if resume_output_activation is not None:
-                    args.output_activation = str(resume_output_activation)
-                    log.info(
-                        "Using output activation '%s' from resume checkpoint",
-                        args.output_activation,
-                    )
+            if resume_output_activation is not None:
+                args.output_activation = resume_output_activation
+                log.info(
+                    "Using output activation '%s' from resume checkpoint",
+                    args.output_activation,
+                )
+        elif resume_output_activation is not None and args.output_activation != resume_output_activation:
+            log.info(
+                "Overriding resume checkpoint output activation '%s' with requested '%s'",
+                resume_output_activation,
+                args.output_activation,
+            )
     if args.output_activation is None:
         args.output_activation = "sigmoid"
 

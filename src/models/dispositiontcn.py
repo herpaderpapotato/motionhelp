@@ -42,6 +42,7 @@ DISPOSITION_CONFIG_KEYS = {
 }
 
 DEFAULT_LEAKY_RELU_SLOPE = 0.01
+SUPPORTED_OUTPUT_ACTIVATIONS = {"sigmoid", "linear", "relu", "leaky_relu"}
 
 
 def extract_disposition_config(config: dict[str, object]) -> dict[str, object]:
@@ -181,9 +182,9 @@ class DispositionTCN(nn.Module):
         self.encoder_dim = encoder_dim
         self.use_aux_layers = use_aux_layers
         self.output_activation = str(output_activation).lower()
-        if self.output_activation not in {"sigmoid", "leaky_relu"}:
+        if self.output_activation not in SUPPORTED_OUTPUT_ACTIVATIONS:
             raise ValueError(
-                "output_activation must be one of {'sigmoid', 'leaky_relu'}"
+                "output_activation must be one of {'sigmoid', 'linear', 'relu', 'leaky_relu'}"
             )
         self.aux_scale_names, self.scale_channel_slices = _normalize_scale_channel_slices(
             scale_channel_slices,
@@ -287,6 +288,10 @@ class DispositionTCN(nn.Module):
     def _apply_output_activation(self, output: torch.Tensor) -> torch.Tensor:
         if self.output_activation == "sigmoid":
             return torch.sigmoid(output)
+        if self.output_activation == "linear":
+            return output
+        if self.output_activation == "relu":
+            return F.relu(output)
         return F.leaky_relu(output, negative_slope=DEFAULT_LEAKY_RELU_SLOPE)
 
     def forward(
@@ -298,7 +303,7 @@ class DispositionTCN(nn.Module):
         Args:
             spatial_features: [B, T, N, C, H, W] RoI-aligned spatial features
             conf: [B, T, N] per-person detection confidence (optional)
-        Returns: [B, T] positions in [0, 1]
+        Returns: [B, T] activated per-frame predictions
         """
         encoded = self.spatial_encoder(spatial_features)  # [B, T, N, encoder_dim]
         pooled = self.person_attn(encoded, conf)  # [B, T, encoder_dim]
