@@ -10,7 +10,7 @@ Architecture:
     2. PersonAttention: confidence-weighted pooling across N persons -> [B, T, encoder_dim]
     3. Linear projection -> [B, T, d_model]
     4. Dilated TCN backbone for multi-scale temporal modeling
-    5. Per-frame output head with sigmoid -> [B, T] in [0, 1]
+    5. Per-frame output head with configurable activation -> [B, T]
 
 Data flow:
     Input: (spatial_features [B, T, N, C, H, W], conf [B, T, N])
@@ -36,9 +36,12 @@ DISPOSITION_CONFIG_KEYS = {
     "encoder_dim",
     "use_ddl",
     "use_aux_layers",
+    "output_activation",
     "scale_channel_slices",
     "scale_names",
 }
+
+DEFAULT_LEAKY_RELU_SLOPE = 0.01
 
 
 def extract_disposition_config(config: dict[str, object]) -> dict[str, object]:
@@ -149,7 +152,7 @@ class DispositionTCN(nn.Module):
         spatial_features: [B, T, N, C, H, W]  (RoI-aligned backbone features)
         conf:             [B, T, N]            (detection confidence scores)
 
-    Output: [B, T] position values in [0, 1]
+    Output: [B, T] per-frame position values
         When use_aux_layers=True, returns [B, 1 + n_scales, T] where channel 0 is
         the fused prediction and the remaining channels are per-scale aux outputs.
     """
@@ -166,6 +169,7 @@ class DispositionTCN(nn.Module):
         encoder_dim: int = 128,
         use_ddl: bool = False,
         use_aux_layers: bool = False,
+        output_activation: str = "sigmoid",
         scale_channel_slices: dict[str, Sequence[int]] | Sequence[Sequence[int]] | None = None,
         scale_names: Sequence[str] | None = None,
     ):
@@ -176,6 +180,11 @@ class DispositionTCN(nn.Module):
         self.n_persons = n_persons
         self.encoder_dim = encoder_dim
         self.use_aux_layers = use_aux_layers
+        self.output_activation = str(output_activation).lower()
+        if self.output_activation not in {"sigmoid", "leaky_relu"}:
+            raise ValueError(
+                "output_activation must be one of {'sigmoid', 'leaky_relu'}"
+            )
         self.aux_scale_names, self.scale_channel_slices = _normalize_scale_channel_slices(
             scale_channel_slices,
             scale_names=scale_names,
@@ -275,6 +284,11 @@ class DispositionTCN(nn.Module):
             if hasattr(self, attr):
                 delattr(self, attr)
 
+    def _apply_output_activation(self, output: torch.Tensor) -> torch.Tensor:
+        if self.output_activation == "sigmoid":
+            return torch.sigmoid(output)
+        return F.leaky_relu(output, negative_slope=DEFAULT_LEAKY_RELU_SLOPE)
+
     def forward(
         self,
         spatial_features: torch.Tensor,
@@ -305,8 +319,8 @@ class DispositionTCN(nn.Module):
         main_out = self.output_head(x).squeeze(-1)  # [B, T]
         if self.use_aux_layers:
             out = torch.stack([main_out, *aux_outputs], dim=1)
-            return torch.sigmoid(out)
-        return torch.sigmoid(main_out)
+            return self._apply_output_activation(out)
+        return self._apply_output_activation(main_out)
 
     def count_parameters(self) -> dict[str, int]:
         total = sum(p.numel() for p in self.parameters())
