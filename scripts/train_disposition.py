@@ -52,6 +52,12 @@ AUX_STATE_PREFIXES = (
     "aux_tcn_blocks",
     "aux_output_heads",
 )
+AUGMENTATION_NAMES = (
+    "time_reversal",
+    "temporal_jitter",
+    "channel_dropout",
+    "horizontal_flip",
+)
 
 
 class SpatialDataset(Dataset):
@@ -263,9 +269,7 @@ class SpatialDataset(Dataset):
         spatial = batch["spatial"]
         conf = batch["conf"]
         labels = batch["labels"]
-
-        ## I need to read the metrics file and look into the prepare_videos for actions-to-frame labels. It's essential to check label statistics across the data set and compute label distribution for the train/validation split using Python. Hmm, I should inspect the augmentation inversion's interaction too. Notably, the train_disposition randomly inverts labels without input changes, which seems suspicious! That could cause the output range to compress significantly. I need to check if this happens in train_tcn as well.
-        # HOLY CRAP YOU NAILED IT!
+        aug_flags = torch.zeros(len(AUGMENTATION_NAMES), dtype=torch.uint8)
 
         if self.augment:
             # Time reversal
@@ -273,13 +277,41 @@ class SpatialDataset(Dataset):
                 spatial = spatial.flip(0)
                 conf = conf.flip(0)
                 labels = labels.flip(0)
-            # # Position inversion  # KILLING THIS BECAUSE THIS IS REALLY BAD!
+                aug_flags[0] = 1
+            # Temporal jitter
+            if torch.rand(1).item() < 0.3:
+                jitter = random.randint(-5, 5)
+                if jitter != 0:
+                    spatial = torch.roll(spatial, shifts=jitter, dims=0)
+                    conf = torch.roll(conf, shifts=jitter, dims=0)
+                    labels = torch.roll(labels, shifts=jitter, dims=0)
+                    aug_flags[1] = 1
+            # Channel input slice dropout
+            channel_slices = self.spatial_metadata.get("channel_slices", {})
+            if torch.rand(1).item() < 0.3 and isinstance(channel_slices, dict) and channel_slices:
+                dropout_channel = random.choice(list(channel_slices.values()))
+                if isinstance(dropout_channel, (list, tuple)) and len(dropout_channel) == 2:
+                    channel_slice = slice(int(dropout_channel[0]), int(dropout_channel[1]))
+                else:
+                    channel_slice = int(dropout_channel)
+                spatial[:, :, channel_slice] = 0.0
+                aug_flags[2] = 1
+            # Horizontal flip features. Left-right reversal for each input slice.
+            if torch.rand(1).item() < 0.3:
+                spatial = spatial.flip(4)  # flip W dimension
+                aug_flags[3] = 1
+
+
+
+
+            # # Position inversion. don't do this, it's bad and would require also inverting the features
             # if torch.rand(1).item() < 0.3:
             #     labels = 1.0 - labels
 
         batch["spatial"] = spatial
         batch["conf"] = conf
         batch["labels"] = labels
+        batch["aug_flags"] = aug_flags
         return batch
 
     def sample_random(self, n: int, device: torch.device | None = None) -> dict[str, torch.Tensor]:
@@ -377,11 +409,14 @@ def _prepare_batch(
     else:
         spatial = batch["spatial"].to(device=device, dtype=spatial_dtype, non_blocking=True)
 
-    return {
+    out = {
         "spatial": spatial,
         "conf": batch["conf"].to(device=device, dtype=torch.float32, non_blocking=True),
         "labels": batch["labels"].to(device=device, dtype=torch.float32, non_blocking=True),
     }
+    if "aug_flags" in batch:
+        out["aug_flags"] = batch["aug_flags"].to(device=device, dtype=torch.uint8, non_blocking=True)
+    return out
 
 
 def _scale_names_from_metadata(metadata: dict[str, object] | None) -> tuple[str, ...]:
@@ -894,12 +929,21 @@ def train() -> None:
         model.train()
         train_losses = []
         train_metrics: dict[str, list[float]] = {"pos_mse": [], "vel_mse": [], "acc_mse": []}
+        epoch_aug_counts = {name: 0 for name in AUGMENTATION_NAMES}
+        epoch_aug_samples = 0
 
         for batch in tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs}", unit="batch"):
             prepared = _prepare_batch(batch, device, device_dequantize=train_ds.device_dequantize)
             spatial = prepared["spatial"]
             conf = prepared["conf"]
             lbl = prepared["labels"]
+
+            aug_flags = batch.get("aug_flags")
+            if aug_flags is not None:
+                batch_aug = aug_flags.to(torch.int32).sum(dim=0)
+                for idx, name in enumerate(AUGMENTATION_NAMES):
+                    epoch_aug_counts[name] += int(batch_aug[idx].item())
+                epoch_aug_samples += aug_flags.shape[0]
 
             optimizer.zero_grad(set_to_none=True)
 
@@ -949,6 +993,19 @@ def train() -> None:
 
         avg_train = np.mean(train_losses)
         avg_train_metrics = {k: float(np.mean(v)) for k, v in train_metrics.items() if v}
+        epoch_aug_rates: dict[str, float] = {}
+        if epoch_aug_samples > 0:
+            epoch_aug_rates = {
+                name: epoch_aug_counts[name] / epoch_aug_samples
+                for name in AUGMENTATION_NAMES
+            }
+            for name, rate in epoch_aug_rates.items():
+                writer.add_scalar(f"train/aug_{name}_rate", rate, epoch)
+            log.info(
+                "Epoch %d augmentation rates: %s",
+                epoch,
+                ", ".join(f"{name}={rate:.3f}" for name, rate in epoch_aug_rates.items()),
+            )
 
         # Validate
         model.eval()
