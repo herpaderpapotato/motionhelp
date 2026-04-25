@@ -93,6 +93,11 @@ def scene_is_rejected(scene_dir: Path) -> bool:
         review.get("status") == "rejected"
         or review.get("stage2_status") == "rejected"
     )
+def scene_is_not_approved(scene_dir: Path) -> bool:
+    review = read_review(scene_dir)
+    return (
+        review.get("status") != "approved"
+    )
 
 
 def collect_split_candidates(
@@ -118,6 +123,9 @@ def collect_split_candidates(
 
         if scene_is_rejected(scene_dir):
             skipped.append((scene_dir.name, "scene is rejected in review.json"))
+            continue
+        if scene_is_not_approved(scene_dir):
+            skipped.append((scene_dir.name, "scene is not approved in review.json"))
             continue
 
         if require_embeddings:

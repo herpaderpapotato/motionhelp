@@ -418,8 +418,8 @@ def _compute_loss(
 
     loss = (
         metrics["pos_mse"] * pos_weight
-        + args.velocity_weight * metrics["vel_mse"]
-        + args.temporal_weight * metrics["acc_mse"]
+        + args.velocity_weight * metrics["vel_mse"] * 60 # to make it in a range that's closer to pos_mse. If the average is 1 hz at 60fps, then each frame's velocity error now contributes roughly the same to the loss as a position error. If the velocity error is 1 hz, that means the prediction is off by 1 second over the course of a minute, which seems like a reasonable balance to me.
+        + args.temporal_weight * metrics["acc_mse"] * 60 # to make it in a range that's closer to pos_mse
     )
 
     if aux_preds:
@@ -568,7 +568,7 @@ def train() -> None:
         "--aux-weight",
         type=float,
         default=None,
-        help="Weight for aux branch MSE; defaults to 0.1 when --use-aux-layers is enabled",
+        help="Weight for aux branch MSE; defaults to 0.1 when --use-aux-layers is enablaed",
     )
     parser.add_argument("--use-aux-layers", action="store_true", dest="use_aux_layers")
     parser.add_argument("--disable-aux-layers", action="store_false", dest="use_aux_layers")
@@ -653,7 +653,7 @@ def train() -> None:
         device_dequantize=args.device_dequantize,
     )
     val_ds = SpatialDataset(
-        args.data_dir, "val", args.seq_len, args.stride,
+        args.data_dir, "val", args.seq_len, args.seq_len, # val always has the stride equal to seq_len.
         model_name=args.model_name, augment=False,
         device_dequantize=args.device_dequantize,
     )
@@ -821,7 +821,7 @@ def train() -> None:
         early_stop_counter = 0
     scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
         optimizer,
-        T_0=max(1, args.epochs * len(train_loader) // 20),
+        T_0=max(1, args.epochs * len(train_loader) // 5),
         T_mult=1,
         eta_min=args.lr * 0.01,
     )
